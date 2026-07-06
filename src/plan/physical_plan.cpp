@@ -40,6 +40,10 @@ PhysicalPlan lower_to_physical(const LogicalPlan& logical) {
         return PhysicalPlan::filter(logical.predicates, lower_to_physical(require_input(logical)));
     case LogicalKind::Project:
         return PhysicalPlan::project(logical.projections, lower_to_physical(require_input(logical)));
+    case LogicalKind::Aggregate:
+        return PhysicalPlan::aggregate(logical.group_keys,
+                                       logical.aggregate_expressions,
+                                       lower_to_physical(require_input(logical)));
     case LogicalKind::Sort:
         return PhysicalPlan::sort(logical.sort_keys, lower_to_physical(require_input(logical)));
     }

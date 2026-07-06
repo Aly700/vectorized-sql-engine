@@ -14,7 +14,7 @@ namespace optimizer {
 
 using GroupId = std::uint64_t;
 
-enum class MemoExpressionKind { Scan, Join, Filter, Project, Sort, GroupRef };
+enum class MemoExpressionKind { Scan, Join, Filter, Project, Aggregate, Sort, GroupRef };
 
 struct MemoExpression {
     MemoExpressionKind kind{MemoExpressionKind::Scan};
@@ -24,6 +24,8 @@ struct MemoExpression {
     std::string table;
     std::string binding_name;
     std::vector<plan::Projection> projections;
+    std::vector<plan::BoundColumnRef> group_keys;
+    std::vector<plan::AggregateExpression> aggregate_expressions;
     std::vector<plan::SortKey> sort_keys;
     std::vector<plan::BoundComparisonExpr> predicates;
     std::vector<GroupId> children;

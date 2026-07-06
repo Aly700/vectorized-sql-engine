@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -55,6 +56,19 @@ struct JoinOutputBuilder {
     std::vector<storage::Int64Column> columns;
 };
 
+struct AggregateValue {
+    std::int64_t count{0};
+    std::int64_t sum{0};
+    std::int64_t min{0};
+    std::int64_t max{0};
+    bool has_value{false};
+};
+
+struct AggregateGroupState {
+    HashKey key;
+    std::vector<AggregateValue> aggregates;
+};
+
 SelectionVectorPtr make_selection(SelectionVector rows) {
     return std::make_shared<const SelectionVector>(std::move(rows));
 }
@@ -83,6 +97,9 @@ void validate_view(const BatchView& view) {
 }
 
 std::string column_identity_name(const plan::BoundColumnRef& column) {
+    if (column.binding.empty()) {
+        return column.column;
+    }
     return column.binding + "." + column.column;
 }
 
@@ -217,6 +234,101 @@ HashKey make_key(const storage::ColumnarBatch& batch,
     return key;
 }
 
+void increment_count(AggregateValue& value, const std::string& output_name) {
+    if (value.count == std::numeric_limits<std::int64_t>::max()) {
+        throw std::runtime_error(output_name + " overflowed int64");
+    }
+    ++value.count;
+}
+
+std::int64_t checked_sum(std::int64_t left, std::int64_t right, const std::string& output_name) {
+    std::int64_t result = 0;
+    if (__builtin_add_overflow(left, right, &result)) {
+        throw std::runtime_error(output_name + " overflowed int64");
+    }
+    return result;
+}
+
+std::int64_t aggregate_argument_value(const plan::AggregateExpression& aggregate,
+                                      const storage::ColumnarBatch& batch,
+                                      std::size_t row) {
+    if (!aggregate.argument.has_value()) {
+        throw std::logic_error("aggregate argument is missing");
+    }
+    return batch.column(column_identity_name(*aggregate.argument)).at(row);
+}
+
+void update_aggregate(AggregateValue& value,
+                      const plan::AggregateExpression& aggregate,
+                      const storage::ColumnarBatch& batch,
+                      std::size_t row) {
+    switch (aggregate.function) {
+    case sql::AggregateFunction::Count:
+        if (aggregate.argument.has_value()) {
+            (void)aggregate_argument_value(aggregate, batch, row);
+        }
+        increment_count(value, aggregate.output_name);
+        return;
+    case sql::AggregateFunction::Sum: {
+        const auto argument = aggregate_argument_value(aggregate, batch, row);
+        if (!value.has_value) {
+            value.sum = argument;
+            value.has_value = true;
+            return;
+        }
+        value.sum = checked_sum(value.sum, argument, aggregate.output_name);
+        return;
+    }
+    case sql::AggregateFunction::Min: {
+        const auto argument = aggregate_argument_value(aggregate, batch, row);
+        if (!value.has_value || argument < value.min) {
+            value.min = argument;
+        }
+        value.has_value = true;
+        return;
+    }
+    case sql::AggregateFunction::Max: {
+        const auto argument = aggregate_argument_value(aggregate, batch, row);
+        if (!value.has_value || argument > value.max) {
+            value.max = argument;
+        }
+        value.has_value = true;
+        return;
+    }
+    }
+    throw std::logic_error("unreachable aggregate function");
+}
+
+std::int64_t finalize_aggregate(const AggregateValue& value, const plan::AggregateExpression& aggregate) {
+    switch (aggregate.function) {
+    case sql::AggregateFunction::Count:
+        return value.count;
+    case sql::AggregateFunction::Sum:
+        if (!value.has_value) {
+            throw std::runtime_error(aggregate.output_name + " over empty input has no NULL-free result");
+        }
+        return value.sum;
+    case sql::AggregateFunction::Min:
+        if (!value.has_value) {
+            throw std::runtime_error(aggregate.output_name + " over empty input has no NULL-free result");
+        }
+        return value.min;
+    case sql::AggregateFunction::Max:
+        if (!value.has_value) {
+            throw std::runtime_error(aggregate.output_name + " over empty input has no NULL-free result");
+        }
+        return value.max;
+    }
+    throw std::logic_error("unreachable aggregate function");
+}
+
+AggregateGroupState make_aggregate_group(HashKey key, const plan::PhysicalPlan& plan) {
+    AggregateGroupState group;
+    group.key = std::move(key);
+    group.aggregates.resize(plan.aggregate_expressions.size());
+    return group;
+}
+
 JoinOutputBuilder make_join_output_builder(const storage::ColumnarBatch& left,
                                            const storage::ColumnarBatch& right) {
     JoinOutputBuilder builder;
@@ -315,6 +427,7 @@ BatchView execute_scan(const plan::PhysicalPlan& plan, const Catalog& catalog) {
 BatchView execute_filter(const plan::PhysicalPlan& plan, const Catalog& catalog);
 BatchView execute_join(const plan::PhysicalPlan& plan, const Catalog& catalog);
 BatchView execute_project(const plan::PhysicalPlan& plan, const Catalog& catalog);
+BatchView execute_aggregate(const plan::PhysicalPlan& plan, const Catalog& catalog);
 BatchView execute_sort(const plan::PhysicalPlan& plan, const Catalog& catalog);
 
 BatchView execute_to_view(const plan::PhysicalPlan& plan, const Catalog& catalog) {
@@ -327,6 +440,8 @@ BatchView execute_to_view(const plan::PhysicalPlan& plan, const Catalog& catalog
         return execute_filter(plan, catalog);
     case plan::PhysicalKind::Project:
         return execute_project(plan, catalog);
+    case plan::PhysicalKind::Aggregate:
+        return execute_aggregate(plan, catalog);
     case plan::PhysicalKind::Sort:
         return execute_sort(plan, catalog);
     }
@@ -433,6 +548,67 @@ SelectionVectorPtr sort_selection(const std::vector<plan::SortKey>& sort_keys, c
 BatchView execute_project(const plan::PhysicalPlan& plan, const Catalog& catalog) {
     auto input = execute_to_view(require_input(plan), catalog);
     auto materialized = std::make_shared<const storage::ColumnarBatch>(materialize_projection(plan, input));
+
+    BatchView view;
+    view.owned_batch = materialized;
+    view.batch = materialized.get();
+    view.selection = identity_selection(materialized->row_count());
+    validate_view(view);
+    return view;
+}
+
+storage::ColumnarBatch materialize_aggregate(const plan::PhysicalPlan& plan, const BatchView& input) {
+    validate_view(input);
+
+    std::unordered_map<HashKey, std::size_t, HashKeyHash> group_index_by_key;
+    std::vector<AggregateGroupState> groups;
+    if (plan.group_keys.empty()) {
+        groups.push_back(make_aggregate_group(HashKey{}, plan));
+    }
+
+    for (auto row : *input.selection) {
+        std::size_t group_index = 0;
+        if (!plan.group_keys.empty()) {
+            auto key = make_key(*input.batch, row, plan.group_keys);
+            const auto found = group_index_by_key.find(key);
+            if (found == group_index_by_key.end()) {
+                group_index = groups.size();
+                group_index_by_key.emplace(key, group_index);
+                groups.push_back(make_aggregate_group(std::move(key), plan));
+            } else {
+                group_index = found->second;
+            }
+        }
+
+        auto& group = groups.at(group_index);
+        for (std::size_t i = 0; i < plan.aggregate_expressions.size(); ++i) {
+            update_aggregate(group.aggregates.at(i), plan.aggregate_expressions[i], *input.batch, row);
+        }
+    }
+
+    storage::ColumnarBatch out;
+    for (std::size_t key_index = 0; key_index < plan.group_keys.size(); ++key_index) {
+        storage::Int64Column column;
+        for (const auto& group : groups) {
+            column.append(group.key.values.at(key_index));
+        }
+        out.add_column(column_identity_name(plan.group_keys[key_index]), std::move(column));
+    }
+
+    for (std::size_t aggregate_index = 0; aggregate_index < plan.aggregate_expressions.size(); ++aggregate_index) {
+        const auto& aggregate = plan.aggregate_expressions[aggregate_index];
+        storage::Int64Column column;
+        for (const auto& group : groups) {
+            column.append(finalize_aggregate(group.aggregates.at(aggregate_index), aggregate));
+        }
+        out.add_column(aggregate.output_name, std::move(column));
+    }
+    return out;
+}
+
+BatchView execute_aggregate(const plan::PhysicalPlan& plan, const Catalog& catalog) {
+    auto input = execute_to_view(require_input(plan), catalog);
+    auto materialized = std::make_shared<const storage::ColumnarBatch>(materialize_aggregate(plan, input));
 
     BatchView view;
     view.owned_batch = materialized;

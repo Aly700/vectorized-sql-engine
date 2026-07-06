@@ -30,9 +30,19 @@ const LogicalPlan& require_right(const LogicalPlan& logical) {
 
 std::string expression_to_string(const BoundScalarExpr& expression) {
     if (const auto* column = std::get_if<BoundColumnRef>(&expression)) {
+        if (column->binding.empty()) {
+            return "col(" + column->column + ")";
+        }
         return "col(" + column->binding + "." + column->column + ")";
     }
     return "lit(" + std::to_string(std::get<sql::IntLiteral>(expression).value) + ")";
+}
+
+std::string column_to_string(const BoundColumnRef& column) {
+    if (column.binding.empty()) {
+        return "col(" + column.column + ")";
+    }
+    return "col(" + column.binding + "." + column.column + ")";
 }
 
 std::string comparison_op_to_string(sql::ComparisonOp op) {
@@ -69,7 +79,15 @@ std::string sort_direction_to_string(sql::SortDirection direction) {
 }
 
 std::string sort_key_to_string(const SortKey& key) {
-    return "col(" + key.column.binding + "." + key.column.column + ") " + sort_direction_to_string(key.direction);
+    return column_to_string(key.column) + " " + sort_direction_to_string(key.direction);
+}
+
+std::string aggregate_expression_to_string(const AggregateExpression& aggregate) {
+    auto text = aggregate.output_name;
+    if (aggregate.argument.has_value()) {
+        text += "=" + column_to_string(*aggregate.argument);
+    }
+    return text;
 }
 
 void append_indent(std::ostringstream& out, std::size_t depth) {
@@ -121,6 +139,24 @@ void append_plan(std::ostringstream& out, const LogicalPlan& logical, std::size_
             out << logical.projections[i].output_name << "=" << expression_to_string(logical.projections[i].expression);
         }
         out << "]\n";
+        append_plan(out, require_input(logical), depth + 1);
+        return;
+    case LogicalKind::Aggregate:
+        out << "Aggregate[group_keys=[";
+        for (std::size_t i = 0; i < logical.group_keys.size(); ++i) {
+            if (i != 0) {
+                out << ", ";
+            }
+            out << column_to_string(logical.group_keys[i]);
+        }
+        out << "], aggregates=[";
+        for (std::size_t i = 0; i < logical.aggregate_expressions.size(); ++i) {
+            if (i != 0) {
+                out << ", ";
+            }
+            out << aggregate_expression_to_string(logical.aggregate_expressions[i]);
+        }
+        out << "]]\n";
         append_plan(out, require_input(logical), depth + 1);
         return;
     case LogicalKind::Sort:

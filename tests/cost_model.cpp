@@ -253,6 +253,76 @@ void assert_aliased_self_join_costs_physical_table_stats() {
     }
 }
 
+void assert_aggregate_cost_uses_group_count() {
+    const auto catalog = make_skewed_catalog();
+
+    const auto grouped_sql = "SELECT k, COUNT(*) FROM big GROUP BY k";
+    const auto grouped = sql::bind_select(sql::parse_select(grouped_sql), catalog);
+    const auto grouped_estimate = optimizer::estimate_cost(grouped, catalog);
+    if (grouped_estimate.rows != 1000.0 || grouped_estimate.cost != 3000.0) {
+        std::cerr << "GROUP BY aggregate cost did not use input rows plus group count\n"
+                  << "sql: " << grouped_sql << "\n"
+                  << "plan:\n"
+                  << plan::to_string(grouped) << "\n"
+                  << "rows: " << grouped_estimate.rows << "\n"
+                  << "cost: " << grouped_estimate.cost << "\n";
+        std::terminate();
+    }
+
+    const auto global_sql = "SELECT COUNT(*) FROM tiny";
+    const auto global = sql::bind_select(sql::parse_select(global_sql), catalog);
+    const auto global_estimate = optimizer::estimate_cost(global, catalog);
+    if (global_estimate.rows != 1.0 || global_estimate.cost != 5.0) {
+        std::cerr << "global aggregate cost did not use one output group\n"
+                  << "sql: " << global_sql << "\n"
+                  << "plan:\n"
+                  << plan::to_string(global) << "\n"
+                  << "rows: " << global_estimate.rows << "\n"
+                  << "cost: " << global_estimate.cost << "\n";
+        std::terminate();
+    }
+}
+
+void assert_group_by_does_not_block_join_transforms() {
+    const auto catalog = make_skewed_catalog();
+    const auto sql =
+        "SELECT big.k, COUNT(*) FROM big JOIN mid ON big.k = mid.k JOIN tiny ON mid.k = tiny.k GROUP BY big.k";
+    const auto logical = sql::bind_select(sql::parse_select(sql), catalog);
+
+    optimizer::GroupId root = 0;
+    auto memo = explored_memo_for(logical, root);
+    const auto alternatives = memo.extract_alternatives(root, optimizer::AlternativeExtractionOptions{64, 512});
+    const auto best = memo.extract_best(root, catalog);
+
+    const auto expected_best =
+        std::string("Project[big.k=col(big.k), COUNT(*)=col(COUNT(*))]\n") +
+        "  Aggregate[group_keys=[col(big.k)], aggregates=[COUNT(*)]]\n"
+        "    Join[col(big.k) = col(mid.k)]\n"
+        "      Scan[big]\n"
+        "      Join[col(mid.k) = col(tiny.k)]\n"
+        "        Scan[mid]\n"
+        "        Scan[tiny]";
+
+    std::cout << "group-by multi-join alternatives verified: alternatives=" << alternatives.plans.size()
+              << " max_group_expressions=" << alternatives.max_group_expression_count
+              << " hit_expression_bound=" << (alternatives.hit_expression_bound ? "yes" : "no")
+              << " hit_plan_bound=" << (alternatives.hit_plan_bound ? "yes" : "no") << "\n";
+
+    if (alternatives.plans.size() <= 1 || alternatives.hit_expression_bound || alternatives.hit_plan_bound ||
+        plan::to_string(best) != expected_best || plan::to_string(best) == plan::to_string(logical)) {
+        std::cerr << "GROUP BY blocked join alternatives below Aggregate\n"
+                  << "sql: " << sql << "\n"
+                  << "alternative count: " << alternatives.plans.size() << "\n"
+                  << "ingested plan:\n"
+                  << plan::to_string(logical) << "\n"
+                  << "best plan:\n"
+                  << plan::to_string(best) << "\n"
+                  << "memo dump:\n"
+                  << memo.dump();
+        std::terminate();
+    }
+}
+
 } // namespace
 
 int main() {
@@ -261,5 +331,7 @@ int main() {
     assert_order_by_keeps_join_alternatives_below_sort();
     assert_equal_stats_tie_is_deterministic();
     assert_aliased_self_join_costs_physical_table_stats();
+    assert_aggregate_cost_uses_group_count();
+    assert_group_by_does_not_block_join_transforms();
     return 0;
 }

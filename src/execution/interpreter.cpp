@@ -2,6 +2,9 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
+#include <map>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -32,6 +35,9 @@ const plan::LogicalPlan& require_right(const plan::LogicalPlan& plan) {
 }
 
 std::string column_identity_name(const plan::BoundColumnRef& column) {
+    if (column.binding.empty()) {
+        return column.column;
+    }
     return column.binding + "." + column.column;
 }
 
@@ -151,6 +157,125 @@ storage::ColumnarBatch materialize_project_rows(const plan::LogicalPlan& project
     return out;
 }
 
+struct AggregateValue {
+    std::int64_t count{0};
+    std::int64_t sum{0};
+    std::int64_t min{0};
+    std::int64_t max{0};
+    bool has_value{false};
+};
+
+struct GroupState {
+    std::vector<std::int64_t> key_values;
+    std::vector<AggregateValue> aggregates;
+};
+
+void increment_count(AggregateValue& value, const std::string& output_name) {
+    if (value.count == std::numeric_limits<std::int64_t>::max()) {
+        throw std::runtime_error(output_name + " overflowed int64");
+    }
+    ++value.count;
+}
+
+std::int64_t checked_sum(std::int64_t left, std::int64_t right, const std::string& output_name) {
+    std::int64_t result = 0;
+    if (__builtin_add_overflow(left, right, &result)) {
+        throw std::runtime_error(output_name + " overflowed int64");
+    }
+    return result;
+}
+
+std::int64_t aggregate_argument_value(const plan::AggregateExpression& aggregate,
+                                      const storage::ColumnarBatch& batch,
+                                      std::size_t row) {
+    if (!aggregate.argument.has_value()) {
+        throw std::logic_error("aggregate argument is missing");
+    }
+    return batch.column(column_identity_name(*aggregate.argument)).at(row);
+}
+
+void update_aggregate(AggregateValue& value,
+                      const plan::AggregateExpression& aggregate,
+                      const storage::ColumnarBatch& batch,
+                      std::size_t row) {
+    switch (aggregate.function) {
+    case sql::AggregateFunction::Count:
+        if (aggregate.argument.has_value()) {
+            (void)aggregate_argument_value(aggregate, batch, row);
+        }
+        increment_count(value, aggregate.output_name);
+        return;
+    case sql::AggregateFunction::Sum: {
+        const auto argument = aggregate_argument_value(aggregate, batch, row);
+        if (!value.has_value) {
+            value.sum = argument;
+            value.has_value = true;
+            return;
+        }
+        value.sum = checked_sum(value.sum, argument, aggregate.output_name);
+        return;
+    }
+    case sql::AggregateFunction::Min: {
+        const auto argument = aggregate_argument_value(aggregate, batch, row);
+        if (!value.has_value || argument < value.min) {
+            value.min = argument;
+        }
+        value.has_value = true;
+        return;
+    }
+    case sql::AggregateFunction::Max: {
+        const auto argument = aggregate_argument_value(aggregate, batch, row);
+        if (!value.has_value || argument > value.max) {
+            value.max = argument;
+        }
+        value.has_value = true;
+        return;
+    }
+    }
+    throw std::logic_error("unreachable aggregate function");
+}
+
+std::int64_t finalize_aggregate(const AggregateValue& value, const plan::AggregateExpression& aggregate) {
+    switch (aggregate.function) {
+    case sql::AggregateFunction::Count:
+        return value.count;
+    case sql::AggregateFunction::Sum:
+        if (!value.has_value) {
+            throw std::runtime_error(aggregate.output_name + " over empty input has no NULL-free result");
+        }
+        return value.sum;
+    case sql::AggregateFunction::Min:
+        if (!value.has_value) {
+            throw std::runtime_error(aggregate.output_name + " over empty input has no NULL-free result");
+        }
+        return value.min;
+    case sql::AggregateFunction::Max:
+        if (!value.has_value) {
+            throw std::runtime_error(aggregate.output_name + " over empty input has no NULL-free result");
+        }
+        return value.max;
+    }
+    throw std::logic_error("unreachable aggregate function");
+}
+
+std::vector<std::int64_t> group_key_values(const std::vector<plan::BoundColumnRef>& group_keys,
+                                           const storage::ColumnarBatch& batch,
+                                           std::size_t row) {
+    std::vector<std::int64_t> values;
+    values.reserve(group_keys.size());
+    for (const auto& key : group_keys) {
+        values.push_back(batch.column(column_identity_name(key)).at(row));
+    }
+    return values;
+}
+
+GroupState make_group(std::vector<std::int64_t> key_values, const plan::LogicalPlan& plan) {
+    GroupState group;
+    group.key_values = std::move(key_values);
+    group.aggregates.resize(plan.aggregate_expressions.size());
+    return group;
+}
+
 storage::ColumnarBatch execute_scan(const plan::LogicalPlan& plan, const Catalog& catalog) {
     const auto& input = catalog.table(plan.table);
     storage::ColumnarBatch out;
@@ -235,6 +360,55 @@ storage::ColumnarBatch execute_join(const plan::LogicalPlan& plan, const Catalog
     return out;
 }
 
+storage::ColumnarBatch execute_aggregate(const plan::LogicalPlan& plan, const Catalog& catalog) {
+    const auto input = execute_interpreted(require_input(plan), catalog);
+
+    std::map<std::vector<std::int64_t>, std::size_t> group_index_by_key;
+    std::vector<GroupState> groups;
+    if (plan.group_keys.empty()) {
+        groups.push_back(make_group({}, plan));
+    }
+
+    for (std::size_t row = 0; row < input.row_count(); ++row) {
+        std::size_t group_index = 0;
+        if (!plan.group_keys.empty()) {
+            auto key = group_key_values(plan.group_keys, input, row);
+            const auto found = group_index_by_key.find(key);
+            if (found == group_index_by_key.end()) {
+                group_index = groups.size();
+                group_index_by_key.emplace(key, group_index);
+                groups.push_back(make_group(std::move(key), plan));
+            } else {
+                group_index = found->second;
+            }
+        }
+
+        auto& group = groups.at(group_index);
+        for (std::size_t i = 0; i < plan.aggregate_expressions.size(); ++i) {
+            update_aggregate(group.aggregates.at(i), plan.aggregate_expressions[i], input, row);
+        }
+    }
+
+    storage::ColumnarBatch out;
+    for (std::size_t key_index = 0; key_index < plan.group_keys.size(); ++key_index) {
+        storage::Int64Column column;
+        for (const auto& group : groups) {
+            column.append(group.key_values.at(key_index));
+        }
+        out.add_column(column_identity_name(plan.group_keys[key_index]), std::move(column));
+    }
+
+    for (std::size_t aggregate_index = 0; aggregate_index < plan.aggregate_expressions.size(); ++aggregate_index) {
+        const auto& aggregate = plan.aggregate_expressions[aggregate_index];
+        storage::Int64Column column;
+        for (const auto& group : groups) {
+            column.append(finalize_aggregate(group.aggregates.at(aggregate_index), aggregate));
+        }
+        out.add_column(aggregate.output_name, std::move(column));
+    }
+    return out;
+}
+
 storage::ColumnarBatch execute_sort(const plan::LogicalPlan& plan, const Catalog& catalog) {
     const auto& input_plan = require_input(plan);
     if (input_plan.kind == plan::LogicalKind::Project) {
@@ -298,6 +472,8 @@ storage::ColumnarBatch execute_interpreted(const plan::LogicalPlan& plan, const 
         }
         return out;
     }
+    case plan::LogicalKind::Aggregate:
+        return execute_aggregate(plan, catalog);
     case plan::LogicalKind::Sort:
         return execute_sort(plan, catalog);
     }

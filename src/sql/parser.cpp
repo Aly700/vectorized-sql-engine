@@ -18,6 +18,9 @@ enum class TokenKind {
     Integer,
     Comma,
     Dot,
+    LeftParen,
+    RightParen,
+    Star,
     Semicolon,
     Equal,
     NotEqual,
@@ -63,7 +66,8 @@ bool is_reserved_keyword(std::string_view text) {
            equals_keyword(text, "AND") || equals_keyword(text, "OR") || equals_keyword(text, "AS") ||
            equals_keyword(text, "JOIN") || equals_keyword(text, "INNER") || equals_keyword(text, "ON") ||
            equals_keyword(text, "ORDER") || equals_keyword(text, "BY") || equals_keyword(text, "ASC") ||
-           equals_keyword(text, "DESC");
+           equals_keyword(text, "DESC") || equals_keyword(text, "GROUP") || equals_keyword(text, "COUNT") ||
+           equals_keyword(text, "SUM") || equals_keyword(text, "MIN") || equals_keyword(text, "MAX");
 }
 
 class Lexer {
@@ -104,6 +108,12 @@ public:
             return Token{TokenKind::Comma, ",", position};
         case '.':
             return Token{TokenKind::Dot, ".", position};
+        case '(':
+            return Token{TokenKind::LeftParen, "(", position};
+        case ')':
+            return Token{TokenKind::RightParen, ")", position};
+        case '*':
+            return Token{TokenKind::Star, "*", position};
         case ';':
             return Token{TokenKind::Semicolon, ";", position};
         case '=':
@@ -158,6 +168,10 @@ public:
             query.predicate = parse_where();
         }
 
+        if (is_keyword("GROUP")) {
+            query.group_by = parse_group_by();
+        }
+
         if (is_keyword("ORDER")) {
             query.order_by = parse_order_by();
         }
@@ -183,6 +197,13 @@ private:
 
     void expect_keyword(std::string_view keyword, const std::string& message) {
         if (!is_keyword(keyword)) {
+            throw ParseError(current_.position, message);
+        }
+        advance();
+    }
+
+    void expect_token(TokenKind kind, const std::string& message) {
+        if (current_.kind != kind) {
             throw ParseError(current_.position, message);
         }
         advance();
@@ -233,7 +254,7 @@ private:
     }
 
     SelectItem parse_select_item() {
-        auto expression = parse_scalar_expr("expected projection expression");
+        auto expression = parse_select_expr("expected projection expression");
         return SelectItem{expression, expression_position(expression)};
     }
 
@@ -252,6 +273,19 @@ private:
         while (current_.kind == TokenKind::Comma) {
             advance();
             keys.push_back(parse_order_by_key());
+        }
+        return keys;
+    }
+
+    std::vector<ColumnRef> parse_group_by() {
+        expect_keyword("GROUP", "expected GROUP");
+        expect_keyword("BY", "expected BY after GROUP");
+
+        std::vector<ColumnRef> keys;
+        keys.push_back(parse_column_ref("expected GROUP BY column name"));
+        while (current_.kind == TokenKind::Comma) {
+            advance();
+            keys.push_back(parse_column_ref("expected GROUP BY column name"));
         }
         return keys;
     }
@@ -370,6 +404,70 @@ private:
         }
 
         throw ParseError(current_.position, message);
+    }
+
+    SelectExpr parse_select_expr(const std::string& message) {
+        if (is_aggregate_function()) {
+            return parse_aggregate_call();
+        }
+        return parse_scalar_expr(message);
+    }
+
+    bool is_aggregate_function() const {
+        return is_keyword("COUNT") || is_keyword("SUM") || is_keyword("MIN") || is_keyword("MAX");
+    }
+
+    AggregateFunction parse_aggregate_function() {
+        if (is_keyword("COUNT")) {
+            advance();
+            return AggregateFunction::Count;
+        }
+        if (is_keyword("SUM")) {
+            advance();
+            return AggregateFunction::Sum;
+        }
+        if (is_keyword("MIN")) {
+            advance();
+            return AggregateFunction::Min;
+        }
+        if (is_keyword("MAX")) {
+            advance();
+            return AggregateFunction::Max;
+        }
+        throw ParseError(current_.position, "expected aggregate function");
+    }
+
+    AggregateCall parse_aggregate_call() {
+        const auto position = current_.position;
+        const auto function = parse_aggregate_function();
+        expect_token(TokenKind::LeftParen, "expected '(' after aggregate function");
+
+        AggregateCall aggregate;
+        aggregate.function = function;
+        aggregate.position = position;
+
+        if (function == AggregateFunction::Count && current_.kind == TokenKind::Star) {
+            aggregate.count_star = true;
+            advance();
+            expect_token(TokenKind::RightParen, "expected ')' after aggregate argument");
+            return aggregate;
+        }
+
+        if (current_.kind == TokenKind::Star) {
+            throw ParseError(current_.position, "expected aggregate argument column");
+        }
+
+        if (is_aggregate_function()) {
+            const auto nested = parse_aggregate_call();
+            aggregate.nested_aggregate = true;
+            aggregate.nested_function = nested.function;
+            aggregate.nested_position = nested.position;
+        } else {
+            aggregate.argument = parse_column_ref("expected aggregate argument column");
+        }
+
+        expect_token(TokenKind::RightParen, "expected ')' after aggregate argument");
+        return aggregate;
     }
 
     Lexer lexer_;

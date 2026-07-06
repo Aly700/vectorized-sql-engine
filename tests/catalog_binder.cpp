@@ -164,6 +164,82 @@ void assert_order_by_ambiguous_unqualified_column_reports_candidates() {
     throw std::logic_error("expected ambiguous ORDER BY bind error");
 }
 
+void assert_group_by_binds_aggregate_between_filter_and_project() {
+    auto catalog = make_schema_catalog();
+    const auto logical =
+        sql::bind_select(sql::parse_select("SELECT a, COUNT(*), SUM(b) FROM t WHERE b >= 20 GROUP BY a"), catalog);
+
+    assert(logical.kind == plan::LogicalKind::Project);
+    assert(logical.projections.size() == 3);
+    assert(logical.projections[0].output_name == "a");
+    assert(logical.projections[1].output_name == "COUNT(*)");
+    assert(logical.projections[2].output_name == "SUM(b)");
+
+    const auto printed = plan::to_string(logical);
+    assert(printed.find("Project[a=col(t.a), COUNT(*)=col(COUNT(*)), SUM(b)=col(SUM(b))]") != std::string::npos);
+    assert(printed.find("Aggregate[group_keys=[col(t.a)], aggregates=[COUNT(*), SUM(b)=col(t.b)]]") !=
+           std::string::npos);
+    assert(printed.find("Filter[col(t.b) >= lit(20)]") != std::string::npos);
+}
+
+void assert_ungrouped_aggregate_binds_single_global_group() {
+    auto catalog = make_schema_catalog();
+    const auto logical = sql::bind_select(sql::parse_select("SELECT COUNT(*), MIN(t.b), MAX(t.b) FROM t"), catalog);
+
+    const auto printed = plan::to_string(logical);
+    assert(printed.find("Aggregate[group_keys=[], aggregates=[COUNT(*), MIN(t.b)=col(t.b), MAX(t.b)=col(t.b)]]") !=
+           std::string::npos);
+    assert(printed.find("Project[COUNT(*)=col(COUNT(*)), MIN(t.b)=col(MIN(t.b)), MAX(t.b)=col(MAX(t.b))]") !=
+           std::string::npos);
+}
+
+void assert_non_grouped_projection_column_is_rejected() {
+    auto catalog = make_schema_catalog();
+    try {
+        (void)sql::bind_select(sql::parse_select("SELECT a, b, COUNT(*) FROM t GROUP BY a"), catalog);
+    } catch (const sql::BindError& error) {
+        assert(error.position() == 10);
+        assert(error.message() == "non-grouped column 'b' must appear in GROUP BY or be aggregated");
+        return;
+    }
+    throw std::logic_error("expected non-grouped projection bind error");
+}
+
+void assert_nested_aggregate_is_rejected() {
+    auto catalog = make_schema_catalog();
+    try {
+        (void)sql::bind_select(sql::parse_select("SELECT SUM(COUNT(*)) FROM t"), catalog);
+    } catch (const sql::BindError& error) {
+        assert(error.position() == 11);
+        assert(error.message() == "nested aggregate 'COUNT' is not allowed");
+        return;
+    }
+    throw std::logic_error("expected nested aggregate bind error");
+}
+
+void assert_grouped_order_by_must_use_grouping_column() {
+    auto catalog = make_schema_catalog();
+    try {
+        (void)sql::bind_select(sql::parse_select("SELECT a, COUNT(*) FROM t GROUP BY a ORDER BY b"), catalog);
+    } catch (const sql::BindError& error) {
+        assert(error.position() == 46);
+        assert(error.message() == "ORDER BY column 'b' must be a GROUP BY column in aggregate queries");
+        return;
+    }
+    throw std::logic_error("expected grouped ORDER BY bind error");
+}
+
+void assert_grouped_order_by_accepts_grouping_column() {
+    auto catalog = make_schema_catalog();
+    const auto logical =
+        sql::bind_select(sql::parse_select("SELECT a, COUNT(*) FROM t GROUP BY a ORDER BY a DESC"), catalog);
+
+    assert(logical.kind == plan::LogicalKind::Sort);
+    const auto printed = plan::to_string(logical);
+    assert(printed.find("Sort[col(t.a) DESC]") != std::string::npos);
+    assert(printed.find("Aggregate[group_keys=[col(t.a)], aggregates=[COUNT(*)]]") != std::string::npos);
+}
+
 void assert_physical_table_qualifier_is_unknown_when_alias_exists() {
     auto catalog = make_schema_catalog();
     try {
@@ -247,6 +323,12 @@ int main() {
     assert_order_by_uses_from_scope_not_projection_outputs();
     assert_alias_order_by_uses_binding_scope();
     assert_order_by_ambiguous_unqualified_column_reports_candidates();
+    assert_group_by_binds_aggregate_between_filter_and_project();
+    assert_ungrouped_aggregate_binds_single_global_group();
+    assert_non_grouped_projection_column_is_rejected();
+    assert_nested_aggregate_is_rejected();
+    assert_grouped_order_by_must_use_grouping_column();
+    assert_grouped_order_by_accepts_grouping_column();
     assert_physical_table_qualifier_is_unknown_when_alias_exists();
     assert_duplicate_binding_reports_alias_scope();
     assert_unaliased_self_join_still_requires_aliases();

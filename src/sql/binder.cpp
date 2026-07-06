@@ -8,6 +8,7 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace sql {
@@ -106,11 +107,15 @@ const TableScope& find_unqualified_scope(const ColumnRef& column, const std::vec
     return *matches.front();
 }
 
+plan::BoundColumnRef bind_column_ref(const ColumnRef& column, const std::vector<TableScope>& scopes) {
+    const auto& scope =
+        column.qualifier.has_value() ? find_qualified_scope(column, scopes) : find_unqualified_scope(column, scopes);
+    return plan::BoundColumnRef{scope.binding_name, column.name, column.position};
+}
+
 plan::BoundScalarExpr bind_expression(const ScalarExpr& expression, const std::vector<TableScope>& scopes) {
     if (const auto* column = std::get_if<ColumnRef>(&expression)) {
-        const auto& scope =
-            column->qualifier.has_value() ? find_qualified_scope(*column, scopes) : find_unqualified_scope(*column, scopes);
-        return plan::BoundColumnRef{scope.binding_name, column->name, column->position};
+        return bind_column_ref(*column, scopes);
     }
     return std::get<IntLiteral>(expression);
 }
@@ -135,18 +140,81 @@ std::vector<plan::BoundComparisonExpr> bind_comparisons(const std::vector<Compar
 }
 
 plan::SortKey bind_order_by_key(const OrderByKey& key, const std::vector<TableScope>& scopes) {
-    const auto& column = key.column;
-    const auto& scope =
-        column.qualifier.has_value() ? find_qualified_scope(column, scopes) : find_unqualified_scope(column, scopes);
-    return plan::SortKey{plan::BoundColumnRef{scope.binding_name, column.name, column.position}, key.direction};
+    return plan::SortKey{bind_column_ref(key.column, scopes), key.direction};
+}
+
+bool bound_column_equal(const plan::BoundColumnRef& left, const plan::BoundColumnRef& right) {
+    return left.binding == right.binding && left.column == right.column;
+}
+
+bool contains_group_key(const std::vector<plan::BoundColumnRef>& group_keys, const plan::BoundColumnRef& column) {
+    for (const auto& key : group_keys) {
+        if (bound_column_equal(key, column)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::vector<plan::BoundColumnRef> bind_group_by_keys(const std::vector<ColumnRef>& keys,
+                                                     const std::vector<TableScope>& scopes) {
+    std::vector<plan::BoundColumnRef> bound;
+    bound.reserve(keys.size());
+    std::set<std::string> seen;
+    for (const auto& key : keys) {
+        auto column = bind_column_ref(key, scopes);
+        const auto identity = column.binding + "." + column.column;
+        const auto [_, inserted] = seen.insert(identity);
+        if (!inserted) {
+            throw BindError(key.position, "duplicate GROUP BY column '" + output_name(key) + "'");
+        }
+        bound.push_back(std::move(column));
+    }
+    return bound;
+}
+
+bool select_item_is_aggregate(const SelectItem& item) {
+    return std::holds_alternative<AggregateCall>(item.expression);
+}
+
+bool query_has_aggregate(const SelectQuery& query) {
+    for (const auto& item : query.projection) {
+        if (select_item_is_aggregate(item)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+plan::AggregateExpression bind_aggregate_call(const AggregateCall& aggregate,
+                                              const std::vector<TableScope>& scopes) {
+    if (aggregate.nested_aggregate) {
+        throw BindError(aggregate.nested_position,
+                        "nested aggregate '" + aggregate_function_name(aggregate.nested_function) + "' is not allowed");
+    }
+
+    std::optional<plan::BoundColumnRef> argument;
+    if (aggregate.argument.has_value()) {
+        argument = bind_column_ref(*aggregate.argument, scopes);
+    }
+
+    return plan::AggregateExpression{output_name(aggregate), aggregate.function, std::move(argument), aggregate.position};
 }
 
 std::vector<plan::SortKey> bind_order_by_keys(const std::vector<OrderByKey>& keys,
-                                              const std::vector<TableScope>& scopes) {
+                                              const std::vector<TableScope>& scopes,
+                                              const std::vector<plan::BoundColumnRef>& group_keys,
+                                              bool aggregate_query) {
     std::vector<plan::SortKey> bound;
     bound.reserve(keys.size());
     for (const auto& key : keys) {
-        bound.push_back(bind_order_by_key(key, scopes));
+        auto sort_key = bind_order_by_key(key, scopes);
+        if (aggregate_query && !contains_group_key(group_keys, sort_key.column)) {
+            throw BindError(key.column.position,
+                            "ORDER BY column '" + output_name(key.column) +
+                                "' must be a GROUP BY column in aggregate queries");
+        }
+        bound.push_back(std::move(sort_key));
     }
     return bound;
 }
@@ -168,17 +236,39 @@ void mark_arbitrary_order(plan::LogicalPlan& logical) {
 
 plan::LogicalPlan bind_select(const SelectQuery& query, const catalog::Catalog& catalog) {
     const auto scopes = build_scopes(query, catalog);
+    auto group_keys = bind_group_by_keys(query.group_by, scopes);
+    const auto aggregate_query = !group_keys.empty() || query_has_aggregate(query);
 
     std::set<std::string> output_names;
     std::vector<plan::Projection> projections;
+    std::vector<plan::AggregateExpression> aggregate_expressions;
     projections.reserve(query.projection.size());
     for (const auto& item : query.projection) {
-        auto expression = bind_expression(item.expression, scopes);
-
         auto name = output_name(item.expression);
         const auto [_, inserted] = output_names.insert(name);
         if (!inserted) {
             throw BindError(item.position, "duplicate output name '" + name + "'");
+        }
+
+        if (const auto* aggregate = std::get_if<AggregateCall>(&item.expression)) {
+            aggregate_expressions.push_back(bind_aggregate_call(*aggregate, scopes));
+            projections.push_back(plan::Projection{
+                name,
+                plan::BoundColumnRef{"", name, item.position},
+            });
+            continue;
+        }
+
+        const auto& scalar = std::get<ScalarExpr>(item.expression);
+        auto expression = bind_expression(scalar, scopes);
+        if (aggregate_query) {
+            if (const auto* column = std::get_if<plan::BoundColumnRef>(&expression);
+                column != nullptr && !contains_group_key(group_keys, *column)) {
+                const auto& parsed_column = std::get<ColumnRef>(scalar);
+                throw BindError(parsed_column.position,
+                                "non-grouped column '" + output_name(parsed_column) +
+                                    "' must appear in GROUP BY or be aggregated");
+            }
         }
         projections.push_back(plan::Projection{std::move(name), std::move(expression)});
     }
@@ -196,13 +286,17 @@ plan::LogicalPlan bind_select(const SelectQuery& query, const catalog::Catalog& 
     if (query.predicate.has_value()) {
         plan = plan::LogicalPlan::filter(bind_comparisons(query.predicate->conjuncts, scopes), std::move(plan));
     }
+    if (aggregate_query) {
+        plan = plan::LogicalPlan::aggregate(std::move(group_keys), std::move(aggregate_expressions), std::move(plan));
+    }
     auto bound = plan::LogicalPlan::project(std::move(projections), std::move(plan));
     mark_arbitrary_order(bound);
     if (!query.order_by.empty()) {
-        // This SQL slice deliberately binds ORDER BY against FROM scopes, not
-        // projection output aliases. That keeps ordered keys as stable bound
-        // column identities even when the SELECT list renames or omits them.
-        return plan::LogicalPlan::sort(bind_order_by_keys(query.order_by, scopes), std::move(bound));
+        // Non-aggregate queries deliberately bind ORDER BY against FROM scopes,
+        // not projection output aliases. Aggregate queries keep the same stable
+        // FROM-scope identities but restrict ORDER BY to grouping columns.
+        return plan::LogicalPlan::sort(bind_order_by_keys(query.order_by, scopes, bound.input->group_keys, aggregate_query),
+                                       std::move(bound));
     }
     return bound;
 }

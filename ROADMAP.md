@@ -7,6 +7,7 @@
 5. Cascades memo, cost model, and join reordering. Delivered in Phase 5c: the memo now explores equivalent join orders, verifies all enumerated alternatives, and extracts a deterministic low-cost logical plan from catalog row-count statistics without changing semantics.
 6. ORDER BY end-to-end. Delivered in Phase 6: parser and binder support FROM-scope column sort keys, logical and physical plans include a required-order root `Sort`, both engines implement deterministic stable sorting, and memo verification distinguishes same-plan exact equality from cross-plan ordered bag-plus-sortedness checks.
 7. Table aliases and self-joins. Delivered in Phase 7: parser and binder support `FROM t [AS] x` and aliased join chains, bound column identities are binding-scoped, logical/physical scans carry physical table plus binding name, memo scan dedup includes aliases, cost stats look up physical tables while distinct keys remain binding-scoped, and both engines verify aliased self-joins through golden and differential memo alternatives.
+8. GROUP BY and aggregate functions. Delivered in Phase 8: parser and binder support `COUNT(*)`, `COUNT(col)`, `SUM`, `MIN`, `MAX`, and `GROUP BY` column refs; `Aggregate` is a logical/physical/memo node between Filter/Join and Project; interpreted and vectorized aggregation preserve first-appearance group order; global empty `COUNT` returns zero while empty `SUM/MIN/MAX` fail loudly in the NULL-free slice; `SUM` detects int64 overflow; join transforms still fire below Aggregate; aggregate queries are covered by golden, binder, cost-model, differential alternatives, and extract_best verification.
 
 ## Phase 1 first tasks
 
@@ -22,6 +23,8 @@ Do not optimize before correctness. Every phase should end with an executable de
 ## Follow-on ideas
 
 - Add output-alias-aware `ORDER BY` once the SQL slice grows explicit alias binding.
+- Add aggregate-output-aware `ORDER BY` once projection alias/name binding is represented explicitly.
+- Add HAVING only after aggregate predicates have a clear bound-expression layer distinct from WHERE.
 - Add sort elimination or sort pushdown only after required physical properties are represented in the memo.
 - Add real per-column statistics behind the catalog boundary, such as exact distinct counts or histograms, while preserving deterministic collection.
 - Split logical and physical costing once physical join implementations expose build/probe choices explicitly.

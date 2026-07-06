@@ -338,6 +338,7 @@ bool contains_join(const plan::LogicalPlan& logical) {
         return true;
     case plan::LogicalKind::Filter:
     case plan::LogicalKind::Project:
+    case plan::LogicalKind::Aggregate:
     case plan::LogicalKind::Sort:
         return logical.input != nullptr && contains_join(*logical.input);
     }
@@ -502,6 +503,9 @@ bool run_result_golden_queries() {
         "SELECT a, b FROM t ORDER BY b DESC",
         "SELECT a, b FROM t ORDER BY b ASC, a DESC",
         "SELECT b FROM t ORDER BY b ASC",
+        "SELECT COUNT(*), COUNT(b), SUM(a), MIN(b), MAX(b) FROM t",
+        "SELECT b, COUNT(*), SUM(a), MIN(a), MAX(a) FROM t GROUP BY b",
+        "SELECT b, COUNT(*) FROM t GROUP BY b ORDER BY b DESC",
     };
 
     bool ok = true;
@@ -549,6 +553,10 @@ bool run_join_oracle_corpus() {
         "JOIN t1 AS z ON y.a = z.a WHERE z.b >= 20",
         "SELECT x.b, y.c, z.d FROM t1 AS x JOIN t2 AS y ON x.a = y.a "
         "JOIN t3 AS z ON y.c = z.c ORDER BY z.d DESC, x.b ASC",
+        "SELECT t1.a, COUNT(*), SUM(t2.c), MIN(t2.c), MAX(t2.c) FROM t1 JOIN t2 ON t1.a = t2.a GROUP BY t1.a",
+        "SELECT t1.a, COUNT(*) FROM t1 JOIN t2 ON t1.a = t2.a GROUP BY t1.a ORDER BY t1.a DESC",
+        "SELECT t1.a, t3.d, COUNT(*) FROM t1 JOIN t2 ON t1.a = t2.a "
+        "JOIN t3 ON t2.c = t3.c GROUP BY t1.a, t3.d ORDER BY t3.d DESC, t1.a ASC",
     };
 
     bool ok = true;
@@ -634,6 +642,14 @@ bool run_generated_corpus() {
         }
         ok = compare_engines("SELECT a FROM t ORDER BY a ASC", catalog, table_text) && ok;
         ok = compare_engines("SELECT b, a FROM t ORDER BY b DESC, a ASC", catalog, table_text) && ok;
+        ok = compare_engines("SELECT COUNT(*) FROM t", catalog, table_text) && ok;
+        ok = compare_engines("SELECT a, COUNT(*) FROM t GROUP BY a", catalog, table_text) && ok;
+        ok = compare_engines("SELECT a, b, COUNT(*) FROM t GROUP BY a, b", catalog, table_text) && ok;
+        ok = compare_engines("SELECT a, COUNT(*), COUNT(b), SUM(b), MIN(b), MAX(b) FROM t GROUP BY a",
+                             catalog,
+                             table_text) &&
+             ok;
+        ok = compare_engines("SELECT a, COUNT(*) FROM t GROUP BY a ORDER BY a DESC", catalog, table_text) && ok;
 
         for (const auto op : ops) {
             for (const auto literal : literals) {
