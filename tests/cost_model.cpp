@@ -348,6 +348,36 @@ void assert_having_costs_as_filter_over_aggregate() {
     }
 }
 
+void assert_or_selectivity_uses_inclusion_exclusion() {
+    const auto catalog = make_skewed_catalog();
+
+    const auto or_sql = "SELECT k FROM big WHERE k = 1 OR k = 2";
+    const auto or_logical = sql::bind_select(sql::parse_select(or_sql), catalog);
+    const auto or_estimate = optimizer::estimate_cost(or_logical, catalog);
+    if (std::abs(or_estimate.rows - 190.0) > 1e-9 || or_estimate.cost != 2000.0) {
+        std::cerr << "OR selectivity did not use inclusion-exclusion\n"
+                  << "sql: " << or_sql << "\n"
+                  << "plan:\n"
+                  << plan::to_string(or_logical) << "\n"
+                  << "rows: " << or_estimate.rows << "\n"
+                  << "cost: " << or_estimate.cost << "\n";
+        std::terminate();
+    }
+
+    const auto nested_sql = "SELECT k FROM big WHERE k = 1 AND (k = 2 OR k <> 3)";
+    const auto nested_logical = sql::bind_select(sql::parse_select(nested_sql), catalog);
+    const auto nested_estimate = optimizer::estimate_cost(nested_logical, catalog);
+    if (std::abs(nested_estimate.rows - 91.0) > 1e-9 || nested_estimate.cost != 2000.0) {
+        std::cerr << "nested AND/OR selectivity was not deterministic\n"
+                  << "sql: " << nested_sql << "\n"
+                  << "plan:\n"
+                  << plan::to_string(nested_logical) << "\n"
+                  << "rows: " << nested_estimate.rows << "\n"
+                  << "cost: " << nested_estimate.cost << "\n";
+        std::terminate();
+    }
+}
+
 void assert_having_does_not_block_join_transforms() {
     const auto catalog = make_skewed_catalog();
     const auto sql =
@@ -423,6 +453,39 @@ void assert_extract_best_prefers_pushed_join_filter() {
     }
 }
 
+void assert_extract_best_prefers_pushed_one_side_or_filter() {
+    const auto catalog = make_pushdown_catalog();
+    const auto sql = "SELECT big.k, mid.k FROM big JOIN mid ON big.k = mid.k WHERE big.k = 7 OR big.k = 8";
+    const auto logical = sql::bind_select(sql::parse_select(sql), catalog);
+
+    optimizer::GroupId root = 0;
+    auto memo = explored_memo_for(logical, root);
+    const auto best = memo.extract_best(root, catalog);
+    const auto ingested_cost = optimizer::estimate_cost(logical, catalog);
+    const auto best_cost = optimizer::estimate_cost(best, catalog);
+
+    const auto expected_best =
+        std::string("Project[big.k=col(big.k), mid.k=col(mid.k)]\n") +
+        "  Join[col(big.k) = col(mid.k)]\n"
+        "    Filter[(col(big.k) = lit(7) OR col(big.k) = lit(8))]\n"
+        "      Scan[big]\n"
+        "    Scan[mid]";
+
+    if (plan::to_string(best) != expected_best || !(best_cost.cost < ingested_cost.cost)) {
+        std::cerr << "extract_best did not prefer the pushed-down one-side OR filter\n"
+                  << "sql: " << sql << "\n"
+                  << "ingested plan:\n"
+                  << plan::to_string(logical) << "\n"
+                  << "ingested cost: " << ingested_cost.cost << "\n"
+                  << "best plan:\n"
+                  << plan::to_string(best) << "\n"
+                  << "best cost: " << best_cost.cost << "\n"
+                  << "memo dump:\n"
+                  << memo.dump();
+        std::terminate();
+    }
+}
+
 } // namespace
 
 int main() {
@@ -434,7 +497,9 @@ int main() {
     assert_aggregate_cost_uses_group_count();
     assert_group_by_does_not_block_join_transforms();
     assert_having_costs_as_filter_over_aggregate();
+    assert_or_selectivity_uses_inclusion_exclusion();
     assert_having_does_not_block_join_transforms();
     assert_extract_best_prefers_pushed_join_filter();
+    assert_extract_best_prefers_pushed_one_side_or_filter();
     return 0;
 }

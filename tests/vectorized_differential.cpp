@@ -505,11 +505,16 @@ bool run_result_golden_queries() {
         "SELECT b FROM t ORDER BY b ASC",
         "SELECT a AS x, b AS y FROM t ORDER BY x DESC",
         "SELECT b AS a, a AS original FROM t ORDER BY a DESC",
+        "SELECT a, b FROM t WHERE a = 1 OR b = 20 AND c = 7",
+        "SELECT a FROM t WHERE (a = 1 OR b = 20) AND c >= 6",
+        "SELECT a FROM t WHERE 2 > 1 OR a = 5",
+        "SELECT a FROM t WHERE 2 < 1 OR a = 2",
         "SELECT COUNT(*), COUNT(b), SUM(a), MIN(b), MAX(b) FROM t",
         "SELECT b, COUNT(*), SUM(a), MIN(a), MAX(a) FROM t GROUP BY b",
         "SELECT b, COUNT(*) FROM t GROUP BY b ORDER BY b DESC",
         "SELECT a FROM t GROUP BY a HAVING SUM(b) > 20",
         "SELECT a, COUNT(*) FROM t GROUP BY a HAVING SUM(b) > 1000",
+        "SELECT b, COUNT(*) FROM t GROUP BY b HAVING b = 10 OR COUNT(*) > 1",
         "SELECT a, SUM(b) AS total FROM t GROUP BY a HAVING SUM(b) >= 20 ORDER BY total DESC",
         "SELECT a, SUM(b) FROM t GROUP BY a ORDER BY SUM(b) DESC",
     };
@@ -541,8 +546,15 @@ bool run_join_oracle_corpus() {
         "SELECT t1.b, t2.c FROM t1 JOIN t2 ON t1.a = t2.a WHERE 2 > 1 AND t2.c > 200",
         "SELECT t1.b, t2.c FROM t1 JOIN t2 ON t1.a = t2.a "
         "WHERE t1.b = 20 AND t2.c > 200 AND t1.b < t2.c",
+        "SELECT t1.b, t2.c FROM t1 JOIN t2 ON t1.a = t2.a "
+        "WHERE (t1.b = 20 OR t1.b = 30) AND t2.c = 201",
+        "SELECT t1.b, t2.c FROM t1 JOIN t2 ON t1.a = t2.a "
+        "WHERE t1.b = 20 OR t2.c = 201",
+        "SELECT t1.b, t2.c FROM t1 JOIN t2 ON t1.a = t2.a AND (t2.c = 200 OR t1.b = 30)",
         "SELECT t1.b FROM t1 JOIN t2 ON t1.a = t2.a WHERE 2 < 1",
         "SELECT t1.b, t2.c, t3.d FROM t1 JOIN t2 ON t1.a = t2.a JOIN t3 ON t2.c = t3.c WHERE t3.d >= 2",
+        "SELECT t1.b, t2.c, t3.d FROM t1 JOIN t2 ON t1.a = t2.a JOIN t3 ON t2.c = t3.c "
+        "WHERE ((t1.b = 20 OR t3.d = 3) AND (t2.c = 201 OR t3.d = 2))",
         "SELECT t1.b, t2.c, t3.d, t4.e FROM t1 JOIN t2 ON t1.a = t2.a "
         "JOIN t3 ON t2.c = t3.c JOIN t4 ON t3.d = t4.d",
         "SELECT t1.b, t2.c, t3.d FROM t1 JOIN t2 ON t1.a = t2.a "
@@ -566,6 +578,10 @@ bool run_join_oracle_corpus() {
         "SELECT t1.a FROM t1 JOIN t2 ON t1.a = t2.a GROUP BY t1.a HAVING SUM(t2.c) > 500",
         "SELECT t1.a, COUNT(*) FROM t1 JOIN t2 ON t1.a = t2.a "
         "GROUP BY t1.a HAVING t1.a = 2 AND COUNT(*) > 1",
+        "SELECT t1.a, COUNT(*) FROM t1 JOIN t2 ON t1.a = t2.a "
+        "GROUP BY t1.a HAVING t1.a = 1 OR t1.a = 2",
+        "SELECT t1.a, COUNT(*) FROM t1 JOIN t2 ON t1.a = t2.a "
+        "GROUP BY t1.a HAVING t1.a = 1 OR COUNT(*) > 1",
         "SELECT t1.a AS key, SUM(t2.c) AS total FROM t1 JOIN t2 ON t1.a = t2.a "
         "GROUP BY t1.a HAVING SUM(t2.c) > 500 ORDER BY total DESC",
         "SELECT t1.a, t3.d, COUNT(*) FROM t1 JOIN t2 ON t1.a = t2.a "
@@ -703,6 +719,17 @@ bool run_generated_corpus() {
             ok = compare_engines("SELECT " + projection + " FROM t WHERE 2 < 1", catalog, table_text) && ok;
             ok = compare_engines("SELECT " + projection + " FROM t WHERE 2 > 1 AND a = 7", catalog, table_text) && ok;
             ok = compare_engines("SELECT " + projection + " FROM t WHERE a = 7 AND 2 < 1", catalog, table_text) && ok;
+            ok = compare_engines("SELECT " + projection + " FROM t WHERE 2 > 1 OR a = 7", catalog, table_text) && ok;
+            ok = compare_engines("SELECT " + projection + " FROM t WHERE 2 < 1 OR a = 7", catalog, table_text) && ok;
+            ok = compare_engines("SELECT " + projection + " FROM t WHERE (a = 7 OR b = 7) AND 2 > 1",
+                                 catalog,
+                                 table_text) &&
+                 ok;
+            ok = compare_engines("SELECT " + projection + " FROM t WHERE a = " + std::to_string(min) +
+                                     " OR b = " + std::to_string(max),
+                                 catalog,
+                                 table_text) &&
+                 ok;
         }
     }
 

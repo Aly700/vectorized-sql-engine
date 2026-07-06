@@ -280,6 +280,45 @@ void assert_filter_into_join_adds_pushdown_alternative() {
     memo.assert_invariants();
 }
 
+void assert_filter_into_join_moves_one_side_or_but_not_mixed_side_or() {
+    const auto catalog = make_catalog();
+    const auto sql =
+        "SELECT t1.b, t2.c FROM t1 JOIN t2 ON t1.a = t2.a "
+        "WHERE (t1.b = 20 OR t1.b = 30) AND (t1.b = 20 OR t2.c = 201)";
+    const auto logical = sql::bind_select(sql::parse_select(sql), catalog);
+
+    optimizer::Memo memo;
+    const auto root = memo.insert(logical);
+    const auto explored = optimizer::explore_memo_to_fixpoint(memo, optimizer::default_memo_rules());
+    assert(explored.reached_fixpoint);
+
+    const auto dump = memo.dump();
+    const std::string left_only_or = "Filter[(col(t1.b) = lit(20) OR col(t1.b) = lit(30))]";
+    const std::string mixed_or = "(col(t1.b) = lit(20) OR col(t2.c) = lit(201))";
+    const std::string illegal_join_or =
+        "Join[col(t1.a) = col(t2.a) AND (col(t1.b) = lit(20) OR col(t2.c) = lit(201))]";
+
+    if (!trace_contains(explored.fired_rules, "FilterIntoJoinRule") ||
+        dump.find(left_only_or) == std::string::npos ||
+        dump.find("Filter[" + mixed_or + "]") == std::string::npos ||
+        dump.find(illegal_join_or) != std::string::npos) {
+        std::cerr << "OR predicate mobility did not move only whole one-side trees\n"
+                  << "sql: " << sql << "\n"
+                  << "root group: " << root << "\n"
+                  << "trace: ";
+        for (const auto& fired : explored.fired_rules) {
+            std::cerr << fired << " ";
+        }
+        std::cerr << "\nlogical plan:\n"
+                  << plan::to_string(logical) << "\n"
+                  << "memo dump:\n"
+                  << dump;
+        std::terminate();
+    }
+
+    memo.assert_invariants();
+}
+
 bool contains_plan_text(const std::vector<plan::LogicalPlan>& alternatives, const std::string& text) {
     for (const auto& alternative : alternatives) {
         if (plan::to_string(alternative).find(text) != std::string::npos) {
@@ -332,6 +371,49 @@ void assert_filter_through_aggregate_pushes_only_group_keys() {
     memo.assert_invariants();
 }
 
+void assert_filter_through_aggregate_moves_group_key_or_but_pins_aggregate_or() {
+    const auto catalog = make_catalog();
+    const auto sql =
+        "SELECT t1.a, COUNT(*) FROM t1 JOIN t2 ON t1.a = t2.a "
+        "GROUP BY t1.a HAVING (t1.a = 1 OR t1.a = 2) AND (t1.a = 1 OR COUNT(*) > 1)";
+    const auto logical = sql::bind_select(sql::parse_select(sql), catalog);
+
+    optimizer::Memo memo;
+    const auto root = memo.insert(logical);
+    const auto explored = optimizer::explore_memo_to_fixpoint(memo, optimizer::default_memo_rules());
+    assert(explored.reached_fixpoint);
+    const auto alternatives = memo.extract_alternatives(root, optimizer::AlternativeExtractionOptions{128, 1024});
+    assert(!alternatives.hit_expression_bound);
+    assert(!alternatives.hit_plan_bound);
+
+    const auto pushed_group_key_or =
+        std::string("Filter[(col(t1.a) = lit(1) OR col(COUNT(*)) > lit(1))]\n") +
+        "    Aggregate[group_keys=[col(t1.a)], aggregates=[COUNT(*)]]\n"
+        "      Filter[(col(t1.a) = lit(1) OR col(t1.a) = lit(2))]";
+    const auto illegal_aggregate_output_or_push =
+        std::string("Aggregate[group_keys=[col(t1.a)], aggregates=[COUNT(*)]]\n") +
+        "      Filter[(col(t1.a) = lit(1) OR col(COUNT(*)) > lit(1))]";
+
+    if (!trace_contains(explored.fired_rules, "FilterThroughAggregateRule") ||
+        !contains_plan_text(alternatives.plans, pushed_group_key_or) ||
+        contains_plan_text(alternatives.plans, illegal_aggregate_output_or_push)) {
+        std::cerr << "filter-through-aggregate did not move only grouping-key OR predicates\n"
+                  << "sql: " << sql << "\n"
+                  << "trace: ";
+        for (const auto& fired : explored.fired_rules) {
+            std::cerr << fired << " ";
+        }
+        std::cerr << "\nalternative count: " << alternatives.plans.size() << "\n"
+                  << "logical plan:\n"
+                  << plan::to_string(logical) << "\n"
+                  << "memo dump:\n"
+                  << memo.dump();
+        std::terminate();
+    }
+
+    memo.assert_invariants();
+}
+
 } // namespace
 
 int main() {
@@ -342,6 +424,8 @@ int main() {
     assert_aliased_self_join_scans_remain_distinct_groups();
     assert_having_filter_round_trips_through_memo();
     assert_filter_into_join_adds_pushdown_alternative();
+    assert_filter_into_join_moves_one_side_or_but_not_mixed_side_or();
     assert_filter_through_aggregate_pushes_only_group_keys();
+    assert_filter_through_aggregate_moves_group_key_or_but_pins_aggregate_or();
     return 0;
 }

@@ -31,7 +31,7 @@ struct EquiJoinKey {
 
 struct JoinPredicateSplit {
     std::vector<EquiJoinKey> equi_keys;
-    std::vector<plan::BoundComparisonExpr> residuals;
+    std::vector<plan::BoundPredicate> residuals;
 };
 
 struct HashKey {
@@ -138,6 +138,40 @@ bool evaluate_comparison(const plan::BoundComparisonExpr& comparison,
                           evaluate_scalar(comparison.right, batch, row));
 }
 
+const plan::BoundPredicate& require_left_predicate(const plan::BoundPredicate& predicate) {
+    if (predicate.left == nullptr) {
+        throw std::invalid_argument("bound predicate is missing its left child");
+    }
+    return *predicate.left;
+}
+
+const plan::BoundPredicate& require_right_predicate(const plan::BoundPredicate& predicate) {
+    if (predicate.right == nullptr) {
+        throw std::invalid_argument("bound predicate is missing its right child");
+    }
+    return *predicate.right;
+}
+
+bool evaluate_predicate(const plan::BoundPredicate& predicate, const storage::ColumnarBatch& batch, std::size_t row) {
+    switch (predicate.kind) {
+    case sql::PredicateKind::Comparison:
+        return evaluate_comparison(predicate.comparison, batch, row);
+    case sql::PredicateKind::And: {
+        // Evaluation is deliberately left-to-right and short-circuit-free so
+        // the vectorized path has the same observable order as the oracle.
+        const auto left = evaluate_predicate(require_left_predicate(predicate), batch, row);
+        const auto right = evaluate_predicate(require_right_predicate(predicate), batch, row);
+        return left && right;
+    }
+    case sql::PredicateKind::Or: {
+        const auto left = evaluate_predicate(require_left_predicate(predicate), batch, row);
+        const auto right = evaluate_predicate(require_right_predicate(predicate), batch, row);
+        return left || right;
+    }
+    }
+    throw std::logic_error("unreachable predicate kind");
+}
+
 std::int64_t evaluate_join_scalar(const plan::BoundScalarExpr& expression,
                                   const storage::ColumnarBatch& left,
                                   std::size_t left_row,
@@ -166,29 +200,60 @@ bool evaluate_join_comparison(const plan::BoundComparisonExpr& comparison,
                           evaluate_join_scalar(comparison.right, left, left_row, right, right_row));
 }
 
-bool evaluate_join_predicates(const std::vector<plan::BoundComparisonExpr>& predicates,
+bool evaluate_join_predicate(const plan::BoundPredicate& predicate,
+                             const storage::ColumnarBatch& left,
+                             std::size_t left_row,
+                             const storage::ColumnarBatch& right,
+                             std::size_t right_row) {
+    switch (predicate.kind) {
+    case sql::PredicateKind::Comparison:
+        return evaluate_join_comparison(predicate.comparison, left, left_row, right, right_row);
+    case sql::PredicateKind::And: {
+        const auto left_result =
+            evaluate_join_predicate(require_left_predicate(predicate), left, left_row, right, right_row);
+        const auto right_result =
+            evaluate_join_predicate(require_right_predicate(predicate), left, left_row, right, right_row);
+        return left_result && right_result;
+    }
+    case sql::PredicateKind::Or: {
+        const auto left_result =
+            evaluate_join_predicate(require_left_predicate(predicate), left, left_row, right, right_row);
+        const auto right_result =
+            evaluate_join_predicate(require_right_predicate(predicate), left, left_row, right, right_row);
+        return left_result || right_result;
+    }
+    }
+    throw std::logic_error("unreachable predicate kind");
+}
+
+bool evaluate_join_predicates(const std::vector<plan::BoundPredicate>& predicates,
                               const storage::ColumnarBatch& left,
                               std::size_t left_row,
                               const storage::ColumnarBatch& right,
                               std::size_t right_row) {
+    bool keep = true;
     for (const auto& predicate : predicates) {
-        if (!evaluate_join_comparison(predicate, left, left_row, right, right_row)) {
-            return false;
-        }
+        const auto predicate_result = evaluate_join_predicate(predicate, left, left_row, right, right_row);
+        keep = keep && predicate_result;
     }
-    return true;
+    return keep;
 }
 
-bool try_add_equi_key(const plan::BoundComparisonExpr& predicate,
+bool try_add_equi_key(const plan::BoundPredicate& predicate,
                       const storage::ColumnarBatch& left,
                       const storage::ColumnarBatch& right,
                       JoinPredicateSplit& split) {
-    if (predicate.op != sql::ComparisonOp::Equal) {
+    if (predicate.kind != sql::PredicateKind::Comparison) {
         return false;
     }
 
-    const auto* lhs = std::get_if<plan::BoundColumnRef>(&predicate.left);
-    const auto* rhs = std::get_if<plan::BoundColumnRef>(&predicate.right);
+    const auto& comparison = predicate.comparison;
+    if (comparison.op != sql::ComparisonOp::Equal) {
+        return false;
+    }
+
+    const auto* lhs = std::get_if<plan::BoundColumnRef>(&comparison.left);
+    const auto* rhs = std::get_if<plan::BoundColumnRef>(&comparison.right);
     if (lhs == nullptr || rhs == nullptr) {
         return false;
     }
@@ -211,7 +276,7 @@ bool try_add_equi_key(const plan::BoundComparisonExpr& predicate,
     return false;
 }
 
-JoinPredicateSplit split_join_predicates(const std::vector<plan::BoundComparisonExpr>& predicates,
+JoinPredicateSplit split_join_predicates(const std::vector<plan::BoundPredicate>& predicates,
                                          const storage::ColumnarBatch& left,
                                          const storage::ColumnarBatch& right) {
     JoinPredicateSplit split;
@@ -362,7 +427,7 @@ storage::ColumnarBatch finish_join_output(JoinOutputBuilder builder) {
 
 storage::ColumnarBatch execute_nested_loop_join(const BatchView& left,
                                                 const BatchView& right,
-                                                const std::vector<plan::BoundComparisonExpr>& predicates) {
+                                                const std::vector<plan::BoundPredicate>& predicates) {
     auto builder = make_join_output_builder(*left.batch, *right.batch);
     for (auto left_row : *left.selection) {
         for (auto right_row : *right.selection) {
@@ -478,10 +543,8 @@ BatchView execute_filter(const plan::PhysicalPlan& plan, const Catalog& catalog)
     for (auto row : *input.selection) {
         bool keep = true;
         for (const auto& predicate : plan.predicates) {
-            if (!evaluate_comparison(predicate, *input.batch, row)) {
-                keep = false;
-                break;
-            }
+            const auto predicate_result = evaluate_predicate(predicate, *input.batch, row);
+            keep = keep && predicate_result;
         }
         if (keep) {
             rows.push_back(row);

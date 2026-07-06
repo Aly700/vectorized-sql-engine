@@ -1,8 +1,10 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -46,8 +48,35 @@ struct ComparisonExpr {
     std::size_t operator_position{0};
 };
 
+enum class PredicateKind { Comparison, And, Or };
+
+struct PredicateExpr {
+    PredicateKind kind{PredicateKind::Comparison};
+    ComparisonExpr comparison;
+    std::shared_ptr<PredicateExpr> left;
+    std::shared_ptr<PredicateExpr> right;
+    std::size_t operator_position{0};
+    bool parenthesized{false};
+
+    static PredicateExpr comparison_expr(ComparisonExpr comparison) {
+        PredicateExpr predicate;
+        predicate.kind = PredicateKind::Comparison;
+        predicate.comparison = std::move(comparison);
+        return predicate;
+    }
+
+    static PredicateExpr binary(PredicateKind kind, PredicateExpr left, PredicateExpr right, std::size_t position) {
+        PredicateExpr predicate;
+        predicate.kind = kind;
+        predicate.left = std::make_shared<PredicateExpr>(std::move(left));
+        predicate.right = std::make_shared<PredicateExpr>(std::move(right));
+        predicate.operator_position = position;
+        return predicate;
+    }
+};
+
 struct WhereClause {
-    std::vector<ComparisonExpr> conjuncts;
+    std::vector<PredicateExpr> conjuncts;
 };
 
 struct HavingComparisonExpr {
@@ -57,9 +86,37 @@ struct HavingComparisonExpr {
     std::size_t operator_position{0};
 };
 
+struct HavingPredicateExpr {
+    PredicateKind kind{PredicateKind::Comparison};
+    HavingComparisonExpr comparison;
+    std::shared_ptr<HavingPredicateExpr> left;
+    std::shared_ptr<HavingPredicateExpr> right;
+    std::size_t operator_position{0};
+    bool parenthesized{false};
+
+    static HavingPredicateExpr comparison_expr(HavingComparisonExpr comparison) {
+        HavingPredicateExpr predicate;
+        predicate.kind = PredicateKind::Comparison;
+        predicate.comparison = std::move(comparison);
+        return predicate;
+    }
+
+    static HavingPredicateExpr binary(PredicateKind kind,
+                                      HavingPredicateExpr left,
+                                      HavingPredicateExpr right,
+                                      std::size_t position) {
+        HavingPredicateExpr predicate;
+        predicate.kind = kind;
+        predicate.left = std::make_shared<HavingPredicateExpr>(std::move(left));
+        predicate.right = std::make_shared<HavingPredicateExpr>(std::move(right));
+        predicate.operator_position = position;
+        return predicate;
+    }
+};
+
 struct HavingClause {
     std::size_t position{0};
-    std::vector<HavingComparisonExpr> conjuncts;
+    std::vector<HavingPredicateExpr> conjuncts;
 };
 
 enum class SortDirection { Asc, Desc };
@@ -81,7 +138,7 @@ struct JoinClause {
     std::size_t table_position{0};
     std::optional<std::string> alias;
     std::size_t alias_position{0};
-    std::vector<ComparisonExpr> predicates;
+    std::vector<PredicateExpr> predicates;
 };
 
 struct SelectQuery {

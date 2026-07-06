@@ -21,7 +21,7 @@ struct PhysicalPlan {
     std::vector<BoundColumnRef> group_keys;
     std::vector<AggregateExpression> aggregate_expressions;
     std::vector<SortKey> sort_keys;
-    std::vector<BoundComparisonExpr> predicates;
+    std::vector<BoundPredicate> predicates;
     std::shared_ptr<PhysicalPlan> input;
     std::shared_ptr<PhysicalPlan> left;
     std::shared_ptr<PhysicalPlan> right;
@@ -38,7 +38,7 @@ struct PhysicalPlan {
         return p;
     }
 
-    static PhysicalPlan filter(std::vector<BoundComparisonExpr> predicates, PhysicalPlan child) {
+    static PhysicalPlan filter(std::vector<BoundPredicate> predicates, PhysicalPlan child) {
         PhysicalPlan p;
         p.kind = PhysicalKind::Filter;
         p.predicates = std::move(predicates);
@@ -46,7 +46,7 @@ struct PhysicalPlan {
         return p;
     }
 
-    static PhysicalPlan join(std::vector<BoundComparisonExpr> predicates,
+    static PhysicalPlan join(std::vector<BoundPredicate> predicates,
                              PhysicalPlan left,
                              PhysicalPlan right) {
         PhysicalPlan p;

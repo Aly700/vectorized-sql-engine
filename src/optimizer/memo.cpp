@@ -41,6 +41,24 @@ void hash_comparison(std::size_t& seed, const plan::BoundComparisonExpr& compari
     hash_scalar(seed, comparison.right);
 }
 
+void hash_predicate(std::size_t& seed, const plan::BoundPredicate& predicate) {
+    hash_combine(seed, static_cast<std::size_t>(predicate.kind));
+    switch (predicate.kind) {
+    case sql::PredicateKind::Comparison:
+        hash_comparison(seed, predicate.comparison);
+        return;
+    case sql::PredicateKind::And:
+    case sql::PredicateKind::Or:
+        if (predicate.left == nullptr || predicate.right == nullptr) {
+            throw std::logic_error("bound predicate is missing a child");
+        }
+        hash_predicate(seed, *predicate.left);
+        hash_predicate(seed, *predicate.right);
+        return;
+    }
+    throw std::logic_error("unreachable predicate kind");
+}
+
 void hash_projection(std::size_t& seed, const plan::Projection& projection) {
     hash_string(seed, projection.output_name);
     hash_scalar(seed, projection.expression);
@@ -94,7 +112,7 @@ std::size_t structural_hash(const MemoExpression& expression) {
 
     hash_combine(seed, expression.predicates.size());
     for (const auto& predicate : expression.predicates) {
-        hash_comparison(seed, predicate);
+        hash_predicate(seed, predicate);
     }
 
     hash_combine(seed, expression.children.size());
@@ -118,6 +136,23 @@ bool scalar_equal(const plan::BoundScalarExpr& left, const plan::BoundScalarExpr
 
 bool comparison_equal(const plan::BoundComparisonExpr& left, const plan::BoundComparisonExpr& right) {
     return scalar_equal(left.left, right.left) && left.op == right.op && scalar_equal(left.right, right.right);
+}
+
+bool predicate_equal(const plan::BoundPredicate& left, const plan::BoundPredicate& right) {
+    if (left.kind != right.kind) {
+        return false;
+    }
+    switch (left.kind) {
+    case sql::PredicateKind::Comparison:
+        return comparison_equal(left.comparison, right.comparison);
+    case sql::PredicateKind::And:
+    case sql::PredicateKind::Or:
+        if (left.left == nullptr || left.right == nullptr || right.left == nullptr || right.right == nullptr) {
+            return false;
+        }
+        return predicate_equal(*left.left, *right.left) && predicate_equal(*left.right, *right.right);
+    }
+    throw std::logic_error("unreachable predicate kind");
 }
 
 bool projection_equal(const plan::Projection& left, const plan::Projection& right) {
@@ -163,7 +198,7 @@ bool structural_equal(const MemoExpression& left, const MemoExpression& right) {
            vector_equal(left.group_keys, right.group_keys, column_equal) &&
            vector_equal(left.aggregate_expressions, right.aggregate_expressions, aggregate_expression_equal) &&
            vector_equal(left.sort_keys, right.sort_keys, sort_key_equal) &&
-           vector_equal(left.predicates, right.predicates, comparison_equal) && left.children == right.children;
+           vector_equal(left.predicates, right.predicates, predicate_equal) && left.children == right.children;
 }
 
 const plan::LogicalPlan& require_input(const plan::LogicalPlan& logical) {
@@ -227,12 +262,30 @@ std::string comparison_to_string(const plan::BoundComparisonExpr& comparison) {
            expression_to_string(comparison.right);
 }
 
-void append_predicates(std::ostringstream& out, const std::vector<plan::BoundComparisonExpr>& predicates) {
+std::string predicate_to_string(const plan::BoundPredicate& predicate) {
+    switch (predicate.kind) {
+    case sql::PredicateKind::Comparison:
+        return comparison_to_string(predicate.comparison);
+    case sql::PredicateKind::And:
+        if (predicate.left == nullptr || predicate.right == nullptr) {
+            throw std::logic_error("bound AND predicate is missing a child");
+        }
+        return "(" + predicate_to_string(*predicate.left) + " AND " + predicate_to_string(*predicate.right) + ")";
+    case sql::PredicateKind::Or:
+        if (predicate.left == nullptr || predicate.right == nullptr) {
+            throw std::logic_error("bound OR predicate is missing a child");
+        }
+        return "(" + predicate_to_string(*predicate.left) + " OR " + predicate_to_string(*predicate.right) + ")";
+    }
+    throw std::logic_error("unreachable predicate kind");
+}
+
+void append_predicates(std::ostringstream& out, const std::vector<plan::BoundPredicate>& predicates) {
     for (std::size_t i = 0; i < predicates.size(); ++i) {
         if (i != 0) {
             out << " AND ";
         }
-        out << comparison_to_string(predicates[i]);
+        out << predicate_to_string(predicates[i]);
     }
 }
 
@@ -362,8 +415,10 @@ MemoExpression group_ref_expression(GroupId representative,
 }
 
 // Deterministic logical costing constants. The estimator is intentionally simple:
-// scans use exact catalog row counts; filters multiply input rows by one fixed
-// selectivity per comparison kind; equi-joins use
+// scans use exact catalog row counts; filters multiply input rows by recursive
+// predicate-tree selectivity. Comparison leaves use one fixed selectivity per
+// comparison kind, AND multiplies, and OR uses inclusion-exclusion
+// s1 + s2 - s1*s2. Equi-joins use
 // |L| * |R| / max(distinct(left_key), distinct(right_key)); non-equi joins use
 // the cross product. Distinct counts are heuristics derived from row counts:
 // scan columns start with distinct=row_count and later operators clamp them to
@@ -490,14 +545,36 @@ double comparison_selectivity(const plan::BoundComparisonExpr& predicate) {
     throw std::logic_error("unreachable comparison operator");
 }
 
-double combined_selectivity(const std::vector<plan::BoundComparisonExpr>& predicates,
+double predicate_selectivity(const plan::BoundPredicate& predicate) {
+    switch (predicate.kind) {
+    case sql::PredicateKind::Comparison:
+        return comparison_selectivity(predicate.comparison);
+    case sql::PredicateKind::And: {
+        if (predicate.left == nullptr || predicate.right == nullptr) {
+            throw std::logic_error("bound AND predicate is missing a child");
+        }
+        return safe_multiply(predicate_selectivity(*predicate.left), predicate_selectivity(*predicate.right));
+    }
+    case sql::PredicateKind::Or: {
+        if (predicate.left == nullptr || predicate.right == nullptr) {
+            throw std::logic_error("bound OR predicate is missing a child");
+        }
+        const auto left = predicate_selectivity(*predicate.left);
+        const auto right = predicate_selectivity(*predicate.right);
+        return clamp_estimate(left + right - left * right);
+    }
+    }
+    throw std::logic_error("unreachable predicate kind");
+}
+
+double combined_selectivity(const std::vector<plan::BoundPredicate>& predicates,
                             std::optional<std::size_t> skipped_predicate = std::nullopt) {
     double selectivity = 1.0;
     for (std::size_t i = 0; i < predicates.size(); ++i) {
         if (skipped_predicate.has_value() && *skipped_predicate == i) {
             continue;
         }
-        selectivity = safe_multiply(selectivity, comparison_selectivity(predicates[i]));
+        selectivity = safe_multiply(selectivity, predicate_selectivity(predicates[i]));
     }
     return selectivity;
 }
@@ -510,15 +587,20 @@ double distinct_for(const RelationEstimate& estimate, const plan::BoundColumnRef
     return it->second;
 }
 
-std::optional<EquiJoinKeyEstimate> usable_equi_join_key(const plan::BoundComparisonExpr& predicate,
+std::optional<EquiJoinKeyEstimate> usable_equi_join_key(const plan::BoundPredicate& predicate,
                                                         const RelationEstimate& left,
                                                         const RelationEstimate& right) {
-    if (predicate.op != sql::ComparisonOp::Equal) {
+    if (predicate.kind != sql::PredicateKind::Comparison) {
         return std::nullopt;
     }
 
-    const auto* left_column = std::get_if<plan::BoundColumnRef>(&predicate.left);
-    const auto* right_column = std::get_if<plan::BoundColumnRef>(&predicate.right);
+    const auto& comparison = predicate.comparison;
+    if (comparison.op != sql::ComparisonOp::Equal) {
+        return std::nullopt;
+    }
+
+    const auto* left_column = std::get_if<plan::BoundColumnRef>(&comparison.left);
+    const auto* right_column = std::get_if<plan::BoundColumnRef>(&comparison.right);
     if (left_column == nullptr || right_column == nullptr) {
         return std::nullopt;
     }
@@ -555,7 +637,7 @@ RelationEstimate scan_estimate(const std::string& table,
     return estimate;
 }
 
-RelationEstimate filter_estimate(const std::vector<plan::BoundComparisonExpr>& predicates,
+RelationEstimate filter_estimate(const std::vector<plan::BoundPredicate>& predicates,
                                  RelationEstimate child,
                                  plan::OrderPermission order_permission) {
     const auto selectivity = combined_selectivity(predicates);
@@ -639,7 +721,7 @@ RelationEstimate sort_estimate(const std::vector<plan::SortKey>& sort_keys,
     return estimate;
 }
 
-RelationEstimate join_estimate(const std::vector<plan::BoundComparisonExpr>& predicates,
+RelationEstimate join_estimate(const std::vector<plan::BoundPredicate>& predicates,
                                RelationEstimate left,
                                RelationEstimate right,
                                plan::OrderPermission order_permission) {

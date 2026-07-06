@@ -53,18 +53,23 @@ struct MemoExploreResult {
     bool reached_fixpoint{false};
 };
 
-// Pattern matched: Filter whose conjunct list contains non-canonical literal-vs-literal comparisons.
-// Replacement expression: The same Filter with each matched comparison replaced by canonical TRUE
+// Pattern matched: Filter whose conjunct list contains predicate trees with non-canonical
+// literal-vs-literal comparison leaves, or boolean subtrees that simplify against canonical TRUE
 // (`lit(1) = lit(1)`) or canonical FALSE (`lit(1) = lit(0)`).
+// Replacement expression: The same Filter with each matched comparison leaf replaced by canonical
+// TRUE/FALSE, then with boolean tree algebra applied deterministically: TRUE OR x -> TRUE, FALSE OR
+// x -> x, TRUE AND x -> x, FALSE AND x -> FALSE.
 // Semantic equivalence argument: The current scalar expression slice has only pure non-NULL int64
 // literals and column reads. A comparison between two literals has a fixed two-valued result for
-// every input row, so replacing it with an equivalent canonical boolean predicate preserves the
-// accepted row bag exactly.
+// every input row, and the boolean identities are valid under two-valued logic, so replacing or
+// simplifying a subtree preserves the accepted row bag exactly. Each algebra simplification strictly
+// reduces tree size; folding a literal comparison replaces one non-canonical leaf with one canonical
+// leaf and no default rule reintroduces non-canonical literal comparisons.
 // Preconditions: No NULLs, no volatile functions, and no side effects exist in the current slice;
 // duplicate rows are preserved because this rule only changes per-row predicate truth values;
 // input and output ordering are preserved because the node shape and child remain unchanged.
-// Golden query: `SELECT a FROM t WHERE 2 > 1 AND a = 2` proves interpreted equality before and
-// after replacing `2 > 1` with canonical TRUE.
+// Golden query: `SELECT a FROM t WHERE 2 > 1 OR a = 2` proves interpreted equality before and
+// after replacing `2 > 1` with canonical TRUE and simplifying the OR tree.
 class ConstantFoldComparisonRule final : public Rule, public MemoRule {
 public:
     [[nodiscard]] std::string_view name() const override { return "ConstantFoldComparisonRule"; }
@@ -115,7 +120,7 @@ public:
 // Semantic equivalence argument: Applying filter `p` and then filter `q` accepts exactly rows that
 // satisfy `p AND q`; preserving inner-before-outer predicate order keeps the current deterministic
 // evaluation sequence. Bag multiplicities are unchanged because rows are only retained or rejected.
-// Preconditions: Predicates are pure, non-NULL two-valued comparisons with no side effects or
+// Preconditions: Predicates are pure, non-NULL two-valued predicate trees with no side effects or
 // volatility; duplicates are not collapsed; ordering is preserved because the same child row order
 // flows through a single equivalent filter.
 // Golden query: `SELECT a FROM t WHERE a >= 2 AND b < 40` proves interpreted equality for the same
@@ -131,19 +136,20 @@ public:
 // Pattern matched: Filter(P, Join(L, R, J)) in the memo.
 // Replacement expression: An equivalent join alternative where each filter conjunct that references
 // only L's binding identities becomes/merges with a Filter over L, each conjunct that references only
-// R's binding identities becomes/merges with a Filter over R, each conjunct that references both sides
-// is appended to the Join predicate list, and residual conjuncts remain in a smaller Filter above the
-// new Join. If no residual conjunct remains, the Filter disappears.
+// R's binding identities becomes/merges with a Filter over R, each comparison-leaf conjunct that
+// references both sides is appended to the Join predicate list, and residual conjuncts remain in a
+// smaller Filter above the new Join. Predicate trees move only as whole conjuncts; mixed-side OR/AND
+// trees are not split and stay residual. If no residual conjunct remains, the Filter disappears.
 // Semantic equivalence argument: For inner join under bag semantics, applying a pure two-valued
 // predicate that reads only one input before the join preserves exactly the matching pair
-// multiplicities that would survive filtering after the join. A predicate that reads both inputs is
-// semantically a join predicate because it can be evaluated precisely when both rows are available.
-// Conjuncts are independent in the current NULL-free, side-effect-free scalar slice, so splitting an
-// AND list across these scopes preserves accepted output rows and duplicates.
-// Preconditions: Only conjuncts whose referenced binding identities are wholly available at the
-// target scope move. Literal-only, unknown-scope, and aggregate-output predicates stay residual; no
-// NULLs, outer joins, volatile functions, or side effects exist; the original expression remains in
-// the memo and ordering permission is preserved on the inserted alternative.
+// multiplicities that would survive filtering after the join. A comparison leaf that reads both
+// inputs is semantically a join predicate because it can be evaluated precisely when both rows are
+// available. Whole-tree reference analysis prevents unsound OR splitting.
+// Preconditions: Only conjunct trees whose referenced binding identities are wholly available at
+// the target child scope move below the join. Literal-only, unknown-scope, aggregate-output, and
+// mixed-side non-leaf predicates stay residual; no NULLs, outer joins, volatile functions, or side
+// effects exist; the original expression remains in the memo and ordering permission is preserved
+// on the inserted alternative.
 // Golden query: `SELECT t1.b, t2.c FROM t1 JOIN t2 ON t1.a = t2.a WHERE t1.b = 20 AND t2.c > 200
 // AND t1.b < t2.c` proves all pushed alternatives remain equal to the unrewritten oracle.
 class FilterIntoJoinRule final : public MemoRule {
@@ -153,22 +159,23 @@ public:
 };
 
 // Pattern matched: Filter(P, Aggregate(group_keys, aggregates, input)) in the memo.
-// Replacement expression: Push each conjunct whose column references are exactly grouping-key
-// identities into a new/merged Filter over the Aggregate input, then rebuild the Aggregate above that
-// filtered input. Aggregate-output and other residual conjuncts stay in a smaller Filter above the
-// Aggregate; if no residual remains, the Filter disappears.
+// Replacement expression: Push each whole conjunct tree whose column references are exactly
+// grouping-key identities into a new/merged Filter over the Aggregate input, then rebuild the
+// Aggregate above that filtered input. Aggregate-output and other residual conjunct trees stay in a
+// smaller Filter above the Aggregate; if no residual remains, the Filter disappears.
 // Semantic equivalence argument: Group membership is decided per input row solely by grouping-key
 // values. Filtering groups by a predicate over only those keys therefore keeps exactly the groups
 // whose member rows have key values satisfying the same predicate, which is equivalent to filtering
 // input rows by that predicate before aggregation. Aggregate outputs such as COUNT/SUM are computed
 // after grouping and are not available before aggregation, so predicates that reference them do not
 // move.
-// Preconditions: Every moved conjunct must reference at least one column and every referenced column
-// must match one of `group_keys` by bound identity. The current binder represents HAVING grouping-key
-// predicates with the original input `BoundColumnRef{binding, column}` and aggregate outputs with an
-// empty binding, so aggregate-output predicates fail this exact match. The scalar slice is pure,
-// NULL-free, two-valued, and side-effect-free; duplicates are preserved because aggregation still
-// sees exactly the filtered input row bag.
+// Preconditions: Every moved conjunct tree must reference at least one column and every referenced
+// column in every leaf must match one of `group_keys` by bound identity. The current binder
+// represents HAVING grouping-key predicates with the original input `BoundColumnRef{binding,
+// column}` and aggregate outputs with an empty binding, so any aggregate-output leaf fails this
+// exact match and pins the whole tree. The scalar slice is pure, NULL-free, two-valued, and
+// side-effect-free; duplicates are preserved because aggregation still sees exactly the filtered
+// input row bag.
 // Golden query: `SELECT t1.a, COUNT(*) FROM t1 JOIN t2 ON t1.a = t2.a GROUP BY t1.a HAVING
 // t1.a = 2 AND COUNT(*) > 1` proves the grouping-key conjunct moves while COUNT(*) stays above.
 class FilterThroughAggregateRule final : public MemoRule {
@@ -197,8 +204,8 @@ public:
 
 // Pattern matched: Join(Join(A, B, p_ab), C, p_abc) or Join(A, Join(B, C, p_bc), p_abc)
 // in an arbitrary-order, identity-addressed memo context.
-// Replacement expression: The opposite association, with conjuncts placed only at join nodes where
-// all referenced table identities are available.
+// Replacement expression: The opposite association, with whole conjunct trees placed only at join
+// nodes where all referenced table identities are available.
 // Semantic equivalence argument: Inner join over pure two-valued predicates is associative under
 // bag semantics when the same conjuncts are evaluated after both sides they reference are present.
 // Multiplicities are preserved because no duplicate-eliminating operator is introduced.

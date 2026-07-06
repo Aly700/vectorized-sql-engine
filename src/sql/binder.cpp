@@ -130,12 +130,29 @@ plan::BoundComparisonExpr bind_comparison(const ComparisonExpr& comparison, cons
     };
 }
 
-std::vector<plan::BoundComparisonExpr> bind_comparisons(const std::vector<ComparisonExpr>& comparisons,
-                                                        const std::vector<TableScope>& scopes) {
-    std::vector<plan::BoundComparisonExpr> bound;
-    bound.reserve(comparisons.size());
-    for (const auto& comparison : comparisons) {
-        bound.push_back(bind_comparison(comparison, scopes));
+plan::BoundPredicate bind_predicate(const PredicateExpr& predicate, const std::vector<TableScope>& scopes) {
+    switch (predicate.kind) {
+    case PredicateKind::Comparison:
+        return plan::BoundPredicate::comparison_expr(bind_comparison(predicate.comparison, scopes));
+    case PredicateKind::And:
+    case PredicateKind::Or:
+        if (predicate.left == nullptr || predicate.right == nullptr) {
+            throw std::logic_error("parsed boolean predicate is missing a child");
+        }
+        return plan::BoundPredicate::binary(predicate.kind,
+                                           bind_predicate(*predicate.left, scopes),
+                                           bind_predicate(*predicate.right, scopes),
+                                           predicate.operator_position);
+    }
+    throw std::logic_error("unreachable predicate kind");
+}
+
+std::vector<plan::BoundPredicate> bind_predicates(const std::vector<PredicateExpr>& predicates,
+                                                  const std::vector<TableScope>& scopes) {
+    std::vector<plan::BoundPredicate> bound;
+    bound.reserve(predicates.size());
+    for (const auto& predicate : predicates) {
+        bound.push_back(bind_predicate(predicate, scopes));
     }
     return bound;
 }
@@ -260,15 +277,42 @@ plan::BoundComparisonExpr bind_having_comparison(const HavingComparisonExpr& com
     };
 }
 
-std::vector<plan::BoundComparisonExpr> bind_having_comparisons(
-    const std::vector<HavingComparisonExpr>& comparisons,
+plan::BoundPredicate bind_having_predicate(const HavingPredicateExpr& predicate,
+                                           const std::vector<TableScope>& scopes,
+                                           const std::vector<plan::BoundColumnRef>& group_keys,
+                                           std::vector<plan::AggregateExpression>& aggregate_expressions) {
+    switch (predicate.kind) {
+    case PredicateKind::Comparison:
+        return plan::BoundPredicate::comparison_expr(
+            bind_having_comparison(predicate.comparison, scopes, group_keys, aggregate_expressions));
+    case PredicateKind::And:
+    case PredicateKind::Or:
+        if (predicate.left == nullptr || predicate.right == nullptr) {
+            throw std::logic_error("parsed HAVING predicate is missing a child");
+        }
+        return plan::BoundPredicate::binary(predicate.kind,
+                                           bind_having_predicate(*predicate.left,
+                                                                 scopes,
+                                                                 group_keys,
+                                                                 aggregate_expressions),
+                                           bind_having_predicate(*predicate.right,
+                                                                 scopes,
+                                                                 group_keys,
+                                                                 aggregate_expressions),
+                                           predicate.operator_position);
+    }
+    throw std::logic_error("unreachable predicate kind");
+}
+
+std::vector<plan::BoundPredicate> bind_having_predicates(
+    const std::vector<HavingPredicateExpr>& predicates,
     const std::vector<TableScope>& scopes,
     const std::vector<plan::BoundColumnRef>& group_keys,
     std::vector<plan::AggregateExpression>& aggregate_expressions) {
-    std::vector<plan::BoundComparisonExpr> bound;
-    bound.reserve(comparisons.size());
-    for (const auto& comparison : comparisons) {
-        bound.push_back(bind_having_comparison(comparison, scopes, group_keys, aggregate_expressions));
+    std::vector<plan::BoundPredicate> bound;
+    bound.reserve(predicates.size());
+    for (const auto& predicate : predicates) {
+        bound.push_back(bind_having_predicate(predicate, scopes, group_keys, aggregate_expressions));
     }
     return bound;
 }
@@ -365,9 +409,9 @@ plan::LogicalPlan bind_select(const SelectQuery& query, const catalog::Catalog& 
         projections.push_back(plan::Projection{std::move(name), std::move(expression)});
     }
 
-    std::vector<plan::BoundComparisonExpr> having_predicates;
+    std::vector<plan::BoundPredicate> having_predicates;
     if (query.having.has_value()) {
-        having_predicates = bind_having_comparisons(query.having->conjuncts, scopes, group_keys, aggregate_expressions);
+        having_predicates = bind_having_predicates(query.having->conjuncts, scopes, group_keys, aggregate_expressions);
     }
 
     auto sort_keys =
@@ -378,13 +422,13 @@ plan::LogicalPlan bind_select(const SelectQuery& query, const catalog::Catalog& 
     visible_scopes.push_back(scopes.front());
     for (std::size_t i = 0; i < query.joins.size(); ++i) {
         visible_scopes.push_back(scopes.at(i + 1));
-        plan = plan::LogicalPlan::join(bind_comparisons(query.joins[i].predicates, visible_scopes),
+        plan = plan::LogicalPlan::join(bind_predicates(query.joins[i].predicates, visible_scopes),
                                        std::move(plan),
                                        plan::LogicalPlan::scan(query.joins[i].table, binding_name(query.joins[i])));
     }
 
     if (query.predicate.has_value()) {
-        plan = plan::LogicalPlan::filter(bind_comparisons(query.predicate->conjuncts, scopes), std::move(plan));
+        plan = plan::LogicalPlan::filter(bind_predicates(query.predicate->conjuncts, scopes), std::move(plan));
     }
     if (aggregate_query) {
         plan = plan::LogicalPlan::aggregate(std::move(group_keys), std::move(aggregate_expressions), std::move(plan));

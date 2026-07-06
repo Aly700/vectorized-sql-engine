@@ -209,6 +209,31 @@ void assert_having_binds_between_aggregate_and_project() {
     assert(printed.find("Aggregate[group_keys=[col(t.a)], aggregates=[SUM(b)=col(t.b)]]") != std::string::npos);
 }
 
+void assert_boolean_tree_predicates_bind_and_split_top_level_and() {
+    auto catalog = make_schema_catalog();
+    const auto logical =
+        sql::bind_select(sql::parse_select("SELECT a FROM t WHERE a = 1 AND (b = 20 OR a = 3)"), catalog);
+
+    assert(logical.kind == plan::LogicalKind::Project);
+    assert(logical.input != nullptr);
+    assert(logical.input->kind == plan::LogicalKind::Filter);
+    assert(logical.input->predicates.size() == 2);
+
+    const auto printed = plan::to_string(logical);
+    assert(printed.find("Filter[col(t.a) = lit(1) AND (col(t.b) = lit(20) OR col(t.a) = lit(3))]") !=
+           std::string::npos);
+}
+
+void assert_having_boolean_tree_binds_group_keys_and_aggregate_outputs() {
+    auto catalog = make_schema_catalog();
+    const auto logical =
+        sql::bind_select(sql::parse_select("SELECT a FROM t GROUP BY a HAVING a = 1 OR COUNT(*) > 1"), catalog);
+
+    const auto printed = plan::to_string(logical);
+    assert(printed.find("Filter[(col(t.a) = lit(1) OR col(COUNT(*)) > lit(1))]") != std::string::npos);
+    assert(printed.find("Aggregate[group_keys=[col(t.a)], aggregates=[COUNT(*)]]") != std::string::npos);
+}
+
 void assert_select_aliases_name_projected_aggregate_outputs() {
     auto catalog = make_schema_catalog();
     const auto logical = sql::bind_select(
@@ -389,6 +414,8 @@ int main() {
     assert_order_by_ambiguous_unqualified_column_reports_candidates();
     assert_group_by_binds_aggregate_between_filter_and_project();
     assert_having_binds_between_aggregate_and_project();
+    assert_boolean_tree_predicates_bind_and_split_top_level_and();
+    assert_having_boolean_tree_binds_group_keys_and_aggregate_outputs();
     assert_select_aliases_name_projected_aggregate_outputs();
     assert_ungrouped_aggregate_binds_single_global_group();
     assert_non_grouped_projection_column_is_rejected();

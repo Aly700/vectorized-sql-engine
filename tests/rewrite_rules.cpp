@@ -102,10 +102,8 @@ bool trace_contains(const optimizer::RewriteTrace& trace, const std::string& rul
     return false;
 }
 
-plan::BoundComparisonExpr comparison(plan::BoundScalarExpr left,
-                                     sql::ComparisonOp op,
-                                     plan::BoundScalarExpr right) {
-    return plan::BoundComparisonExpr{std::move(left), op, std::move(right), 0};
+plan::BoundPredicate comparison(plan::BoundScalarExpr left, sql::ComparisonOp op, plan::BoundScalarExpr right) {
+    return plan::BoundPredicate::comparison_expr(plan::BoundComparisonExpr{std::move(left), op, std::move(right), 0});
 }
 
 plan::BoundScalarExpr column(std::string name) {
@@ -248,6 +246,40 @@ void assert_all_true_filter_is_removed() {
     assert(plan::to_string(rewritten.plan).find("Filter") == std::string::npos);
 }
 
+void assert_true_or_predicate_simplifies_to_removed_filter() {
+    assert_rewrite_equivalent("SELECT a FROM t WHERE 2 > 1 OR a = 2");
+
+    const auto catalog = make_catalog();
+    const auto rewritten = rewrite_sql("SELECT a FROM t WHERE 2 > 1 OR a = 2", catalog, optimizer::default_rules());
+    assert(trace_contains(rewritten.trace, "ConstantFoldComparisonRule"));
+    assert(trace_contains(rewritten.trace, "DropAlwaysTrueFilterRule"));
+    assert(plan::to_string(rewritten.plan).find("Filter") == std::string::npos);
+}
+
+void assert_false_or_predicate_simplifies_to_predicate() {
+    const auto catalog = make_catalog();
+    const auto sql = "SELECT a FROM t WHERE 2 < 1 OR a = 2";
+    const auto rewritten = rewrite_sql(sql, catalog, optimizer::default_rules());
+
+    assert(trace_contains(rewritten.trace, "ConstantFoldComparisonRule"));
+    const auto printed = plan::to_string(rewritten.plan);
+    assert(printed.find("Filter[col(t.a) = lit(2)]") != std::string::npos);
+    assert(printed.find("lit(1) = lit(0)") == std::string::npos);
+    assert_rewrite_equivalent(sql);
+}
+
+void assert_true_and_inside_parenthesized_tree_simplifies() {
+    const auto catalog = make_catalog();
+    const auto sql = "SELECT a FROM t WHERE a = 2 AND (2 > 1 AND b = 20)";
+    const auto rewritten = rewrite_sql(sql, catalog, optimizer::default_rules());
+
+    assert(trace_contains(rewritten.trace, "ConstantFoldComparisonRule"));
+    const auto printed = plan::to_string(rewritten.plan);
+    assert(printed.find("Filter[col(t.a) = lit(2) AND col(t.b) = lit(20)]") != std::string::npos);
+    assert(printed.find("lit(1) = lit(1)") == std::string::npos);
+    assert_rewrite_equivalent(sql);
+}
+
 void assert_filter_rewrites_above_join_remain_equivalent() {
     const auto catalog = make_catalog();
     const auto sql = "SELECT t1.b, t2.c FROM t1 JOIN t2 ON t1.a = t2.a WHERE 2 > 1 AND t2.c = 201";
@@ -311,6 +343,9 @@ int main() {
     assert_always_false_rule_fires();
     assert_merge_adjacent_filters_rule_fires();
     assert_all_true_filter_is_removed();
+    assert_true_or_predicate_simplifies_to_removed_filter();
+    assert_false_or_predicate_simplifies_to_predicate();
+    assert_true_and_inside_parenthesized_tree_simplifies();
     assert_filter_rewrites_above_join_remain_equivalent();
     assert_having_filter_rewrites_fire();
     assert_having_always_false_rule_fires();
