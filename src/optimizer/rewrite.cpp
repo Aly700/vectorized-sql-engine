@@ -87,6 +87,14 @@ bool is_canonical_false(const plan::BoundComparisonExpr& comparison) {
            is_literal_with_value(comparison.right, 0);
 }
 
+MemoExpression filter_expression(std::vector<plan::BoundComparisonExpr> predicates, GroupId child) {
+    MemoExpression expression;
+    expression.kind = MemoExpressionKind::Filter;
+    expression.predicates = std::move(predicates);
+    expression.children.push_back(child);
+    return expression;
+}
+
 std::optional<plan::LogicalPlan> rewrite_once(
     const plan::LogicalPlan& logical,
     const std::vector<std::reference_wrapper<const Rule>>& rules,
@@ -165,6 +173,35 @@ std::optional<plan::LogicalPlan> ConstantFoldComparisonRule::apply(const plan::L
     return rewritten;
 }
 
+bool ConstantFoldComparisonRule::apply(Memo& memo, GroupId group, const MemoExpression& expression) const {
+    if (expression.kind != MemoExpressionKind::Filter) {
+        return false;
+    }
+
+    auto predicates = expression.predicates;
+    bool changed = false;
+    for (auto& predicate : predicates) {
+        if (is_canonical_true(predicate) || is_canonical_false(predicate)) {
+            continue;
+        }
+
+        const auto left = literal_value(predicate.left);
+        const auto right = literal_value(predicate.right);
+        if (!left.has_value() || !right.has_value()) {
+            continue;
+        }
+
+        predicate = compare_values(*left, predicate.op, *right) ? canonical_true() : canonical_false();
+        changed = true;
+    }
+
+    if (!changed) {
+        return false;
+    }
+
+    return memo.insert_equivalent(group, filter_expression(std::move(predicates), expression.children.at(0)));
+}
+
 std::optional<plan::LogicalPlan> DropAlwaysTrueFilterRule::apply(const plan::LogicalPlan& logical) const {
     if (logical.kind != plan::LogicalKind::Filter) {
         return std::nullopt;
@@ -192,6 +229,33 @@ std::optional<plan::LogicalPlan> DropAlwaysTrueFilterRule::apply(const plan::Log
     return plan::LogicalPlan::filter(std::move(predicates), require_input(logical));
 }
 
+bool DropAlwaysTrueFilterRule::apply(Memo& memo, GroupId group, const MemoExpression& expression) const {
+    if (expression.kind != MemoExpressionKind::Filter) {
+        return false;
+    }
+
+    std::vector<plan::BoundComparisonExpr> predicates;
+    predicates.reserve(expression.predicates.size());
+    bool changed = false;
+    for (const auto& predicate : expression.predicates) {
+        if (is_canonical_true(predicate)) {
+            changed = true;
+            continue;
+        }
+        predicates.push_back(predicate);
+    }
+
+    if (!changed) {
+        return false;
+    }
+
+    if (predicates.empty()) {
+        return memo.insert_group_ref_equivalent(group, expression.children.at(0));
+    }
+
+    return memo.insert_equivalent(group, filter_expression(std::move(predicates), expression.children.at(0)));
+}
+
 std::optional<plan::LogicalPlan> AlwaysFalseFilterRule::apply(const plan::LogicalPlan& logical) const {
     if (logical.kind != plan::LogicalKind::Filter) {
         return std::nullopt;
@@ -215,6 +279,29 @@ std::optional<plan::LogicalPlan> AlwaysFalseFilterRule::apply(const plan::Logica
     return plan::LogicalPlan::filter({canonical_false()}, require_input(logical));
 }
 
+bool AlwaysFalseFilterRule::apply(Memo& memo, GroupId group, const MemoExpression& expression) const {
+    if (expression.kind != MemoExpressionKind::Filter) {
+        return false;
+    }
+
+    bool has_false = false;
+    for (const auto& predicate : expression.predicates) {
+        if (is_canonical_false(predicate)) {
+            has_false = true;
+            break;
+        }
+    }
+
+    if (!has_false) {
+        return false;
+    }
+    if (expression.predicates.size() == 1 && is_canonical_false(expression.predicates.front())) {
+        return false;
+    }
+
+    return memo.insert_equivalent(group, filter_expression({canonical_false()}, expression.children.at(0)));
+}
+
 std::optional<plan::LogicalPlan> MergeAdjacentFiltersRule::apply(const plan::LogicalPlan& logical) const {
     if (logical.kind != plan::LogicalKind::Filter) {
         return std::nullopt;
@@ -230,6 +317,32 @@ std::optional<plan::LogicalPlan> MergeAdjacentFiltersRule::apply(const plan::Log
     predicates.insert(predicates.end(), child.predicates.begin(), child.predicates.end());
     predicates.insert(predicates.end(), logical.predicates.begin(), logical.predicates.end());
     return plan::LogicalPlan::filter(std::move(predicates), require_input(child));
+}
+
+bool MergeAdjacentFiltersRule::apply(Memo& memo, GroupId group, const MemoExpression& expression) const {
+    if (expression.kind != MemoExpressionKind::Filter) {
+        return false;
+    }
+
+    bool changed = false;
+    const auto child_group = expression.children.at(0);
+    const auto child_expression_count = memo.group(child_group).expressions.size();
+    for (std::size_t i = 0; i < child_expression_count; ++i) {
+        const auto child_expression = memo.group(child_group).expressions.at(i).expression;
+        if (child_expression.kind != MemoExpressionKind::Filter) {
+            continue;
+        }
+
+        std::vector<plan::BoundComparisonExpr> predicates;
+        predicates.reserve(child_expression.predicates.size() + expression.predicates.size());
+        predicates.insert(predicates.end(), child_expression.predicates.begin(), child_expression.predicates.end());
+        predicates.insert(predicates.end(), expression.predicates.begin(), expression.predicates.end());
+        changed = memo.insert_equivalent(group,
+                                         filter_expression(std::move(predicates), child_expression.children.at(0))) ||
+                  changed;
+    }
+
+    return changed;
 }
 
 RewriteResult rewrite_to_fixpoint(const plan::LogicalPlan& logical,
@@ -257,6 +370,48 @@ std::vector<std::reference_wrapper<const Rule>> default_rules() {
     static const AlwaysFalseFilterRule always_false;
     static const DropAlwaysTrueFilterRule drop_true;
     return {std::cref(constant_fold), std::cref(merge_filters), std::cref(always_false), std::cref(drop_true)};
+}
+
+MemoExploreResult explore_memo_to_fixpoint(Memo& memo,
+                                           const std::vector<std::reference_wrapper<const MemoRule>>& rules,
+                                           MemoExploreOptions options) {
+    MemoExploreResult result;
+    for (std::size_t iteration = 0; iteration < options.max_iterations; ++iteration) {
+        bool changed = false;
+        const auto group_count = memo.group_count();
+        for (GroupId group_id = 1; group_id <= group_count; ++group_id) {
+            const auto expression_count = memo.group(group_id).expressions.size();
+            for (std::size_t expression_index = 0; expression_index < expression_count; ++expression_index) {
+                const auto expression = memo.group(group_id).expressions.at(expression_index).expression;
+                for (const auto& rule : rules) {
+                    if (rule.get().apply(memo, group_id, expression)) {
+                        changed = true;
+                        result.fired_rules.push_back(std::string(rule.get().name()));
+                        memo.assert_invariants();
+                    }
+                }
+            }
+        }
+
+        if (!changed) {
+            result.iterations = iteration;
+            result.reached_fixpoint = true;
+            return result;
+        }
+    }
+
+    throw std::logic_error("optimizer memo exploration did not converge within max_iterations");
+}
+
+std::vector<std::reference_wrapper<const MemoRule>> default_memo_rules() {
+    static const ConstantFoldComparisonRule constant_fold;
+    static const MergeAdjacentFiltersRule merge_filters;
+    static const AlwaysFalseFilterRule always_false;
+    static const DropAlwaysTrueFilterRule drop_true;
+    return {std::cref(static_cast<const MemoRule&>(constant_fold)),
+            std::cref(static_cast<const MemoRule&>(merge_filters)),
+            std::cref(static_cast<const MemoRule&>(always_false)),
+            std::cref(static_cast<const MemoRule&>(drop_true))};
 }
 
 } // namespace optimizer

@@ -34,9 +34,13 @@ target_link_libraries(sql_catalog_binder PRIVATE sql_engine)
 add_executable(sql_rewrite_rules tests/rewrite_rules.cpp)
 target_link_libraries(sql_rewrite_rules PRIVATE sql_engine)
 
+add_executable(sql_optimizer_memo tests/memo.cpp)
+target_link_libraries(sql_optimizer_memo PRIVATE sql_engine)
+
 include(CTest)
 add_test(NAME sql_smoke COMMAND sql_smoke)
 add_test(NAME sql_golden COMMAND sql_golden)
 add_test(NAME sql_vectorized_differential COMMAND sql_vectorized_differential)
 add_test(NAME sql_catalog_binder COMMAND sql_catalog_binder)
 add_test(NAME sql_rewrite_rules COMMAND sql_rewrite_rules)
+add_test(NAME sql_optimizer_memo COMMAND sql_optimizer_memo)

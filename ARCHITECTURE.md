@@ -12,21 +12,35 @@ SQL text -> parser -> binder/type checker -> logical plan -> optimizer memo -> p
 - `catalog::Catalog` is the neutral schema boundary between SQL binding and execution. It exposes table names, column names, and column types without table data.
 - `sql::bind_select` resolves parsed column references against catalog table schema scopes and rejects binding errors before logical planning. Qualified refs bind only to the named table scope. Unqualified refs must match exactly one visible table scope. The sql layer does not include execution headers.
 - `plan::LogicalPlan` is the post-binding algebra handoff boundary. Expressions in logical plans carry bound column identities (`table`, `column`) so downstream layers never re-resolve parsed SQL names.
-- `optimizer::rewrite_to_fixpoint` applies a deterministic ordered list of pure `LogicalPlan -> optional<LogicalPlan>` rewrite rules before physical lowering.
+- `optimizer::rewrite_to_fixpoint` applies a deterministic ordered list of pure `LogicalPlan -> optional<LogicalPlan>` rewrite rules before physical lowering. The same rule proofs are also hosted by the memo exploration driver.
+- `optimizer::Memo` stores logical equivalence groups. Group expressions reference child group ids, not nested plan objects. Ingest copies a bound logical tree bottom-up, assigns deterministic 1-based group ids, and deduplicates structurally identical expressions through structural hash/equality lookup.
 - `plan::PhysicalPlan` is a structure-preserving lowering of the logical tree. It does not optimize, cost, or reorder.
 - `execution::execute_interpreted` is the correctness oracle, including inner join semantics.
 - `execution::execute_vectorized` lowers to the physical tree and runs scan/filter/join/project with immutable selection vectors until final materialization. Inner join materializes a deterministic joined batch boundary before downstream filters or projections run.
 - `storage::ColumnarBatch` enforces equal-length column vectors.
-- `optimizer::Memo` is the shell for Cascades groups.
 - `execution::Catalog` implements `catalog::Catalog` for binding and separately owns table batches for execution.
+
+## Memo core
+
+The Phase 5a memo is a correctness-only Cascades core. A `MemoGroup` is a set of semantically equivalent `MemoExpression`s. Expressions are normalized into operator kind plus operator fields plus child group ids: scans carry a table name, filters and joins carry bound predicates, projects carry bound projections, and `GroupRef` explicitly records the checked case where a rule proves a group is equivalent to an existing child group.
+
+Memo ids are deterministic because ingest is bottom-up and group ids are assigned from insertion order. The structural dedup table is a hash lookup only; observable behavior never depends on hash table iteration. Dumps print groups by id and expressions by insertion index.
+
+Extraction has no costing in Phase 5a. It chooses the first-inserted expression in each group and recursively reconstructs a `LogicalPlan`. That canonical policy intentionally preserves the original ingested shape until Phase 5b adds costing and physical properties. Rule exploration still records additional equivalent expressions in the memo, and the differential corpus executes the extracted plan through both engines to prove extraction preserves semantics.
+
+Memo boundaries fail loud. Insert, equivalent insertion, extraction, and dump validate that child group ids exist, expression arity matches operator kind, the structural index points back to the owning group, and group references do not introduce cycles.
 
 ## Rule-based rewrites
 
-Rules live beside, but not inside, `optimizer::Memo` so they can later be re-hosted onto memo groups. Each rule is a pure transform from a `plan::LogicalPlan` to either an equivalent replacement plan or `std::nullopt`.
+Rules live as proof-bearing classes with two hosts. The standalone host remains a pure transform from a `plan::LogicalPlan` to either an equivalent replacement plan or `std::nullopt`; tests that exercise that path continue to use it. The memo host applies the same proofs to `MemoExpression`s and inserts equivalent expressions into the same group. When `DropAlwaysTrueFilterRule` proves that a filter is equivalent to its child, it inserts an explicit `GroupRef` rather than silently merging groups.
 
 The driver traverses child-first, tries rules in vector order, applies at most one rewrite per pass, records the fired rule name, and repeats to a fixpoint with a hard max-pass bound. For the shipped default rules, termination is monotonic: constant folding removes non-canonical literal comparisons by replacing them with canonical booleans; adjacent-filter merge removes a filter node while preserving predicate order; the always-false rule collapses a predicate list to one canonical false predicate; and the always-true rule removes predicates or an entire filter. No default rule reintroduces a non-canonical literal comparison, adjacent filter pair, canonical true predicate, or larger predicate list after simplification, so the bounded fixpoint is a guard against future cyclic rules rather than part of the proof.
 
-Rewrite equivalence is tested by running each corpus query three ways: unrewritten logical plan through the interpreted oracle, rewritten logical plan through the interpreted oracle, and rewritten logical plan through the vectorized engine. Join queries use the same full three-way check. This protects the invariants that rewrites preserve bag semantics and that vectorized execution matches the oracle for the same logical plan.
+Rewrite equivalence is tested in targeted rule tests by comparing unrewritten plans, standalone rewritten plans, and vectorized execution of the rewritten plans. The generated differential corpus now ingests each bound query into the memo, explores rules to fixpoint, extracts the deterministic canonical plan, and runs that plan through both engines against the unrewritten interpreted oracle. This protects the invariants that memo rules only add equivalent expressions and that vectorized execution matches the oracle for the same extracted logical plan.
+
+Memo exploration walks groups by id, expressions by insertion index, and rules in `default_memo_rules()` order. It repeats until an iteration inserts no new expression. For the shipped default rules, termination follows from structural dedup plus monotonic simplification: constant folding only introduces canonical literal booleans, adjacent-filter merge removes a filter boundary, always-false canonicalization shortens a predicate list to canonical false, and always-true elimination removes true predicates or inserts a child `GroupRef`. The max-iteration bound is a guard for future rules.
+
+The Phase 5a memo shape is compatible with Phase 5b join reordering because joins already reference child groups rather than child plans. Join commutativity and associativity can later add alternate join expressions into equivalent groups only when a proof accounts for bag semantics and output identity. Order-relaxed comparison is not enabled in 5a: the logical plan will need an explicit "arbitrary order permitted" property before a reordering rule may relax output order, and the oracle path will need bag-equality checking only for plans carrying that permission.
 
 ## Inner joins
 
