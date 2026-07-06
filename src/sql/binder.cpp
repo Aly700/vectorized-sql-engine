@@ -129,6 +129,23 @@ std::vector<plan::BoundComparisonExpr> bind_comparisons(const std::vector<Compar
     return bound;
 }
 
+plan::SortKey bind_order_by_key(const OrderByKey& key, const std::vector<TableScope>& scopes) {
+    const auto& column = key.column;
+    const auto& scope =
+        column.qualifier.has_value() ? find_qualified_scope(column, scopes) : find_unqualified_scope(column, scopes);
+    return plan::SortKey{plan::BoundColumnRef{scope.name, column.name, column.position}, key.direction};
+}
+
+std::vector<plan::SortKey> bind_order_by_keys(const std::vector<OrderByKey>& keys,
+                                              const std::vector<TableScope>& scopes) {
+    std::vector<plan::SortKey> bound;
+    bound.reserve(keys.size());
+    for (const auto& key : keys) {
+        bound.push_back(bind_order_by_key(key, scopes));
+    }
+    return bound;
+}
+
 void mark_arbitrary_order(plan::LogicalPlan& logical) {
     logical.order_permission = plan::OrderPermission::Arbitrary;
     if (logical.input != nullptr) {
@@ -176,6 +193,12 @@ plan::LogicalPlan bind_select(const SelectQuery& query, const catalog::Catalog& 
     }
     auto bound = plan::LogicalPlan::project(std::move(projections), std::move(plan));
     mark_arbitrary_order(bound);
+    if (!query.order_by.empty()) {
+        // This SQL slice deliberately binds ORDER BY against FROM scopes, not
+        // projection output aliases. That keeps ordered keys as stable bound
+        // column identities even when the SELECT list renames or omits them.
+        return plan::LogicalPlan::sort(bind_order_by_keys(query.order_by, scopes), std::move(bound));
+    }
     return bound;
 }
 

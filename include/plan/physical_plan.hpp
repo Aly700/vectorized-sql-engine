@@ -9,12 +9,13 @@
 
 namespace plan {
 
-enum class PhysicalKind { Scan, Join, Filter, Project };
+enum class PhysicalKind { Scan, Join, Filter, Project, Sort };
 
 struct PhysicalPlan {
     PhysicalKind kind{PhysicalKind::Scan};
     std::string table;
     std::vector<Projection> projections;
+    std::vector<SortKey> sort_keys;
     std::vector<BoundComparisonExpr> predicates;
     std::shared_ptr<PhysicalPlan> input;
     std::shared_ptr<PhysicalPlan> left;
@@ -50,6 +51,14 @@ struct PhysicalPlan {
         PhysicalPlan p;
         p.kind = PhysicalKind::Project;
         p.projections = std::move(projections);
+        p.input = std::make_shared<PhysicalPlan>(std::move(child));
+        return p;
+    }
+
+    static PhysicalPlan sort(std::vector<SortKey> sort_keys, PhysicalPlan child) {
+        PhysicalPlan p;
+        p.kind = PhysicalKind::Sort;
+        p.sort_keys = std::move(sort_keys);
         p.input = std::make_shared<PhysicalPlan>(std::move(child));
         return p;
     }

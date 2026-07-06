@@ -10,7 +10,7 @@
 
 namespace plan {
 
-enum class LogicalKind { Scan, Join, Filter, Project };
+enum class LogicalKind { Scan, Join, Filter, Project, Sort };
 enum class OrderPermission { Deterministic, Arbitrary };
 
 struct BoundColumnRef {
@@ -33,11 +33,17 @@ struct Projection {
     BoundScalarExpr expression;
 };
 
+struct SortKey {
+    BoundColumnRef column;
+    sql::SortDirection direction{sql::SortDirection::Asc};
+};
+
 struct LogicalPlan {
     LogicalKind kind{LogicalKind::Scan};
     OrderPermission order_permission{OrderPermission::Deterministic};
     std::string table;
     std::vector<Projection> projections;
+    std::vector<SortKey> sort_keys;
     std::vector<BoundComparisonExpr> predicates;
     std::shared_ptr<LogicalPlan> input;
     std::shared_ptr<LogicalPlan> left;
@@ -75,6 +81,14 @@ struct LogicalPlan {
         LogicalPlan p;
         p.kind = LogicalKind::Project;
         p.projections = std::move(projections);
+        p.input = std::make_shared<LogicalPlan>(std::move(child));
+        return p;
+    }
+
+    static LogicalPlan sort(std::vector<SortKey> sort_keys, LogicalPlan child) {
+        LogicalPlan p;
+        p.kind = LogicalKind::Sort;
+        p.sort_keys = std::move(sort_keys);
         p.input = std::make_shared<LogicalPlan>(std::move(child));
         return p;
     }

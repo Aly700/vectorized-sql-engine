@@ -156,6 +156,47 @@ void assert_best_plan_is_enumerated_and_semantic() {
     }
 }
 
+void assert_order_by_keeps_join_alternatives_below_sort() {
+    const auto catalog = make_skewed_catalog();
+    const auto sql =
+        "SELECT big.k, mid.k, tiny.k FROM big JOIN mid ON big.k = mid.k "
+        "JOIN tiny ON mid.k = tiny.k ORDER BY tiny.k DESC, big.k ASC";
+    const auto logical = sql::bind_select(sql::parse_select(sql), catalog);
+
+    optimizer::GroupId root = 0;
+    auto memo = explored_memo_for(logical, root);
+    const auto alternatives = memo.extract_alternatives(root, optimizer::AlternativeExtractionOptions{64, 512});
+    const auto best = memo.extract_best(root, catalog);
+
+    const auto expected_best =
+        std::string("Sort[col(tiny.k) DESC, col(big.k) ASC]\n") +
+        "  Project[big.k=col(big.k), mid.k=col(mid.k), tiny.k=col(tiny.k)]\n"
+        "    Join[col(big.k) = col(mid.k)]\n"
+        "      Scan[big]\n"
+        "      Join[col(mid.k) = col(tiny.k)]\n"
+        "        Scan[mid]\n"
+        "        Scan[tiny]";
+
+    std::cout << "order-by multi-join alternatives verified: alternatives=" << alternatives.plans.size()
+              << " max_group_expressions=" << alternatives.max_group_expression_count
+              << " hit_expression_bound=" << (alternatives.hit_expression_bound ? "yes" : "no")
+              << " hit_plan_bound=" << (alternatives.hit_plan_bound ? "yes" : "no") << "\n";
+
+    if (alternatives.plans.size() <= 1 || alternatives.hit_expression_bound || alternatives.hit_plan_bound ||
+        plan::to_string(best) != expected_best || plan::to_string(best) == plan::to_string(logical)) {
+        std::cerr << "ORDER BY blocked join alternatives below Sort\n"
+                  << "sql: " << sql << "\n"
+                  << "alternative count: " << alternatives.plans.size() << "\n"
+                  << "ingested plan:\n"
+                  << plan::to_string(logical) << "\n"
+                  << "best plan:\n"
+                  << plan::to_string(best) << "\n"
+                  << "memo dump:\n"
+                  << memo.dump();
+        std::terminate();
+    }
+}
+
 void assert_equal_stats_tie_is_deterministic() {
     const auto catalog = make_equal_catalog();
     const auto sql = "SELECT a.k, b.k, c.k FROM a JOIN b ON a.k = b.k JOIN c ON b.k = c.k";
@@ -184,6 +225,7 @@ void assert_equal_stats_tie_is_deterministic() {
 int main() {
     assert_skewed_catalog_changes_join_order();
     assert_best_plan_is_enumerated_and_semantic();
+    assert_order_by_keeps_join_alternatives_below_sort();
     assert_equal_stats_tie_is_deterministic();
     return 0;
 }

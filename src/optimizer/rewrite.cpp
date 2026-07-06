@@ -187,6 +187,7 @@ std::vector<std::string> output_tables_for_expression(const Memo& memo,
         return {expression.table};
     case MemoExpressionKind::Filter:
     case MemoExpressionKind::Project:
+    case MemoExpressionKind::Sort:
     case MemoExpressionKind::GroupRef:
         return output_tables_for_group(memo, expression.children.at(0), stack);
     case MemoExpressionKind::Join:
@@ -231,6 +232,7 @@ std::optional<plan::LogicalPlan> rewrite_once(
     RewriteTrace& trace) {
     switch (logical.kind) {
     case plan::LogicalKind::Project:
+    case plan::LogicalKind::Sort:
     case plan::LogicalKind::Filter: {
         const auto rewritten_child = rewrite_once(require_input(logical), rules, trace);
         if (rewritten_child.has_value()) {

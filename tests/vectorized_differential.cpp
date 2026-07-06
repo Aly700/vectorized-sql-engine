@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <iostream>
 #include <limits>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -269,6 +270,53 @@ std::string format_sorted_bag(const storage::ColumnarBatch& batch) {
     return out.str();
 }
 
+std::optional<std::string> output_column_for_sort_key(const plan::SortKey& key, const storage::ColumnarBatch& batch) {
+    const auto qualified = key.column.table + "." + key.column.column;
+    if (batch.has_column(qualified)) {
+        return qualified;
+    }
+    if (batch.has_column(key.column.column)) {
+        return key.column.column;
+    }
+    return std::nullopt;
+}
+
+bool is_sorted_by_keys(const storage::ColumnarBatch& batch, const std::vector<plan::SortKey>& keys) {
+    for (const auto& key : keys) {
+        if (!output_column_for_sort_key(key, batch).has_value()) {
+            return false;
+        }
+    }
+    for (std::size_t row = 1; row < batch.row_count(); ++row) {
+        bool decided = false;
+        for (const auto& key : keys) {
+            const auto column_name = *output_column_for_sort_key(key, batch);
+            const auto previous = batch.column(column_name).at(row - 1);
+            const auto current = batch.column(column_name).at(row);
+            if (previous == current) {
+                continue;
+            }
+            if (key.direction == sql::SortDirection::Asc && previous > current) {
+                return false;
+            }
+            if (key.direction == sql::SortDirection::Desc && previous < current) {
+                return false;
+            }
+            decided = true;
+            break;
+        }
+        (void)decided;
+    }
+    return true;
+}
+
+const std::vector<plan::SortKey>* root_sort_keys(const plan::LogicalPlan& logical) {
+    if (logical.kind == plan::LogicalKind::Sort) {
+        return &logical.sort_keys;
+    }
+    return nullptr;
+}
+
 std::string format_trace(const std::vector<std::string>& fired_rules) {
     std::ostringstream out;
     out << "[";
@@ -290,6 +338,7 @@ bool contains_join(const plan::LogicalPlan& logical) {
         return true;
     case plan::LogicalKind::Filter:
     case plan::LogicalKind::Project:
+    case plan::LogicalKind::Sort:
         return logical.input != nullptr && contains_join(*logical.input);
     }
     throw std::logic_error("unreachable logical plan kind");
@@ -319,8 +368,19 @@ bool compare_engines(const std::string& sql,
     const auto parsed = sql::parse_select(sql);
     const auto logical = sql::bind_select(parsed, catalog);
     const auto is_join_query = contains_join(logical);
-    if (is_join_query && logical.order_permission != plan::OrderPermission::Arbitrary) {
+    const auto* order_keys = root_sort_keys(logical);
+    const auto is_ordered_query = order_keys != nullptr;
+    if (is_join_query && !is_ordered_query && logical.order_permission != plan::OrderPermission::Arbitrary) {
         std::cerr << "join query did not carry arbitrary-order permission\n"
+                  << "sql: " << sql << "\n"
+                  << "plan:\n"
+                  << plan::to_string(logical) << "\n";
+        return false;
+    }
+    if (is_ordered_query &&
+        (logical.order_permission != plan::OrderPermission::Deterministic || logical.input == nullptr ||
+         logical.input->order_permission != plan::OrderPermission::Arbitrary)) {
+        std::cerr << "ordered query did not keep a required root above arbitrary-order input\n"
                   << "sql: " << sql << "\n"
                   << "plan:\n"
                   << plan::to_string(logical) << "\n";
@@ -353,14 +413,21 @@ bool compare_engines(const std::string& sql,
         const auto& extracted = alternatives.plans[alternative_index];
         const auto memo_oracle = execution::execute_interpreted(extracted, catalog);
         const auto memo_vectorized = execution::execute_vectorized(extracted, catalog);
-        const auto cross_plan_equal = is_join_query ? same_sorted_bag(unrewritten_oracle, memo_oracle)
-                                                    : same_batch(unrewritten_oracle, memo_oracle);
+        const auto* extracted_order_keys = root_sort_keys(extracted);
+        const auto ordered_outputs_are_sorted =
+            !is_ordered_query ||
+            (extracted_order_keys != nullptr && is_sorted_by_keys(unrewritten_oracle, *order_keys) &&
+             is_sorted_by_keys(memo_oracle, *extracted_order_keys));
+        const auto cross_plan_equal = is_ordered_query || is_join_query
+                                          ? same_sorted_bag(unrewritten_oracle, memo_oracle)
+                                          : same_batch(unrewritten_oracle, memo_oracle);
         const auto vectorized_equal = same_batch(memo_oracle, memo_vectorized);
         const auto column_sets_match = same_column_identity_set(unrewritten_oracle, memo_oracle) &&
                                        same_column_identity_set(memo_oracle, memo_vectorized);
         const auto output_order_matches = same_column_order(unrewritten_oracle, memo_oracle) &&
                                           same_column_order(memo_oracle, memo_vectorized);
-        if (cross_plan_equal && vectorized_equal && column_sets_match && output_order_matches) {
+        if (cross_plan_equal && vectorized_equal && column_sets_match && output_order_matches &&
+            ordered_outputs_are_sorted) {
             continue;
         }
 
@@ -381,21 +448,29 @@ bool compare_engines(const std::string& sql,
                   << "unrewritten bag:        " << format_sorted_bag(unrewritten_oracle) << "\n"
                   << "alternative oracle:     " << format_batch(memo_oracle) << "\n"
                   << "alternative oracle bag: " << format_sorted_bag(memo_oracle) << "\n"
-                  << "alternative vectorized: " << format_batch(memo_vectorized) << "\n";
+                  << "alternative vectorized: " << format_batch(memo_vectorized) << "\n"
+                  << "ordered outputs sorted: " << (ordered_outputs_are_sorted ? "yes" : "no") << "\n";
         return false;
     }
 
     const auto best = memo.extract_best(root, catalog);
     const auto best_oracle = execution::execute_interpreted(best, catalog);
     const auto best_vectorized = execution::execute_vectorized(best, catalog);
-    const auto best_cross_plan_equal =
-        is_join_query ? same_sorted_bag(unrewritten_oracle, best_oracle) : same_batch(unrewritten_oracle, best_oracle);
+    const auto* best_order_keys = root_sort_keys(best);
+    const auto best_ordered_outputs_are_sorted =
+        !is_ordered_query ||
+        (best_order_keys != nullptr && is_sorted_by_keys(unrewritten_oracle, *order_keys) &&
+         is_sorted_by_keys(best_oracle, *best_order_keys));
+    const auto best_cross_plan_equal = is_ordered_query || is_join_query
+                                           ? same_sorted_bag(unrewritten_oracle, best_oracle)
+                                           : same_batch(unrewritten_oracle, best_oracle);
     const auto best_vectorized_equal = same_batch(best_oracle, best_vectorized);
     const auto best_column_sets_match = same_column_identity_set(unrewritten_oracle, best_oracle) &&
                                         same_column_identity_set(best_oracle, best_vectorized);
     const auto best_output_order_matches = same_column_order(unrewritten_oracle, best_oracle) &&
                                            same_column_order(best_oracle, best_vectorized);
-    if (!best_cross_plan_equal || !best_vectorized_equal || !best_column_sets_match || !best_output_order_matches) {
+    if (!best_cross_plan_equal || !best_vectorized_equal || !best_column_sets_match || !best_output_order_matches ||
+        !best_ordered_outputs_are_sorted) {
         std::cerr << "best memo/vectorized divergence\n"
                   << "sql: " << sql << "\n"
                   << table_text << "\n"
@@ -408,7 +483,8 @@ bool compare_engines(const std::string& sql,
                   << plan::to_string(best) << "\n"
                   << "unrewritten oracle: " << format_batch(unrewritten_oracle) << "\n"
                   << "best oracle:        " << format_batch(best_oracle) << "\n"
-                  << "best vectorized:    " << format_batch(best_vectorized) << "\n";
+                  << "best vectorized:    " << format_batch(best_vectorized) << "\n"
+                  << "ordered outputs sorted: " << (best_ordered_outputs_are_sorted ? "yes" : "no") << "\n";
         return false;
     }
 
@@ -423,6 +499,9 @@ bool run_result_golden_queries() {
         "SELECT b, a FROM t WHERE a = 2",
         "SELECT b FROM t WHERE a <= 3 AND 10 < b",
         "SELECT a FROM t WHERE a > 2",
+        "SELECT a, b FROM t ORDER BY b DESC",
+        "SELECT a, b FROM t ORDER BY b ASC, a DESC",
+        "SELECT b FROM t ORDER BY b ASC",
     };
 
     bool ok = true;
@@ -458,6 +537,11 @@ bool run_join_oracle_corpus() {
         "JOIN t3 ON t1.b = t3.d",
         "SELECT extreme_left.a, extreme_left.b, extreme_right.b FROM extreme_left JOIN extreme_right "
         "ON extreme_left.a = extreme_right.a",
+        "SELECT t1.b, t2.c FROM t1 JOIN t2 ON t1.a = t2.a ORDER BY t2.c DESC, t1.b ASC",
+        "SELECT t1.b, t2.c, t3.d FROM t1 JOIN t2 ON t1.a = t2.a "
+        "JOIN t3 ON t2.c = t3.c ORDER BY t3.d DESC, t2.c ASC",
+        "SELECT t1.b, t2.c, t3.d, t4.e FROM t1 JOIN t2 ON t1.a = t2.a "
+        "JOIN t3 ON t2.c = t3.c JOIN t4 ON t3.d = t4.d ORDER BY t4.e DESC, t2.c ASC",
     };
 
     bool ok = true;
@@ -541,6 +625,8 @@ bool run_generated_corpus() {
         for (const auto& projection : projections) {
             ok = compare_engines("SELECT " + projection + " FROM t", catalog, table_text) && ok;
         }
+        ok = compare_engines("SELECT a FROM t ORDER BY a ASC", catalog, table_text) && ok;
+        ok = compare_engines("SELECT b, a FROM t ORDER BY b DESC, a ASC", catalog, table_text) && ok;
 
         for (const auto op : ops) {
             for (const auto literal : literals) {
