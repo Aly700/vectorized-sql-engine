@@ -220,6 +220,39 @@ void assert_equal_stats_tie_is_deterministic() {
     }
 }
 
+void assert_aliased_self_join_costs_physical_table_stats() {
+    const auto catalog = make_skewed_catalog();
+    const auto sql = "SELECT x.k, y.k FROM big AS x JOIN big AS y ON x.k = y.k";
+    const auto logical = sql::bind_select(sql::parse_select(sql), catalog);
+
+    const auto estimate = optimizer::estimate_cost(logical, catalog);
+    if (estimate.rows != 1000.0 || estimate.cost != 4000.0) {
+        std::cerr << "aliased self-join did not cost through physical table stats\n"
+                  << "sql: " << sql << "\n"
+                  << "plan:\n"
+                  << plan::to_string(logical) << "\n"
+                  << "rows: " << estimate.rows << "\n"
+                  << "cost: " << estimate.cost << "\n";
+        std::terminate();
+    }
+
+    optimizer::GroupId root = 0;
+    auto memo = explored_memo_for(logical, root);
+    const auto best = memo.extract_best(root, catalog);
+    const auto best_estimate = optimizer::estimate_cost(best, catalog);
+    if (best_estimate.rows != 1000.0 || best_estimate.cost != 4000.0) {
+        std::cerr << "extract_best did not preserve aliased physical stats lookup\n"
+                  << "sql: " << sql << "\n"
+                  << "best plan:\n"
+                  << plan::to_string(best) << "\n"
+                  << "rows: " << best_estimate.rows << "\n"
+                  << "cost: " << best_estimate.cost << "\n"
+                  << "memo dump:\n"
+                  << memo.dump();
+        std::terminate();
+    }
+}
+
 } // namespace
 
 int main() {
@@ -227,5 +260,6 @@ int main() {
     assert_best_plan_is_enumerated_and_semantic();
     assert_order_by_keeps_join_alternatives_below_sort();
     assert_equal_stats_tie_is_deterministic();
+    assert_aliased_self_join_costs_physical_table_stats();
     return 0;
 }

@@ -8,13 +8,13 @@ SQL text -> parser -> binder/type checker -> logical plan -> optimizer memo -> p
 
 ## Current scaffold
 
-- `sql::parse_select` implements a small, explicit SQL slice for golden tests and rejects unsupported syntax with position-bearing parse errors. The slice includes `SELECT ... FROM t1 [INNER] JOIN t2 ON ...` chains with conjunction-only `ON` and `WHERE` comparisons, plus tail-position `ORDER BY <col> [ASC|DESC]` lists.
+- `sql::parse_select` implements a small, explicit SQL slice for golden tests and rejects unsupported syntax with position-bearing parse errors. The slice includes `SELECT ... FROM t1 [AS] x [INNER] JOIN t2 [AS] y ON ...` chains with conjunction-only `ON` and `WHERE` comparisons, plus tail-position `ORDER BY <col> [ASC|DESC]` lists. Table aliases are optional; reserved keywords are rejected as explicit aliases.
 - `catalog::Catalog` is the neutral schema boundary between SQL binding and execution. It exposes table names, column names, and column types without table data.
-- `sql::bind_select` resolves parsed column references against catalog table schema scopes and rejects binding errors before logical planning. Qualified refs bind only to the named table scope. Unqualified refs must match exactly one visible table scope. `ORDER BY` keys deliberately bind against the same FROM scopes, not projection output aliases, so output aliases remain outside the slice. The sql layer does not include execution headers.
-- `plan::LogicalPlan` is the post-binding algebra handoff boundary. Expressions in logical plans carry bound column identities (`table`, `column`) so downstream layers never re-resolve parsed SQL names. Logical plans also carry an explicit order permission. A SELECT without `ORDER BY` is still marked as permitting arbitrary row order. A SELECT with `ORDER BY` has a required-order root `Sort` above `Project`, while every node below the `Sort` remains marked arbitrary so legal join transforms can still fire below the ordering boundary.
+- `sql::bind_select` resolves parsed column references against catalog table schema scopes and rejects binding errors before logical planning. The scope identity is the binding name: alias if present, otherwise the physical table name. Qualified refs bind only to the named binding scope; once a table is aliased, the physical table name is not also a qualifier. Unqualified refs must match exactly one visible binding scope. Duplicate binding names are rejected, so `t JOIN t` remains invalid while `t AS x JOIN t AS y` is valid. `ORDER BY` keys deliberately bind against the same FROM scopes, not projection output aliases, so output aliases remain outside the slice. The sql layer does not include execution headers.
+- `plan::LogicalPlan` is the post-binding algebra handoff boundary. Expressions in logical plans carry bound column identities (`binding`, `column`) so downstream layers never re-resolve parsed SQL names. `Scan` nodes separately carry the physical table to read and the binding name used to qualify emitted column identities. Logical plans also carry an explicit order permission. A SELECT without `ORDER BY` is still marked as permitting arbitrary row order. A SELECT with `ORDER BY` has a required-order root `Sort` above `Project`, while every node below the `Sort` remains marked arbitrary so legal join transforms can still fire below the ordering boundary.
 - `optimizer::rewrite_to_fixpoint` applies a deterministic ordered list of pure `LogicalPlan -> optional<LogicalPlan>` rewrite rules before physical lowering. The same rule proofs are also hosted by the memo exploration driver.
 - `optimizer::Memo` stores logical equivalence groups. Group expressions reference child group ids, not nested plan objects. Ingest copies a bound logical tree bottom-up, assigns deterministic 1-based group ids, and deduplicates structurally identical expressions through structural hash/equality lookup.
-- `plan::PhysicalPlan` is a structure-preserving lowering of the logical tree. It does not optimize, cost, or reorder.
+- `plan::PhysicalPlan` is a structure-preserving lowering of the logical tree. Physical scans preserve both the physical table and binding name from logical scans. Lowering does not optimize, cost, or reorder.
 - `execution::execute_interpreted` is the correctness oracle, including inner join and stable sort semantics.
 - `execution::execute_vectorized` lowers to the physical tree and runs scan/filter/join/project/sort with immutable selection vectors until final materialization. Inner join materializes a deterministic joined batch boundary before downstream filters or projections run. Sort uses `std::stable_sort` over row ids with a comparator that reads only bound int64 key columns and returns false for full-key ties.
 - `storage::ColumnarBatch` enforces equal-length column vectors.
@@ -22,7 +22,7 @@ SQL text -> parser -> binder/type checker -> logical plan -> optimizer memo -> p
 
 ## Memo core
 
-The Phase 5 memo is a correctness-only Cascades core. A `MemoGroup` is a set of semantically equivalent `MemoExpression`s. Expressions are normalized into operator kind plus operator fields plus order permission plus child group ids: scans carry a table name, filters and joins carry bound predicates, projects carry bound projections, sorts carry bound sort keys and directions, and `GroupRef` explicitly records the checked case where a rule proves a group is equivalent to an existing child group.
+The Phase 5 memo is a correctness-only Cascades core. A `MemoGroup` is a set of semantically equivalent `MemoExpression`s. Expressions are normalized into operator kind plus operator fields plus order permission plus child group ids: scans carry both a physical table name and binding name, filters and joins carry bound predicates, projects carry bound projections, sorts carry bound sort keys and directions, and `GroupRef` explicitly records the checked case where a rule proves a group is equivalent to an existing child group. Scan structural hash/equality includes both physical table and binding name; two self-join scans of the same physical table under different aliases are distinct memo groups.
 
 Memo ids are deterministic because ingest is bottom-up and group ids are assigned from insertion order. When a new equivalent expression is structurally identical to an expression already owned by another group, the groups are merged rather than rejected. Merging uses stable representatives with the smaller group id as the deterministic winner; losing group ids remain valid aliases and are printed as `group N -> representative M`. Expressions move to the winner, all child references are canonicalized to representatives, and the structural index is rebuilt over representative groups only. The structural dedup table is a hash lookup only; observable behavior never depends on hash table iteration. Dumps print groups by id and expressions by insertion index.
 
@@ -32,7 +32,7 @@ Phase 5b also exposes deterministic alternative extraction for verification. The
 
 ## Cost model and best extraction
 
-The Phase 5c cost model is deterministic and logical. It consumes only the neutral `catalog::Catalog` interface; `execution::Catalog` feeds exact table row counts into `catalog::TableSchema::row_count`, and the SQL layer does not include execution headers. Missing row-count statistics are a fail-loud cost-model error rather than an implicit guess. Distinct counts are deliberately heuristic in this slice: each scan column starts with `distinct=row_count`, and filters and joins clamp distinct estimates to the estimated output rows.
+The Phase 5c cost model is deterministic and logical. It consumes only the neutral `catalog::Catalog` interface; `execution::Catalog` feeds exact table row counts into `catalog::TableSchema::row_count`, and the SQL layer does not include execution headers. Missing row-count statistics are a fail-loud cost-model error rather than an implicit guess. Scan row-count statistics are looked up by physical table name, while distinct-count keys are binding-scoped (`binding.column`) so aliased self-joins share table statistics without sharing semantic column identities. Distinct counts are deliberately heuristic in this slice: each scan column starts with `distinct=row_count`, and filters and joins clamp distinct estimates to the estimated output rows.
 
 Cardinality formulas are fixed and documented in code next to the estimator. `Scan(table)` returns the catalog row count. `Filter` multiplies input rows by the product of fixed predicate selectivities: equality `0.10`, not-equal `0.90`, and inequalities `<`, `<=`, `>`, `>=` as `1/3`; literal-vs-literal predicates are evaluated exactly to selectivity `1.0` or `0.0`. `Join` uses the first usable bound column equality whose columns come from opposite children: `|L| * |R| / max(distinct(left_key), distinct(right_key))`. If no usable equi key exists, join cardinality starts as `|L| * |R|`; residual predicates then apply the same fixed selectivities. All rows, distinct counts, and costs are clamped to finite non-negative doubles.
 
@@ -60,18 +60,18 @@ Order-relaxed comparison is a verification policy, not an execution behavior. Th
 
 ## Inner joins
 
-The frontend supports inner join chains without aliases:
+The frontend supports inner join chains with optional table aliases:
 
 ```text
 SELECT select_list
-FROM t1 [INNER] JOIN t2 ON comparison [AND comparison]*
-        [JOIN t3 ON comparison [AND comparison]* ...]
+FROM t1 [AS] x [INNER] JOIN t2 [AS] y ON comparison [AND comparison]*
+        [JOIN t3 [AS] z ON comparison [AND comparison]* ...]
 [WHERE comparison [AND comparison]*]
 ```
 
-Join chains bind as left-deep logical plans. `Join` predicates live on the `Join` node. A join node's output identity and order are deterministic: all left child columns, followed by all right child columns. Scans materialize internal identities as `table.column`; projection output names are separate user-visible names.
+Join chains bind as left-deep logical plans. `Join` predicates live on the `Join` node. A join node's output identity and order are deterministic: all left child columns, followed by all right child columns. Scans materialize internal identities as `binding.column`; projection output names are separate user-visible names. For unaliased tables, binding equals physical table name, so existing query identities remain unchanged.
 
-Qualified projected columns use their qualified spelling as the output name, so `SELECT t1.a, t2.a ...` produces output columns `t1.a` and `t2.a`. Unqualified projected columns use the bare column name, so duplicate output names are still rejected by name.
+Qualified projected columns use their qualified spelling as the output name, so `SELECT x.a, y.a ...` produces output columns `x.a` and `y.a`. Unqualified projected columns use the bare column name, so duplicate output names are still rejected by name.
 
 The interpreted oracle implements nested-loop inner join with bag semantics. The row order is part of the SQL engine contract: for each left row in input order, visit each right row in input order, emitting every pair whose `ON` conjuncts are true. Duplicate matches multiply, and an empty side yields zero output rows with the deterministic joined column order.
 
@@ -79,7 +79,7 @@ The vectorized join implements the same contract. It extracts usable equi-key co
 
 ## Vectorized execution
 
-Scan creates an identity selection vector in table row order. Filter evaluates predicates over the current selection vector and returns a newly allocated `shared_ptr<const vector<size_t>>`; downstream operators cannot mutate a handed-off selection. Join validates both child views, materializes a joined `ColumnarBatch`, then returns a fresh identity selection over that batch so downstream filters and projections cannot mutate child state. Project walks the selected row ids in order, evaluates scalar expressions, and builds output columns through `ColumnarBatch::add_column`, preserving equal row counts and SELECT-list order. Sort creates a new row-id order with `std::stable_sort`. Because the logical shape is `Sort(Project(child))` and the slice permits sorting by FROM-scope columns not present in the SELECT list, Sort executes Project-shaped children by sorting the Project input rows first and then materializing the projection in sorted row order.
+Scan reads storage by physical table name and creates binding-qualified column identities plus an identity selection vector in table row order. Filter evaluates predicates over the current selection vector and returns a newly allocated `shared_ptr<const vector<size_t>>`; downstream operators cannot mutate a handed-off selection. Join validates both child views, materializes a joined `ColumnarBatch`, then returns a fresh identity selection over that batch so downstream filters and projections cannot mutate child state. Project walks the selected row ids in order, evaluates scalar expressions, and builds output columns through `ColumnarBatch::add_column`, preserving equal row counts and SELECT-list order. Sort creates a new row-id order with `std::stable_sort`. Because the logical shape is `Sort(Project(child))` and the slice permits sorting by FROM-scope columns not present in the SELECT list, Sort executes Project-shaped children by sorting the Project input rows first and then materializing the projection in sorted row order.
 
 ## Design bias
 

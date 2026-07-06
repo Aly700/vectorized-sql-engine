@@ -14,7 +14,8 @@ namespace sql {
 namespace {
 
 struct TableScope {
-    std::string name;
+    std::string binding_name;
+    std::string physical_table;
     std::size_t position{0};
     catalog::TableSchema schema;
 };
@@ -28,25 +29,29 @@ catalog::TableSchema require_table(const std::string& name, std::size_t position
 }
 
 void add_scope(std::vector<TableScope>& scopes,
-               std::set<std::string>& seen_tables,
+               std::set<std::string>& seen_bindings,
                const std::string& table_name,
                std::size_t position,
+               const std::optional<std::string>& alias,
+               std::size_t alias_position,
                const catalog::Catalog& catalog) {
-    const auto [_, inserted] = seen_tables.insert(table_name);
+    auto schema = require_table(table_name, position, catalog);
+    const auto& binding = alias.has_value() ? *alias : table_name;
+    const auto binding_position = alias.has_value() ? alias_position : position;
+    const auto [_, inserted] = seen_bindings.insert(binding);
     if (!inserted) {
-        throw BindError(position,
-                        "duplicate table reference '" + table_name + "' requires aliases, which are outside the slice");
+        throw BindError(binding_position, "duplicate table binding '" + binding + "' requires a unique alias");
     }
-    scopes.push_back(TableScope{table_name, position, require_table(table_name, position, catalog)});
+    scopes.push_back(TableScope{binding, table_name, position, std::move(schema)});
 }
 
 std::vector<TableScope> build_scopes(const SelectQuery& query, const catalog::Catalog& catalog) {
     std::vector<TableScope> scopes;
     scopes.reserve(1 + query.joins.size());
-    std::set<std::string> seen_tables;
-    add_scope(scopes, seen_tables, query.table, query.table_position, catalog);
+    std::set<std::string> seen_bindings;
+    add_scope(scopes, seen_bindings, query.table, query.table_position, query.alias, query.alias_position, catalog);
     for (const auto& join : query.joins) {
-        add_scope(scopes, seen_tables, join.table, join.table_position, catalog);
+        add_scope(scopes, seen_bindings, join.table, join.table_position, join.alias, join.alias_position, catalog);
     }
     return scopes;
 }
@@ -64,10 +69,10 @@ std::string quoted_table_list(const std::vector<std::string>& tables) {
 
 const TableScope& find_qualified_scope(const ColumnRef& column, const std::vector<TableScope>& scopes) {
     for (const auto& scope : scopes) {
-        if (scope.name == *column.qualifier) {
+        if (scope.binding_name == *column.qualifier) {
             if (!scope.schema.has_column(column.name)) {
                 throw BindError(column.position,
-                                "unknown column '" + column.name + "' in table '" + scope.name + "'");
+                                "unknown column '" + column.name + "' in table '" + scope.binding_name + "'");
             }
             return scope;
         }
@@ -81,14 +86,14 @@ const TableScope& find_unqualified_scope(const ColumnRef& column, const std::vec
     for (const auto& scope : scopes) {
         if (scope.schema.has_column(column.name)) {
             matches.push_back(&scope);
-            match_names.push_back(scope.name);
+            match_names.push_back(scope.binding_name);
         }
     }
 
     if (matches.empty()) {
         if (scopes.size() == 1) {
             throw BindError(column.position,
-                            "unknown column '" + column.name + "' in table '" + scopes.front().name + "'");
+                            "unknown column '" + column.name + "' in table '" + scopes.front().binding_name + "'");
         }
         throw BindError(column.position, "unknown column '" + column.name + "'");
     }
@@ -105,7 +110,7 @@ plan::BoundScalarExpr bind_expression(const ScalarExpr& expression, const std::v
     if (const auto* column = std::get_if<ColumnRef>(&expression)) {
         const auto& scope =
             column->qualifier.has_value() ? find_qualified_scope(*column, scopes) : find_unqualified_scope(*column, scopes);
-        return plan::BoundColumnRef{scope.name, column->name, column->position};
+        return plan::BoundColumnRef{scope.binding_name, column->name, column->position};
     }
     return std::get<IntLiteral>(expression);
 }
@@ -133,7 +138,7 @@ plan::SortKey bind_order_by_key(const OrderByKey& key, const std::vector<TableSc
     const auto& column = key.column;
     const auto& scope =
         column.qualifier.has_value() ? find_qualified_scope(column, scopes) : find_unqualified_scope(column, scopes);
-    return plan::SortKey{plan::BoundColumnRef{scope.name, column.name, column.position}, key.direction};
+    return plan::SortKey{plan::BoundColumnRef{scope.binding_name, column.name, column.position}, key.direction};
 }
 
 std::vector<plan::SortKey> bind_order_by_keys(const std::vector<OrderByKey>& keys,
@@ -178,14 +183,14 @@ plan::LogicalPlan bind_select(const SelectQuery& query, const catalog::Catalog& 
         projections.push_back(plan::Projection{std::move(name), std::move(expression)});
     }
 
-    auto plan = plan::LogicalPlan::scan(query.table);
+    auto plan = plan::LogicalPlan::scan(query.table, binding_name(query));
     std::vector<TableScope> visible_scopes;
     visible_scopes.push_back(scopes.front());
     for (std::size_t i = 0; i < query.joins.size(); ++i) {
         visible_scopes.push_back(scopes.at(i + 1));
         plan = plan::LogicalPlan::join(bind_comparisons(query.joins[i].predicates, visible_scopes),
                                        std::move(plan),
-                                       plan::LogicalPlan::scan(query.joins[i].table));
+                                       plan::LogicalPlan::scan(query.joins[i].table, binding_name(query.joins[i])));
     }
 
     if (query.predicate.has_value()) {

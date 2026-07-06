@@ -147,12 +147,7 @@ public:
         query.projection = parse_projection();
 
         expect_keyword("FROM", "expected FROM after projection list");
-        if (current_.kind != TokenKind::Identifier || is_reserved_keyword(current_.text)) {
-            throw ParseError(current_.position, "expected table name");
-        }
-        query.table = current_.text;
-        query.table_position = current_.position;
-        advance();
+        parse_table_reference(query.table, query.table_position, query.alias, query.alias_position, "expected table name");
 
         while (is_keyword("INNER") || is_keyword("JOIN")) {
             query.joins.push_back(parse_join());
@@ -191,6 +186,37 @@ private:
             throw ParseError(current_.position, message);
         }
         advance();
+    }
+
+    void parse_table_reference(std::string& table,
+                               std::size_t& table_position,
+                               std::optional<std::string>& alias,
+                               std::size_t& alias_position,
+                               const std::string& table_message) {
+        if (current_.kind != TokenKind::Identifier || is_reserved_keyword(current_.text)) {
+            throw ParseError(current_.position, table_message);
+        }
+
+        table = current_.text;
+        table_position = current_.position;
+        advance();
+
+        if (is_keyword("AS")) {
+            advance();
+            if (current_.kind != TokenKind::Identifier || is_reserved_keyword(current_.text)) {
+                throw ParseError(current_.position, "expected alias after AS");
+            }
+            alias = current_.text;
+            alias_position = current_.position;
+            advance();
+            return;
+        }
+
+        if (current_.kind == TokenKind::Identifier && !is_reserved_keyword(current_.text)) {
+            alias = current_.text;
+            alias_position = current_.position;
+            advance();
+        }
     }
 
     std::vector<SelectItem> parse_projection() {
@@ -250,13 +276,12 @@ private:
             expect_keyword("JOIN", "expected JOIN");
         }
 
-        if (current_.kind != TokenKind::Identifier || is_reserved_keyword(current_.text)) {
-            throw ParseError(current_.position, "expected table name after JOIN");
-        }
         JoinClause join;
-        join.table = current_.text;
-        join.table_position = current_.position;
-        advance();
+        parse_table_reference(join.table,
+                              join.table_position,
+                              join.alias,
+                              join.alias_position,
+                              "expected table name after JOIN");
 
         expect_keyword("ON", "expected ON after JOIN table");
         join.predicates = parse_comparison_conjunction();

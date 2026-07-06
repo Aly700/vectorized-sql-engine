@@ -164,6 +164,29 @@ void assert_cross_group_duplicate_expression_merges_groups() {
     }
 }
 
+void assert_aliased_self_join_scans_remain_distinct_groups() {
+    const auto catalog = make_catalog();
+    const auto logical =
+        sql::bind_select(sql::parse_select("SELECT x.a, y.a FROM t AS x JOIN t AS y ON x.a = y.a"), catalog);
+
+    optimizer::Memo memo;
+    const auto root = memo.insert(logical);
+    const auto dump = memo.dump();
+    if (memo.group_count() != 4 || dump.find("Scan[t AS x]") == std::string::npos ||
+        dump.find("Scan[t AS y]") == std::string::npos) {
+        std::cerr << "aliased self-join scans were not distinct memo groups\n"
+                  << "plan:\n"
+                  << plan::to_string(logical) << "\n"
+                  << "memo dump:\n"
+                  << dump;
+        std::terminate();
+    }
+
+    const auto extracted = memo.extract(root);
+    assert(plan::to_string(extracted) == plan::to_string(logical));
+    memo.assert_invariants();
+}
+
 } // namespace
 
 int main() {
@@ -171,5 +194,6 @@ int main() {
     assert_memo_exploration_adds_equivalent_expressions();
     assert_memo_extracted_plan_matches_both_engines();
     assert_cross_group_duplicate_expression_merges_groups();
+    assert_aliased_self_join_scans_remain_distinct_groups();
     return 0;
 }

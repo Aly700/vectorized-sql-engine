@@ -31,7 +31,7 @@ const LogicalPlan& require_right(const LogicalPlan& logical) {
 PhysicalPlan lower_to_physical(const LogicalPlan& logical) {
     switch (logical.kind) {
     case LogicalKind::Scan:
-        return PhysicalPlan::scan(logical.table);
+        return PhysicalPlan::scan(logical.table, logical.binding_name);
     case LogicalKind::Join:
         return PhysicalPlan::join(logical.predicates,
                                   lower_to_physical(require_left(logical)),

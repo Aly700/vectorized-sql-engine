@@ -49,6 +49,8 @@ struct SelectItem {
 struct JoinClause {
     std::string table;
     std::size_t table_position{0};
+    std::optional<std::string> alias;
+    std::size_t alias_position{0};
     std::vector<ComparisonExpr> predicates;
 };
 
@@ -56,6 +58,8 @@ struct SelectQuery {
     std::vector<SelectItem> projection;
     std::string table;
     std::size_t table_position{0};
+    std::optional<std::string> alias;
+    std::size_t alias_position{0};
     std::vector<JoinClause> joins;
     std::optional<WhereClause> predicate;
     std::vector<OrderByKey> order_by;
@@ -78,6 +82,14 @@ inline std::string output_name(const ScalarExpr& expression) {
         return column->name;
     }
     return std::to_string(std::get<IntLiteral>(expression).value);
+}
+
+inline const std::string& binding_name(const SelectQuery& query) {
+    return query.alias.has_value() ? *query.alias : query.table;
+}
+
+inline const std::string& binding_name(const JoinClause& join) {
+    return join.alias.has_value() ? *join.alias : join.table;
 }
 
 } // namespace sql

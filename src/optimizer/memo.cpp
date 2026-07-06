@@ -26,7 +26,7 @@ void hash_string(std::size_t& seed, const std::string& value) {
 void hash_scalar(std::size_t& seed, const plan::BoundScalarExpr& expression) {
     if (const auto* column = std::get_if<plan::BoundColumnRef>(&expression)) {
         hash_combine(seed, 1);
-        hash_string(seed, column->table);
+        hash_string(seed, column->binding);
         hash_string(seed, column->column);
         return;
     }
@@ -47,7 +47,7 @@ void hash_projection(std::size_t& seed, const plan::Projection& projection) {
 }
 
 void hash_sort_key(std::size_t& seed, const plan::SortKey& key) {
-    hash_string(seed, key.column.table);
+    hash_string(seed, key.column.binding);
     hash_string(seed, key.column.column);
     hash_combine(seed, static_cast<std::size_t>(key.direction));
 }
@@ -57,6 +57,7 @@ std::size_t structural_hash(const MemoExpression& expression) {
     hash_combine(seed, static_cast<std::size_t>(expression.kind));
     hash_combine(seed, static_cast<std::size_t>(expression.order_permission));
     hash_string(seed, expression.table);
+    hash_string(seed, expression.binding_name);
 
     hash_combine(seed, expression.projections.size());
     for (const auto& projection : expression.projections) {
@@ -87,7 +88,7 @@ bool scalar_equal(const plan::BoundScalarExpr& left, const plan::BoundScalarExpr
     }
     if (const auto* left_column = std::get_if<plan::BoundColumnRef>(&left)) {
         const auto& right_column = std::get<plan::BoundColumnRef>(right);
-        return left_column->table == right_column.table && left_column->column == right_column.column;
+        return left_column->binding == right_column.binding && left_column->column == right_column.column;
     }
     return std::get<sql::IntLiteral>(left).value == std::get<sql::IntLiteral>(right).value;
 }
@@ -101,7 +102,7 @@ bool projection_equal(const plan::Projection& left, const plan::Projection& righ
 }
 
 bool sort_key_equal(const plan::SortKey& left, const plan::SortKey& right) {
-    return left.column.table == right.column.table && left.column.column == right.column.column &&
+    return left.column.binding == right.column.binding && left.column.column == right.column.column &&
            left.direction == right.direction;
 }
 
@@ -120,6 +121,7 @@ bool vector_equal(const std::vector<T>& left, const std::vector<T>& right, Equal
 
 bool structural_equal(const MemoExpression& left, const MemoExpression& right) {
     return left.kind == right.kind && left.order_permission == right.order_permission && left.table == right.table &&
+           left.binding_name == right.binding_name &&
            vector_equal(left.projections, right.projections, projection_equal) &&
            vector_equal(left.sort_keys, right.sort_keys, sort_key_equal) &&
            vector_equal(left.predicates, right.predicates, comparison_equal) && left.children == right.children;
@@ -148,7 +150,7 @@ const plan::LogicalPlan& require_right(const plan::LogicalPlan& logical) {
 
 std::string expression_to_string(const plan::BoundScalarExpr& expression) {
     if (const auto* column = std::get_if<plan::BoundColumnRef>(&expression)) {
-        return "col(" + column->table + "." + column->column + ")";
+        return "col(" + column->binding + "." + column->column + ")";
     }
     return "lit(" + std::to_string(std::get<sql::IntLiteral>(expression).value) + ")";
 }
@@ -196,7 +198,7 @@ std::string sort_direction_to_string(sql::SortDirection direction) {
 }
 
 std::string sort_key_to_string(const plan::SortKey& key) {
-    return "col(" + key.column.table + "." + key.column.column + ") " + sort_direction_to_string(key.direction);
+    return "col(" + key.column.binding + "." + key.column.column + ") " + sort_direction_to_string(key.direction);
 }
 
 void append_sort_keys(std::ostringstream& out, const std::vector<plan::SortKey>& sort_keys) {
@@ -223,7 +225,11 @@ std::string memo_expression_to_string(const MemoExpression& expression) {
     std::ostringstream out;
     switch (expression.kind) {
     case MemoExpressionKind::Scan:
-        out << "Scan[" << expression.table << "]";
+        out << "Scan[" << expression.table;
+        if (expression.binding_name != expression.table) {
+            out << " AS " << expression.binding_name;
+        }
+        out << "]";
         return out.str();
     case MemoExpressionKind::Join:
         out << "Join[";
@@ -348,7 +354,7 @@ std::string column_key(const std::string& table, const std::string& column) {
 }
 
 std::string column_key(const plan::BoundColumnRef& column) {
-    return column_key(column.table, column.column);
+    return column_key(column.binding, column.column);
 }
 
 std::optional<std::int64_t> literal_value(const plan::BoundScalarExpr& expression) {
@@ -447,6 +453,7 @@ std::optional<EquiJoinKeyEstimate> usable_equi_join_key(const plan::BoundCompari
 }
 
 RelationEstimate scan_estimate(const std::string& table,
+                               const std::string& binding_name,
                                plan::OrderPermission order_permission,
                                const catalog::Catalog& catalog) {
     const auto schema = require_costed_table_schema(table, catalog);
@@ -454,9 +461,9 @@ RelationEstimate scan_estimate(const std::string& table,
     estimate.rows = clamp_estimate(static_cast<double>(*schema.row_count));
     estimate.cost = estimate.rows;
     for (const auto& column : schema.columns) {
-        estimate.distinct_by_column[column_key(schema.name, column.name)] = estimate.rows <= 0.0 ? 0.0 : estimate.rows;
+        estimate.distinct_by_column[column_key(binding_name, column.name)] = estimate.rows <= 0.0 ? 0.0 : estimate.rows;
     }
-    estimate.plan = plan::LogicalPlan::scan(table);
+    estimate.plan = plan::LogicalPlan::scan(table, binding_name);
     estimate.plan.order_permission = order_permission;
     return estimate;
 }
@@ -558,7 +565,7 @@ RelationEstimate join_estimate(const std::vector<plan::BoundComparisonExpr>& pre
 RelationEstimate estimate_logical_relation(const plan::LogicalPlan& logical, const catalog::Catalog& catalog) {
     switch (logical.kind) {
     case plan::LogicalKind::Scan:
-        return scan_estimate(logical.table, logical.order_permission, catalog);
+        return scan_estimate(logical.table, logical.binding_name, logical.order_permission, catalog);
     case plan::LogicalKind::Filter:
         return filter_estimate(logical.predicates,
                                estimate_logical_relation(require_input(logical), catalog),
@@ -636,7 +643,7 @@ private:
     [[nodiscard]] RelationEstimate estimate_expression(const MemoExpression& expression, std::vector<GroupId>& stack) {
         switch (expression.kind) {
         case MemoExpressionKind::Scan:
-            return scan_estimate(expression.table, expression.order_permission, catalog_);
+            return scan_estimate(expression.table, expression.binding_name, expression.order_permission, catalog_);
         case MemoExpressionKind::Filter:
             return filter_estimate(expression.predicates,
                                    best_for_group(expression.children.at(0), stack).estimate,
@@ -674,6 +681,7 @@ GroupId Memo::insert(const plan::LogicalPlan& logical) {
     case plan::LogicalKind::Scan:
         expression.kind = MemoExpressionKind::Scan;
         expression.table = logical.table;
+        expression.binding_name = logical.binding_name;
         return insert_expression(std::move(expression));
     case plan::LogicalKind::Filter:
         expression.kind = MemoExpressionKind::Filter;
@@ -981,7 +989,7 @@ plan::LogicalPlan Memo::extract(GroupId id, std::vector<GroupId>& stack) const {
 plan::LogicalPlan Memo::extract_expression(const MemoExpression& expression, std::vector<GroupId>& stack) const {
     switch (expression.kind) {
     case MemoExpressionKind::Scan: {
-        auto result = plan::LogicalPlan::scan(expression.table);
+        auto result = plan::LogicalPlan::scan(expression.table, expression.binding_name);
         result.order_permission = expression.order_permission;
         return result;
     }
@@ -1023,38 +1031,38 @@ void Memo::validate_expression(const MemoExpression& expression) const {
 
     switch (expression.kind) {
     case MemoExpressionKind::Scan:
-        if (expression.table.empty() || !expression.projections.empty() || !expression.sort_keys.empty() ||
-            !expression.predicates.empty() || !expression.children.empty()) {
+        if (expression.table.empty() || expression.binding_name.empty() || !expression.projections.empty() ||
+            !expression.sort_keys.empty() || !expression.predicates.empty() || !expression.children.empty()) {
             throw std::logic_error("malformed memo scan expression");
         }
         return;
     case MemoExpressionKind::Filter:
-        if (!expression.table.empty() || !expression.projections.empty() || !expression.sort_keys.empty() ||
-            expression.predicates.empty() || expression.children.size() != 1) {
+        if (!expression.table.empty() || !expression.binding_name.empty() || !expression.projections.empty() ||
+            !expression.sort_keys.empty() || expression.predicates.empty() || expression.children.size() != 1) {
             throw std::logic_error("malformed memo filter expression");
         }
         return;
     case MemoExpressionKind::Project:
-        if (!expression.table.empty() || expression.projections.empty() || !expression.sort_keys.empty() ||
-            !expression.predicates.empty() || expression.children.size() != 1) {
+        if (!expression.table.empty() || !expression.binding_name.empty() || expression.projections.empty() ||
+            !expression.sort_keys.empty() || !expression.predicates.empty() || expression.children.size() != 1) {
             throw std::logic_error("malformed memo project expression");
         }
         return;
     case MemoExpressionKind::Sort:
-        if (!expression.table.empty() || !expression.projections.empty() || expression.sort_keys.empty() ||
-            !expression.predicates.empty() || expression.children.size() != 1) {
+        if (!expression.table.empty() || !expression.binding_name.empty() || !expression.projections.empty() ||
+            expression.sort_keys.empty() || !expression.predicates.empty() || expression.children.size() != 1) {
             throw std::logic_error("malformed memo sort expression");
         }
         return;
     case MemoExpressionKind::Join:
-        if (!expression.table.empty() || !expression.projections.empty() || !expression.sort_keys.empty() ||
-            expression.children.size() != 2) {
+        if (!expression.table.empty() || !expression.binding_name.empty() || !expression.projections.empty() ||
+            !expression.sort_keys.empty() || expression.children.size() != 2) {
             throw std::logic_error("malformed memo join expression");
         }
         return;
     case MemoExpressionKind::GroupRef:
-        if (!expression.table.empty() || !expression.projections.empty() || !expression.sort_keys.empty() ||
-            !expression.predicates.empty() || expression.children.size() != 1) {
+        if (!expression.table.empty() || !expression.binding_name.empty() || !expression.projections.empty() ||
+            !expression.sort_keys.empty() || !expression.predicates.empty() || expression.children.size() != 1) {
             throw std::logic_error("malformed memo group reference expression");
         }
         return;
@@ -1266,7 +1274,7 @@ std::vector<plan::LogicalPlan> Memo::extract_alternatives_for_expression(
     std::vector<GroupId>& stack) const {
     switch (expression.kind) {
     case MemoExpressionKind::Scan: {
-        auto scan = plan::LogicalPlan::scan(expression.table);
+        auto scan = plan::LogicalPlan::scan(expression.table, expression.binding_name);
         scan.order_permission = expression.order_permission;
         return {std::move(scan)};
     }

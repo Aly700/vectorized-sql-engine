@@ -83,7 +83,7 @@ void validate_view(const BatchView& view) {
 }
 
 std::string column_identity_name(const plan::BoundColumnRef& column) {
-    return column.table + "." + column.column;
+    return column.binding + "." + column.column;
 }
 
 std::int64_t evaluate_scalar(const plan::BoundScalarExpr& expression,
@@ -301,7 +301,7 @@ BatchView execute_scan(const plan::PhysicalPlan& plan, const Catalog& catalog) {
     const auto& input = catalog.table(plan.table);
     auto qualified = std::make_shared<storage::ColumnarBatch>();
     for (const auto& column_name : input.column_names()) {
-        qualified->add_column(plan.table + "." + column_name, input.column(column_name));
+        qualified->add_column(plan.binding_name + "." + column_name, input.column(column_name));
     }
 
     BatchView view;

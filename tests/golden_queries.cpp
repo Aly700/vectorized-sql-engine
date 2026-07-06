@@ -267,6 +267,26 @@ int main() {
             ExpectedResult{{"t1.b"}, {{20}, {30}, {20}, {30}}},
         },
         GoldenQuery{
+            "implicit table alias qualifies projection and predicate",
+            "SELECT x.a FROM t x WHERE x.a = 2",
+            ExpectedResult{{"x.a"}, {{2}}},
+        },
+        GoldenQuery{
+            "aliased join orders by aliased keys",
+            "SELECT x.b, y.c FROM t1 AS x JOIN t2 AS y ON x.a = y.a ORDER BY y.c DESC, x.b ASC",
+            ExpectedResult{{"x.b", "y.c"}, {{20, 201}, {30, 201}, {20, 200}, {30, 200}}},
+        },
+        GoldenQuery{
+            "self join equality keeps alias identities separate",
+            "SELECT x.a, y.a FROM t AS x JOIN t AS y ON x.a = y.a ORDER BY x.a ASC, y.a ASC",
+            ExpectedResult{{"x.a", "y.a"}, {{1, 1}, {2, 2}, {3, 3}, {4, 4}}},
+        },
+        GoldenQuery{
+            "self join memo-dedup regression result",
+            "SELECT x.a, y.b FROM t1 AS x JOIN t1 AS y ON x.a = y.a WHERE x.b = 20 ORDER BY y.b ASC",
+            ExpectedResult{{"x.a", "y.b"}, {{2, 20}, {2, 30}}},
+        },
+        GoldenQuery{
             "unsupported OR is rejected at token position",
             "SELECT a FROM t WHERE a = 2 OR b = 20",
             ExpectedResult{},
@@ -316,6 +336,34 @@ int main() {
             ExpectedError{ErrorKind::Bind, 7, "unknown table qualifier 'missing'"},
         },
         GoldenQuery{
+            "physical table name is not a qualifier when alias is present",
+            "SELECT t.a FROM t AS x",
+            ExpectedResult{},
+            true,
+            ExpectedError{ErrorKind::Bind, 7, "unknown table qualifier 't'"},
+        },
+        GoldenQuery{
+            "duplicate unaliased self join binding is a bind error",
+            "SELECT t.a FROM t JOIN t ON t.a = t.a",
+            ExpectedResult{},
+            true,
+            ExpectedError{ErrorKind::Bind, 23, "duplicate table binding 't' requires a unique alias"},
+        },
+        GoldenQuery{
+            "duplicate alias binding is a bind error",
+            "SELECT x.a FROM t AS x JOIN t1 AS x ON x.a = x.a",
+            ExpectedResult{},
+            true,
+            ExpectedError{ErrorKind::Bind, 34, "duplicate table binding 'x' requires a unique alias"},
+        },
+        GoldenQuery{
+            "unqualified column ambiguity reports alias scopes",
+            "SELECT a FROM t AS x JOIN t2 AS y ON x.a = y.a",
+            ExpectedResult{},
+            true,
+            ExpectedError{ErrorKind::Bind, 7, "ambiguous column 'a' matches tables 'x', 'y'"},
+        },
+        GoldenQuery{
             "unknown qualified column is a bind error",
             "SELECT t1.missing FROM t1 JOIN t2 ON t1.a = t2.a",
             ExpectedResult{},
@@ -328,6 +376,13 @@ int main() {
             ExpectedResult{},
             true,
             ExpectedError{ErrorKind::Parse, 9, "expected ',' or FROM after projection expression"},
+        },
+        GoldenQuery{
+            "reserved keyword after AS is rejected as table alias",
+            "SELECT a FROM t AS JOIN",
+            ExpectedResult{},
+            true,
+            ExpectedError{ErrorKind::Parse, 19, "expected alias after AS"},
         },
         GoldenQuery{
             "ORDER must be followed by BY",

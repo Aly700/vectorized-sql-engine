@@ -14,7 +14,7 @@ enum class LogicalKind { Scan, Join, Filter, Project, Sort };
 enum class OrderPermission { Deterministic, Arbitrary };
 
 struct BoundColumnRef {
-    std::string table;
+    std::string binding;
     std::string column;
     std::size_t position{0};
 };
@@ -41,7 +41,10 @@ struct SortKey {
 struct LogicalPlan {
     LogicalKind kind{LogicalKind::Scan};
     OrderPermission order_permission{OrderPermission::Deterministic};
+    // Scan nodes read the physical table named by `table` and emit bound
+    // column identities qualified by `binding_name`.
     std::string table;
+    std::string binding_name;
     std::vector<Projection> projections;
     std::vector<SortKey> sort_keys;
     std::vector<BoundComparisonExpr> predicates;
@@ -50,15 +53,20 @@ struct LogicalPlan {
     std::shared_ptr<LogicalPlan> right;
 
     static LogicalPlan scan(std::string table) {
+        return scan(table, table);
+    }
+
+    static LogicalPlan scan(std::string table, std::string binding_name) {
         LogicalPlan p;
         p.kind = LogicalKind::Scan;
         p.table = std::move(table);
+        p.binding_name = std::move(binding_name);
         return p;
     }
 
     // Join output identity/order is deterministic: all columns from the left
     // child followed by all columns from the right child. Expressions in a
-    // bound logical plan refer to those identities by table and column name;
+    // bound logical plan refer to those identities by binding and column name;
     // downstream layers must not re-resolve parsed SQL names.
     static LogicalPlan join(std::vector<BoundComparisonExpr> predicates, LogicalPlan left, LogicalPlan right) {
         LogicalPlan p;
