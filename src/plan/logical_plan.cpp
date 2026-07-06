@@ -14,9 +14,23 @@ const LogicalPlan& require_input(const LogicalPlan& logical) {
     return *logical.input;
 }
 
-std::string expression_to_string(const sql::ScalarExpr& expression) {
-    if (const auto* column = std::get_if<sql::ColumnRef>(&expression)) {
-        return "col(" + column->name + ")";
+const LogicalPlan& require_left(const LogicalPlan& logical) {
+    if (!logical.left) {
+        throw std::invalid_argument("logical join node is missing its left input");
+    }
+    return *logical.left;
+}
+
+const LogicalPlan& require_right(const LogicalPlan& logical) {
+    if (!logical.right) {
+        throw std::invalid_argument("logical join node is missing its right input");
+    }
+    return *logical.right;
+}
+
+std::string expression_to_string(const BoundScalarExpr& expression) {
+    if (const auto* column = std::get_if<BoundColumnRef>(&expression)) {
+        return "col(" + column->table + "." + column->column + ")";
     }
     return "lit(" + std::to_string(std::get<sql::IntLiteral>(expression).value) + ")";
 }
@@ -39,7 +53,7 @@ std::string comparison_op_to_string(sql::ComparisonOp op) {
     throw std::logic_error("unreachable comparison operator");
 }
 
-std::string comparison_to_string(const sql::ComparisonExpr& comparison) {
+std::string comparison_to_string(const BoundComparisonExpr& comparison) {
     return expression_to_string(comparison.left) + " " + comparison_op_to_string(comparison.op) + " " +
            expression_to_string(comparison.right);
 }
@@ -55,6 +69,19 @@ void append_plan(std::ostringstream& out, const LogicalPlan& logical, std::size_
     switch (logical.kind) {
     case LogicalKind::Scan:
         out << "Scan[" << logical.table << "]";
+        return;
+    case LogicalKind::Join:
+        out << "Join[";
+        for (std::size_t i = 0; i < logical.predicates.size(); ++i) {
+            if (i != 0) {
+                out << " AND ";
+            }
+            out << comparison_to_string(logical.predicates[i]);
+        }
+        out << "]\n";
+        append_plan(out, require_left(logical), depth + 1);
+        out << "\n";
+        append_plan(out, require_right(logical), depth + 1);
         return;
     case LogicalKind::Filter:
         out << "Filter[";

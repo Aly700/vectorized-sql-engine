@@ -15,7 +15,7 @@ struct PhysicalPlan {
     PhysicalKind kind{PhysicalKind::Scan};
     std::string table;
     std::vector<Projection> projections;
-    std::vector<sql::ComparisonExpr> predicates;
+    std::vector<BoundComparisonExpr> predicates;
     std::shared_ptr<PhysicalPlan> input;
 
     static PhysicalPlan scan(std::string table) {
@@ -25,7 +25,7 @@ struct PhysicalPlan {
         return p;
     }
 
-    static PhysicalPlan filter(std::vector<sql::ComparisonExpr> predicates, PhysicalPlan child) {
+    static PhysicalPlan filter(std::vector<BoundComparisonExpr> predicates, PhysicalPlan child) {
         PhysicalPlan p;
         p.kind = PhysicalKind::Filter;
         p.predicates = std::move(predicates);

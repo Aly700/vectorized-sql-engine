@@ -4,6 +4,7 @@
 #include <charconv>
 #include <cctype>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -16,6 +17,7 @@ enum class TokenKind {
     Identifier,
     Integer,
     Comma,
+    Dot,
     Semicolon,
     Equal,
     NotEqual,
@@ -58,7 +60,8 @@ bool equals_keyword(std::string_view text, std::string_view keyword) {
 
 bool is_reserved_keyword(std::string_view text) {
     return equals_keyword(text, "SELECT") || equals_keyword(text, "FROM") || equals_keyword(text, "WHERE") ||
-           equals_keyword(text, "AND") || equals_keyword(text, "OR") || equals_keyword(text, "AS");
+           equals_keyword(text, "AND") || equals_keyword(text, "OR") || equals_keyword(text, "AS") ||
+           equals_keyword(text, "JOIN") || equals_keyword(text, "INNER") || equals_keyword(text, "ON");
 }
 
 class Lexer {
@@ -97,6 +100,8 @@ public:
         switch (ch) {
         case ',':
             return Token{TokenKind::Comma, ",", position};
+        case '.':
+            return Token{TokenKind::Dot, ".", position};
         case ';':
             return Token{TokenKind::Semicolon, ";", position};
         case '=':
@@ -146,6 +151,10 @@ public:
         query.table = current_.text;
         query.table_position = current_.position;
         advance();
+
+        while (is_keyword("INNER") || is_keyword("JOIN")) {
+            query.joins.push_back(parse_join());
+        }
 
         if (is_keyword("WHERE")) {
             advance();
@@ -198,12 +207,39 @@ private:
 
     WhereClause parse_where() {
         WhereClause where;
-        where.conjuncts.push_back(parse_comparison());
+        where.conjuncts = parse_comparison_conjunction();
+        return where;
+    }
+
+    JoinClause parse_join() {
+        if (is_keyword("INNER")) {
+            advance();
+            expect_keyword("JOIN", "expected JOIN after INNER");
+        } else {
+            expect_keyword("JOIN", "expected JOIN");
+        }
+
+        if (current_.kind != TokenKind::Identifier || is_reserved_keyword(current_.text)) {
+            throw ParseError(current_.position, "expected table name after JOIN");
+        }
+        JoinClause join;
+        join.table = current_.text;
+        join.table_position = current_.position;
+        advance();
+
+        expect_keyword("ON", "expected ON after JOIN table");
+        join.predicates = parse_comparison_conjunction();
+        return join;
+    }
+
+    std::vector<ComparisonExpr> parse_comparison_conjunction() {
+        std::vector<ComparisonExpr> conjuncts;
+        conjuncts.push_back(parse_comparison());
         while (is_keyword("AND")) {
             advance();
-            where.conjuncts.push_back(parse_comparison());
+            conjuncts.push_back(parse_comparison());
         }
-        return where;
+        return conjuncts;
     }
 
     ComparisonExpr parse_comparison() {
@@ -241,8 +277,18 @@ private:
 
     ScalarExpr parse_scalar_expr(const std::string& message) {
         if (current_.kind == TokenKind::Identifier && !is_reserved_keyword(current_.text)) {
-            auto column = ColumnRef{current_.text, current_.position};
+            auto first = current_;
             advance();
+            if (current_.kind == TokenKind::Dot) {
+                advance();
+                if (current_.kind != TokenKind::Identifier || is_reserved_keyword(current_.text)) {
+                    throw ParseError(current_.position, "expected column name after qualifier");
+                }
+                auto column = ColumnRef{first.text, current_.text, first.position};
+                advance();
+                return column;
+            }
+            auto column = ColumnRef{std::nullopt, first.text, first.position};
             return column;
         }
 

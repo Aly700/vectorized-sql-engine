@@ -32,6 +32,32 @@ execution::Catalog make_catalog() {
 
     execution::Catalog catalog;
     catalog.add_table("t", std::move(batch));
+
+    storage::Int64Column t1_a;
+    for (auto value : {1, 2, 2}) {
+        t1_a.append(value);
+    }
+    storage::Int64Column t1_b;
+    for (auto value : {10, 20, 30}) {
+        t1_b.append(value);
+    }
+    storage::ColumnarBatch t1;
+    t1.add_column("a", std::move(t1_a));
+    t1.add_column("b", std::move(t1_b));
+    catalog.add_table("t1", std::move(t1));
+
+    storage::Int64Column t2_a;
+    for (auto value : {2, 2, 3}) {
+        t2_a.append(value);
+    }
+    storage::Int64Column t2_c;
+    for (auto value : {200, 201, 300}) {
+        t2_c.append(value);
+    }
+    storage::ColumnarBatch t2;
+    t2.add_column("a", std::move(t2_a));
+    t2.add_column("c", std::move(t2_c));
+    catalog.add_table("t2", std::move(t2));
     return catalog;
 }
 
@@ -76,15 +102,21 @@ bool trace_contains(const optimizer::RewriteTrace& trace, const std::string& rul
     return false;
 }
 
-sql::ComparisonExpr comparison(sql::ScalarExpr left, sql::ComparisonOp op, sql::ScalarExpr right) {
-    return sql::ComparisonExpr{std::move(left), op, std::move(right), 0};
+plan::BoundComparisonExpr comparison(plan::BoundScalarExpr left,
+                                     sql::ComparisonOp op,
+                                     plan::BoundScalarExpr right) {
+    return plan::BoundComparisonExpr{std::move(left), op, std::move(right), 0};
 }
 
-sql::ScalarExpr column(std::string name) {
-    return sql::ColumnRef{std::move(name), 0};
+plan::BoundScalarExpr column(std::string name) {
+    return plan::BoundColumnRef{"t", std::move(name), 0};
 }
 
-sql::ScalarExpr literal(std::int64_t value) {
+plan::BoundScalarExpr column(std::string table, std::string name) {
+    return plan::BoundColumnRef{std::move(table), std::move(name), 0};
+}
+
+plan::BoundScalarExpr literal(std::int64_t value) {
     return sql::IntLiteral{value, 0};
 }
 
@@ -122,6 +154,29 @@ void assert_rewrite_equivalent(const std::string& sql) {
     std::terminate();
 }
 
+void assert_rewrite_equivalent_oracle_only(const std::string& sql) {
+    const auto catalog = make_catalog();
+    const auto parsed = sql::parse_select(sql);
+    const auto logical = sql::bind_select(parsed, catalog);
+    const auto rewritten = optimizer::rewrite_to_fixpoint(logical, optimizer::default_rules());
+
+    const auto unrewritten_oracle = execution::execute_interpreted(logical, catalog);
+    const auto rewritten_oracle = execution::execute_interpreted(rewritten.plan, catalog);
+    if (same_batch(unrewritten_oracle, rewritten_oracle)) {
+        return;
+    }
+
+    std::cerr << "join rewrite oracle equivalence failed\n"
+              << "sql: " << sql << "\n"
+              << "before plan:\n"
+              << plan::to_string(logical) << "\n"
+              << "after plan:\n"
+              << plan::to_string(rewritten.plan) << "\n"
+              << "unrewritten oracle: " << format_batch(unrewritten_oracle) << "\n"
+              << "rewritten oracle:   " << format_batch(rewritten_oracle) << "\n";
+    std::terminate();
+}
+
 void assert_constant_fold_rule_fires() {
     const auto catalog = make_catalog();
     const optimizer::ConstantFoldComparisonRule fold;
@@ -143,7 +198,7 @@ void assert_drop_always_true_rule_fires() {
     assert(trace_contains(rewritten.trace, "DropAlwaysTrueFilterRule"));
     const auto printed = plan::to_string(rewritten.plan);
     assert(printed.find("lit(1) = lit(1)") == std::string::npos);
-    assert(printed.find("col(a) = lit(2)") != std::string::npos);
+    assert(printed.find("col(t.a) = lit(2)") != std::string::npos);
     assert_rewrite_equivalent("SELECT a FROM t WHERE 2 > 1 AND a = 2");
 }
 
@@ -156,7 +211,7 @@ void assert_always_false_rule_fires() {
 
     assert(trace_contains(rewritten.trace, "AlwaysFalseFilterRule"));
     const auto printed = plan::to_string(rewritten.plan);
-    assert(printed.find("col(a) = lit(2)") == std::string::npos);
+    assert(printed.find("col(t.a) = lit(2)") == std::string::npos);
     assert(printed.find("lit(1) = lit(0)") != std::string::npos);
     assert_rewrite_equivalent("SELECT a FROM t WHERE a = 2 AND 2 < 1");
 }
@@ -175,7 +230,7 @@ void assert_merge_adjacent_filters_rule_fires() {
 
     assert(trace_contains(rewritten.trace, "MergeAdjacentFiltersRule"));
     const auto printed = plan::to_string(rewritten.plan);
-    assert(printed.find("Filter[col(a) >= lit(2) AND col(b) < lit(40)]") != std::string::npos);
+    assert(printed.find("Filter[col(t.a) >= lit(2) AND col(t.b) < lit(40)]") != std::string::npos);
 
     const auto unrewritten_oracle = execution::execute_interpreted(logical, catalog);
     const auto rewritten_oracle = execution::execute_interpreted(rewritten.plan, catalog);
@@ -193,6 +248,36 @@ void assert_all_true_filter_is_removed() {
     assert(plan::to_string(rewritten.plan).find("Filter") == std::string::npos);
 }
 
+void assert_filter_rewrites_above_join_remain_equivalent() {
+    const auto catalog = make_catalog();
+    const auto sql = "SELECT t1.b, t2.c FROM t1 JOIN t2 ON t1.a = t2.a WHERE 2 > 1 AND t2.c = 201";
+    const auto rewritten = rewrite_sql(sql, catalog, optimizer::default_rules());
+    assert(trace_contains(rewritten.trace, "DropAlwaysTrueFilterRule"));
+    assert(plan::to_string(rewritten.plan).find("Join[") != std::string::npos);
+    assert_rewrite_equivalent_oracle_only(sql);
+}
+
+void assert_rewrite_driver_traverses_join_children() {
+    const auto left_filter = plan::LogicalPlan::filter(
+        {comparison(literal(2), sql::ComparisonOp::Greater, literal(1))},
+        plan::LogicalPlan::scan("t1"));
+    auto logical = plan::LogicalPlan::project(
+        {plan::Projection{"t1.b", column("t1", "b")}},
+        plan::LogicalPlan::join({comparison(column("t1", "a"), sql::ComparisonOp::Equal, column("t2", "a"))},
+                                left_filter,
+                                plan::LogicalPlan::scan("t2")));
+
+    const optimizer::ConstantFoldComparisonRule fold;
+    const optimizer::DropAlwaysTrueFilterRule drop_true;
+    const std::vector<std::reference_wrapper<const optimizer::Rule>> rules{std::cref(fold), std::cref(drop_true)};
+    const auto rewritten = optimizer::rewrite_to_fixpoint(logical, rules);
+
+    assert(trace_contains(rewritten.trace, "DropAlwaysTrueFilterRule"));
+    const auto printed = plan::to_string(rewritten.plan);
+    assert(printed.find("Join[col(t1.a) = col(t2.a)]") != std::string::npos);
+    assert(printed.find("Filter") == std::string::npos);
+}
+
 } // namespace
 
 int main() {
@@ -201,5 +286,7 @@ int main() {
     assert_always_false_rule_fires();
     assert_merge_adjacent_filters_rule_fires();
     assert_all_true_filter_is_removed();
+    assert_filter_rewrites_above_join_remain_equivalent();
+    assert_rewrite_driver_traverses_join_children();
     return 0;
 }

@@ -9,6 +9,7 @@
 namespace sql {
 
 struct ColumnRef {
+    std::optional<std::string> qualifier;
     std::string name;
     std::size_t position{0};
 };
@@ -38,10 +39,17 @@ struct SelectItem {
     std::size_t position{0};
 };
 
+struct JoinClause {
+    std::string table;
+    std::size_t table_position{0};
+    std::vector<ComparisonExpr> predicates;
+};
+
 struct SelectQuery {
     std::vector<SelectItem> projection;
     std::string table;
     std::size_t table_position{0};
+    std::vector<JoinClause> joins;
     std::optional<WhereClause> predicate;
 };
 
@@ -56,6 +64,9 @@ inline std::size_t expression_position(const ScalarExpr& expression) {
 
 inline std::string output_name(const ScalarExpr& expression) {
     if (const auto* column = std::get_if<ColumnRef>(&expression)) {
+        if (column->qualifier.has_value()) {
+            return *column->qualifier + "." + column->name;
+        }
         return column->name;
     }
     return std::to_string(std::get<IntLiteral>(expression).value);

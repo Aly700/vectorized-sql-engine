@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <memory>
 #include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -45,9 +46,15 @@ void validate_view(const BatchView& view) {
     }
 }
 
-std::int64_t evaluate_scalar(const sql::ScalarExpr& expression, const storage::ColumnarBatch& batch, std::size_t row) {
-    if (const auto* column = std::get_if<sql::ColumnRef>(&expression)) {
-        return batch.column(column->name).at(row);
+std::string column_identity_name(const plan::BoundColumnRef& column) {
+    return column.table + "." + column.column;
+}
+
+std::int64_t evaluate_scalar(const plan::BoundScalarExpr& expression,
+                             const storage::ColumnarBatch& batch,
+                             std::size_t row) {
+    if (const auto* column = std::get_if<plan::BoundColumnRef>(&expression)) {
+        return batch.column(column_identity_name(*column)).at(row);
     }
     return std::get<sql::IntLiteral>(expression).value;
 }
@@ -70,17 +77,25 @@ bool compare_values(std::int64_t left, sql::ComparisonOp op, std::int64_t right)
     throw std::logic_error("unreachable comparison operator");
 }
 
-bool evaluate_comparison(const sql::ComparisonExpr& comparison, const storage::ColumnarBatch& batch, std::size_t row) {
+bool evaluate_comparison(const plan::BoundComparisonExpr& comparison,
+                         const storage::ColumnarBatch& batch,
+                         std::size_t row) {
     return compare_values(evaluate_scalar(comparison.left, batch, row),
                           comparison.op,
                           evaluate_scalar(comparison.right, batch, row));
 }
 
 BatchView execute_scan(const plan::PhysicalPlan& plan, const Catalog& catalog) {
-    const auto& batch = catalog.table(plan.table);
+    const auto& input = catalog.table(plan.table);
+    auto qualified = std::make_shared<storage::ColumnarBatch>();
+    for (const auto& column_name : input.column_names()) {
+        qualified->add_column(plan.table + "." + column_name, input.column(column_name));
+    }
+
     BatchView view;
-    view.batch = &batch;
-    view.selection = identity_selection(batch.row_count());
+    view.owned_batch = qualified;
+    view.batch = qualified.get();
+    view.selection = identity_selection(qualified->row_count());
     validate_view(view);
     return view;
 }
