@@ -90,7 +90,11 @@ ResultSignature signature_for(const storage::ColumnarBatch& batch) {
     }
     for (std::size_t row = 0; row < batch.row_count(); ++row) {
         for (const auto& name : batch.column_names()) {
-            mix_u64(hash, static_cast<std::uint64_t>(batch.column(name).at(row)));
+            const auto& column = batch.column(name);
+            mix_byte(hash, column.is_null(row) ? 0 : 1);
+            if (!column.is_null(row)) {
+                mix_u64(hash, static_cast<std::uint64_t>(column.at(row)));
+            }
         }
     }
     return ResultSignature{batch.row_count(), batch.column_names().size(), hash};

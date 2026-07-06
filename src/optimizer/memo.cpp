@@ -31,8 +31,13 @@ void hash_scalar(std::size_t& seed, const plan::BoundScalarExpr& expression) {
         return;
     }
 
-    hash_combine(seed, 2);
-    hash_combine(seed, std::hash<std::int64_t>{}(std::get<sql::IntLiteral>(expression).value));
+    if (const auto* literal = std::get_if<sql::IntLiteral>(&expression)) {
+        hash_combine(seed, 2);
+        hash_combine(seed, std::hash<std::int64_t>{}(literal->value));
+        return;
+    }
+
+    hash_combine(seed, 3);
 }
 
 void hash_comparison(std::size_t& seed, const plan::BoundComparisonExpr& comparison) {
@@ -46,6 +51,10 @@ void hash_predicate(std::size_t& seed, const plan::BoundPredicate& predicate) {
     switch (predicate.kind) {
     case sql::PredicateKind::Comparison:
         hash_comparison(seed, predicate.comparison);
+        return;
+    case sql::PredicateKind::IsNull:
+    case sql::PredicateKind::IsNotNull:
+        hash_scalar(seed, predicate.null_check);
         return;
     case sql::PredicateKind::And:
     case sql::PredicateKind::Or:
@@ -132,7 +141,10 @@ bool scalar_equal(const plan::BoundScalarExpr& left, const plan::BoundScalarExpr
         const auto& right_column = std::get<plan::BoundColumnRef>(right);
         return left_column->binding == right_column.binding && left_column->column == right_column.column;
     }
-    return std::get<sql::IntLiteral>(left).value == std::get<sql::IntLiteral>(right).value;
+    if (const auto* left_literal = std::get_if<sql::IntLiteral>(&left)) {
+        return left_literal->value == std::get<sql::IntLiteral>(right).value;
+    }
+    return true;
 }
 
 bool comparison_equal(const plan::BoundComparisonExpr& left, const plan::BoundComparisonExpr& right) {
@@ -146,6 +158,9 @@ bool predicate_equal(const plan::BoundPredicate& left, const plan::BoundPredicat
     switch (left.kind) {
     case sql::PredicateKind::Comparison:
         return comparison_equal(left.comparison, right.comparison);
+    case sql::PredicateKind::IsNull:
+    case sql::PredicateKind::IsNotNull:
+        return scalar_equal(left.null_check, right.null_check);
     case sql::PredicateKind::And:
     case sql::PredicateKind::Or:
         if (left.left == nullptr || left.right == nullptr || right.left == nullptr || right.right == nullptr) {
@@ -231,7 +246,10 @@ std::string expression_to_string(const plan::BoundScalarExpr& expression) {
         }
         return "col(" + column->binding + "." + column->column + ")";
     }
-    return "lit(" + std::to_string(std::get<sql::IntLiteral>(expression).value) + ")";
+    if (const auto* literal = std::get_if<sql::IntLiteral>(&expression)) {
+        return "lit(" + std::to_string(literal->value) + ")";
+    }
+    return "lit(NULL)";
 }
 
 std::string column_to_string(const plan::BoundColumnRef& column) {
@@ -268,6 +286,10 @@ std::string predicate_to_string(const plan::BoundPredicate& predicate) {
     switch (predicate.kind) {
     case sql::PredicateKind::Comparison:
         return comparison_to_string(predicate.comparison);
+    case sql::PredicateKind::IsNull:
+        return expression_to_string(predicate.null_check) + " IS NULL";
+    case sql::PredicateKind::IsNotNull:
+        return expression_to_string(predicate.null_check) + " IS NOT NULL";
     case sql::PredicateKind::And:
         if (predicate.left == nullptr || predicate.right == nullptr) {
             throw std::logic_error("bound AND predicate is missing a child");
@@ -559,6 +581,10 @@ double predicate_selectivity(const plan::BoundPredicate& predicate) {
     switch (predicate.kind) {
     case sql::PredicateKind::Comparison:
         return comparison_selectivity(predicate.comparison);
+    case sql::PredicateKind::IsNull:
+        return kEqualitySelectivity;
+    case sql::PredicateKind::IsNotNull:
+        return kNotEqualSelectivity;
     case sql::PredicateKind::And: {
         if (predicate.left == nullptr || predicate.right == nullptr) {
             throw std::logic_error("bound AND predicate is missing a child");
@@ -704,7 +730,8 @@ RelationEstimate aggregate_estimate(const std::vector<plan::BoundColumnRef>& gro
 
     // Aggregate performs one linear input pass plus one output pass over the
     // first-appearance group vector. Global aggregation returns one group even
-    // for empty input so COUNT(*) can produce zero in the NULL-free slice.
+    // for empty input so COUNT(*) can produce zero before Phase 16b defines
+    // full aggregate NULL-result semantics.
     estimate.cost = safe_add(safe_add(child.cost, child.rows), estimate.rows);
     for (const auto& key : group_keys) {
         const auto key_name = column_key(key);

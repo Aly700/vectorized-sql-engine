@@ -5,6 +5,7 @@
 #include <functional>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -15,6 +16,10 @@
 
 namespace execution {
 namespace {
+
+using Cell = std::optional<std::int64_t>;
+
+enum class TruthValue { False, True, Unknown };
 
 using SelectionVector = std::vector<std::size_t>;
 using SelectionVectorPtr = std::shared_ptr<const SelectionVector>;
@@ -36,7 +41,7 @@ struct JoinPredicateSplit {
 };
 
 struct HashKey {
-    std::vector<std::int64_t> values;
+    std::vector<Cell> values;
 
     bool operator==(const HashKey& other) const { return values == other.values; }
 };
@@ -45,18 +50,34 @@ struct HashKeyHash {
     std::size_t operator()(const HashKey& key) const {
         std::size_t seed = key.values.size();
         for (auto value : key.values) {
-            const auto hashed = std::hash<std::int64_t>{}(value);
+            const auto hashed = value.has_value() ? std::hash<std::int64_t>{}(*value) : 0x517cc1b727220a95ULL;
             seed ^= hashed + 0x9e3779b97f4a7c15ULL + (seed << 6U) + (seed >> 2U);
         }
         return seed;
     }
 };
 
+struct CompiledColumn {
+    const std::vector<std::int64_t>* values{nullptr};
+    const std::vector<std::uint8_t>* validity{nullptr};
+
+    [[nodiscard]] bool is_null(std::size_t row) const {
+        return validity != nullptr && (*validity)[row] == 0;
+    }
+
+    [[nodiscard]] Cell cell(std::size_t row) const {
+        if (is_null(row)) {
+            return std::nullopt;
+        }
+        return (*values)[row];
+    }
+};
+
 struct JoinOutputBuilder {
     std::vector<std::string> names;
     std::vector<storage::Int64Column> columns;
-    std::vector<const std::vector<std::int64_t>*> left_columns;
-    std::vector<const std::vector<std::int64_t>*> right_columns;
+    std::vector<CompiledColumn> left_columns;
+    std::vector<CompiledColumn> right_columns;
 };
 
 struct AggregateValue {
@@ -72,15 +93,23 @@ struct AggregateGroupState {
     std::vector<AggregateValue> aggregates;
 };
 
-struct CompiledColumn {
-    const std::vector<std::int64_t>* values{nullptr};
-};
-
 struct CompiledScalar {
     const std::vector<std::int64_t>* column_values{nullptr};
+    const std::vector<std::uint8_t>* column_validity{nullptr};
     std::int64_t literal{0};
+    bool literal_is_null{false};
 
-    [[nodiscard]] std::int64_t value(std::size_t row) const {
+    [[nodiscard]] bool is_null(std::size_t row) const {
+        if (column_values == nullptr) {
+            return literal_is_null;
+        }
+        return column_validity != nullptr && (*column_validity)[row] == 0;
+    }
+
+    [[nodiscard]] Cell cell(std::size_t row) const {
+        if (is_null(row)) {
+            return std::nullopt;
+        }
         return column_values == nullptr ? literal : (*column_values)[row];
     }
 };
@@ -94,6 +123,7 @@ struct CompiledComparison {
 struct CompiledPredicate {
     sql::PredicateKind kind{sql::PredicateKind::Comparison};
     CompiledComparison comparison;
+    CompiledScalar null_check;
     std::shared_ptr<CompiledPredicate> left;
     std::shared_ptr<CompiledPredicate> right;
 };
@@ -105,15 +135,32 @@ struct CompiledProjection {
 
 struct CompiledSortKey {
     const std::vector<std::int64_t>* values{nullptr};
+    const std::vector<std::uint8_t>* validity{nullptr};
     sql::SortDirection direction{sql::SortDirection::Asc};
 };
 
 struct CompiledJoinScalar {
     const std::vector<std::int64_t>* left_values{nullptr};
+    const std::vector<std::uint8_t>* left_validity{nullptr};
     const std::vector<std::int64_t>* right_values{nullptr};
+    const std::vector<std::uint8_t>* right_validity{nullptr};
     std::int64_t literal{0};
+    bool literal_is_null{false};
 
-    [[nodiscard]] std::int64_t value(std::size_t left_row, std::size_t right_row) const {
+    [[nodiscard]] bool is_null(std::size_t left_row, std::size_t right_row) const {
+        if (left_values != nullptr) {
+            return left_validity != nullptr && (*left_validity)[left_row] == 0;
+        }
+        if (right_values != nullptr) {
+            return right_validity != nullptr && (*right_validity)[right_row] == 0;
+        }
+        return literal_is_null;
+    }
+
+    [[nodiscard]] Cell cell(std::size_t left_row, std::size_t right_row) const {
+        if (is_null(left_row, right_row)) {
+            return std::nullopt;
+        }
         if (left_values != nullptr) {
             return (*left_values)[left_row];
         }
@@ -133,6 +180,7 @@ struct CompiledJoinComparison {
 struct CompiledJoinPredicate {
     sql::PredicateKind kind{sql::PredicateKind::Comparison};
     CompiledJoinComparison comparison;
+    CompiledJoinScalar null_check;
     std::shared_ptr<CompiledJoinPredicate> left;
     std::shared_ptr<CompiledJoinPredicate> right;
 };
@@ -140,6 +188,7 @@ struct CompiledJoinPredicate {
 struct CompiledAggregateExpression {
     const plan::AggregateExpression* aggregate{nullptr};
     const std::vector<std::int64_t>* argument_values{nullptr};
+    const std::vector<std::uint8_t>* argument_validity{nullptr};
 };
 
 SelectionVectorPtr make_selection(SelectionVector rows) {
@@ -153,6 +202,14 @@ SelectionVectorPtr identity_selection(std::size_t row_count) {
         rows.push_back(row);
     }
     return make_selection(std::move(rows));
+}
+
+void append_cell(storage::Int64Column& column, Cell value) {
+    if (value.has_value()) {
+        column.append(*value);
+    } else {
+        column.append_null();
+    }
 }
 
 void validate_view(const BatchView& view) {
@@ -177,11 +234,15 @@ std::string column_identity_name(const plan::BoundColumnRef& column) {
 }
 
 CompiledColumn compile_column(const plan::BoundColumnRef& column, const storage::ColumnarBatch& batch) {
-    return CompiledColumn{&batch.column(column_identity_name(column)).values()};
+    const auto& storage_column = batch.column(column_identity_name(column));
+    return CompiledColumn{&storage_column.values(),
+                          storage_column.has_nulls() ? &storage_column.validity() : nullptr};
 }
 
 CompiledColumn compile_named_column(const storage::ColumnarBatch& batch, const std::string& name) {
-    return CompiledColumn{&batch.column(name).values()};
+    const auto& storage_column = batch.column(name);
+    return CompiledColumn{&storage_column.values(),
+                          storage_column.has_nulls() ? &storage_column.validity() : nullptr};
 }
 
 std::vector<CompiledColumn> compile_columns(const std::vector<plan::BoundColumnRef>& columns,
@@ -207,10 +268,16 @@ std::vector<CompiledColumn> compile_named_columns(const storage::ColumnarBatch& 
 CompiledScalar compile_scalar(const plan::BoundScalarExpr& expression, const storage::ColumnarBatch& batch) {
     CompiledScalar compiled;
     if (const auto* column = std::get_if<plan::BoundColumnRef>(&expression)) {
-        compiled.column_values = &batch.column(column_identity_name(*column)).values();
+        const auto& storage_column = batch.column(column_identity_name(*column));
+        compiled.column_values = &storage_column.values();
+        compiled.column_validity = storage_column.has_nulls() ? &storage_column.validity() : nullptr;
         return compiled;
     }
-    compiled.literal = std::get<sql::IntLiteral>(expression).value;
+    if (const auto* literal = std::get_if<sql::IntLiteral>(&expression)) {
+        compiled.literal = literal->value;
+        return compiled;
+    }
+    compiled.literal_is_null = true;
     return compiled;
 }
 
@@ -232,6 +299,30 @@ bool compare_values(std::int64_t left, sql::ComparisonOp op, std::int64_t right)
     throw std::logic_error("unreachable comparison operator");
 }
 
+TruthValue truth_from_bool(bool value) {
+    return value ? TruthValue::True : TruthValue::False;
+}
+
+TruthValue and_truth(TruthValue left, TruthValue right) {
+    if (left == TruthValue::False || right == TruthValue::False) {
+        return TruthValue::False;
+    }
+    if (left == TruthValue::True && right == TruthValue::True) {
+        return TruthValue::True;
+    }
+    return TruthValue::Unknown;
+}
+
+TruthValue or_truth(TruthValue left, TruthValue right) {
+    if (left == TruthValue::True || right == TruthValue::True) {
+        return TruthValue::True;
+    }
+    if (left == TruthValue::False && right == TruthValue::False) {
+        return TruthValue::False;
+    }
+    return TruthValue::Unknown;
+}
+
 CompiledComparison compile_comparison(const plan::BoundComparisonExpr& comparison,
                                       const storage::ColumnarBatch& batch) {
     CompiledComparison compiled;
@@ -241,8 +332,13 @@ CompiledComparison compile_comparison(const plan::BoundComparisonExpr& compariso
     return compiled;
 }
 
-bool evaluate_comparison(const CompiledComparison& comparison, std::size_t row) {
-    return compare_values(comparison.left.value(row), comparison.op, comparison.right.value(row));
+TruthValue evaluate_comparison(const CompiledComparison& comparison, std::size_t row) {
+    const auto left = comparison.left.cell(row);
+    const auto right = comparison.right.cell(row);
+    if (!left.has_value() || !right.has_value()) {
+        return TruthValue::Unknown;
+    }
+    return truth_from_bool(compare_values(*left, comparison.op, *right));
 }
 
 const plan::BoundPredicate& require_left_predicate(const plan::BoundPredicate& predicate) {
@@ -280,6 +376,10 @@ CompiledPredicate compile_predicate(const plan::BoundPredicate& predicate, const
     case sql::PredicateKind::Comparison:
         compiled.comparison = compile_comparison(predicate.comparison, batch);
         return compiled;
+    case sql::PredicateKind::IsNull:
+    case sql::PredicateKind::IsNotNull:
+        compiled.null_check = compile_scalar(predicate.null_check, batch);
+        return compiled;
     case sql::PredicateKind::And:
     case sql::PredicateKind::Or:
         compiled.left = std::make_shared<CompiledPredicate>(compile_predicate(require_left_predicate(predicate), batch));
@@ -299,31 +399,35 @@ std::vector<CompiledPredicate> compile_predicates(const std::vector<plan::BoundP
     return compiled;
 }
 
-bool evaluate_predicate(const CompiledPredicate& predicate, std::size_t row) {
+TruthValue evaluate_predicate(const CompiledPredicate& predicate, std::size_t row) {
     switch (predicate.kind) {
     case sql::PredicateKind::Comparison:
         return evaluate_comparison(predicate.comparison, row);
+    case sql::PredicateKind::IsNull:
+        return truth_from_bool(predicate.null_check.is_null(row));
+    case sql::PredicateKind::IsNotNull:
+        return truth_from_bool(!predicate.null_check.is_null(row));
     case sql::PredicateKind::And: {
         // Evaluation is deliberately left-to-right and short-circuit-free so
         // the vectorized path has the same observable order as the oracle.
         const auto left = evaluate_predicate(require_left_predicate(predicate), row);
         const auto right = evaluate_predicate(require_right_predicate(predicate), row);
-        return left && right;
+        return and_truth(left, right);
     }
     case sql::PredicateKind::Or: {
         const auto left = evaluate_predicate(require_left_predicate(predicate), row);
         const auto right = evaluate_predicate(require_right_predicate(predicate), row);
-        return left || right;
+        return or_truth(left, right);
     }
     }
     throw std::logic_error("unreachable predicate kind");
 }
 
-bool evaluate_predicates(const std::vector<CompiledPredicate>& predicates, std::size_t row) {
-    bool keep = true;
+TruthValue evaluate_predicates(const std::vector<CompiledPredicate>& predicates, std::size_t row) {
+    auto keep = TruthValue::True;
     for (const auto& predicate : predicates) {
         const auto predicate_result = evaluate_predicate(predicate, row);
-        keep = keep && predicate_result;
+        keep = and_truth(keep, predicate_result);
     }
     return keep;
 }
@@ -335,16 +439,24 @@ CompiledJoinScalar compile_join_scalar(const plan::BoundScalarExpr& expression,
     if (const auto* column = std::get_if<plan::BoundColumnRef>(&expression)) {
         const auto name = column_identity_name(*column);
         if (left.has_column(name)) {
-            compiled.left_values = &left.column(name).values();
+            const auto& storage_column = left.column(name);
+            compiled.left_values = &storage_column.values();
+            compiled.left_validity = storage_column.has_nulls() ? &storage_column.validity() : nullptr;
             return compiled;
         }
         if (right.has_column(name)) {
-            compiled.right_values = &right.column(name).values();
+            const auto& storage_column = right.column(name);
+            compiled.right_values = &storage_column.values();
+            compiled.right_validity = storage_column.has_nulls() ? &storage_column.validity() : nullptr;
             return compiled;
         }
         throw std::logic_error("bound join column identity is missing from both inputs: " + name);
     }
-    compiled.literal = std::get<sql::IntLiteral>(expression).value;
+    if (const auto* literal = std::get_if<sql::IntLiteral>(&expression)) {
+        compiled.literal = literal->value;
+        return compiled;
+    }
+    compiled.literal_is_null = true;
     return compiled;
 }
 
@@ -358,12 +470,15 @@ CompiledJoinComparison compile_join_comparison(const plan::BoundComparisonExpr& 
     return compiled;
 }
 
-bool evaluate_join_comparison(const CompiledJoinComparison& comparison,
-                              std::size_t left_row,
-                              std::size_t right_row) {
-    return compare_values(comparison.left.value(left_row, right_row),
-                          comparison.op,
-                          comparison.right.value(left_row, right_row));
+TruthValue evaluate_join_comparison(const CompiledJoinComparison& comparison,
+                                    std::size_t left_row,
+                                    std::size_t right_row) {
+    const auto left = comparison.left.cell(left_row, right_row);
+    const auto right = comparison.right.cell(left_row, right_row);
+    if (!left.has_value() || !right.has_value()) {
+        return TruthValue::Unknown;
+    }
+    return truth_from_bool(compare_values(*left, comparison.op, *right));
 }
 
 const CompiledJoinPredicate& require_left_predicate(const CompiledJoinPredicate& predicate) {
@@ -389,6 +504,10 @@ CompiledJoinPredicate compile_join_predicate(const plan::BoundPredicate& predica
     case sql::PredicateKind::Comparison:
         compiled.comparison = compile_join_comparison(predicate.comparison, left, right);
         return compiled;
+    case sql::PredicateKind::IsNull:
+    case sql::PredicateKind::IsNotNull:
+        compiled.null_check = compile_join_scalar(predicate.null_check, left, right);
+        return compiled;
     case sql::PredicateKind::And:
     case sql::PredicateKind::Or:
         compiled.left =
@@ -411,33 +530,37 @@ std::vector<CompiledJoinPredicate> compile_join_predicates(const std::vector<pla
     return compiled;
 }
 
-bool evaluate_join_predicate(const CompiledJoinPredicate& predicate,
-                             std::size_t left_row,
-                             std::size_t right_row) {
+TruthValue evaluate_join_predicate(const CompiledJoinPredicate& predicate,
+                                   std::size_t left_row,
+                                   std::size_t right_row) {
     switch (predicate.kind) {
     case sql::PredicateKind::Comparison:
         return evaluate_join_comparison(predicate.comparison, left_row, right_row);
+    case sql::PredicateKind::IsNull:
+        return truth_from_bool(predicate.null_check.is_null(left_row, right_row));
+    case sql::PredicateKind::IsNotNull:
+        return truth_from_bool(!predicate.null_check.is_null(left_row, right_row));
     case sql::PredicateKind::And: {
         const auto left_result = evaluate_join_predicate(require_left_predicate(predicate), left_row, right_row);
         const auto right_result = evaluate_join_predicate(require_right_predicate(predicate), left_row, right_row);
-        return left_result && right_result;
+        return and_truth(left_result, right_result);
     }
     case sql::PredicateKind::Or: {
         const auto left_result = evaluate_join_predicate(require_left_predicate(predicate), left_row, right_row);
         const auto right_result = evaluate_join_predicate(require_right_predicate(predicate), left_row, right_row);
-        return left_result || right_result;
+        return or_truth(left_result, right_result);
     }
     }
     throw std::logic_error("unreachable predicate kind");
 }
 
-bool evaluate_join_predicates(const std::vector<CompiledJoinPredicate>& predicates,
-                              std::size_t left_row,
-                              std::size_t right_row) {
-    bool keep = true;
+TruthValue evaluate_join_predicates(const std::vector<CompiledJoinPredicate>& predicates,
+                                    std::size_t left_row,
+                                    std::size_t right_row) {
+    auto keep = TruthValue::True;
     for (const auto& predicate : predicates) {
         const auto predicate_result = evaluate_join_predicate(predicate, left_row, right_row);
-        keep = keep && predicate_result;
+        keep = and_truth(keep, predicate_result);
     }
     return keep;
 }
@@ -495,7 +618,20 @@ HashKey make_key(std::size_t row, const std::vector<CompiledColumn>& key_columns
     HashKey key;
     key.values.reserve(key_columns.size());
     for (const auto& column : key_columns) {
-        key.values.push_back((*column.values)[row]);
+        key.values.push_back(column.cell(row));
+    }
+    return key;
+}
+
+std::optional<HashKey> make_non_null_key(std::size_t row, const std::vector<CompiledColumn>& key_columns) {
+    HashKey key;
+    key.values.reserve(key_columns.size());
+    for (const auto& column : key_columns) {
+        const auto value = column.cell(row);
+        if (!value.has_value()) {
+            return std::nullopt;
+        }
+        key.values.push_back(value);
     }
     return key;
 }
@@ -520,7 +656,9 @@ CompiledAggregateExpression compile_aggregate_expression(const plan::AggregateEx
     CompiledAggregateExpression compiled;
     compiled.aggregate = &aggregate;
     if (aggregate.argument.has_value()) {
-        compiled.argument_values = &batch.column(column_identity_name(*aggregate.argument)).values();
+        const auto& storage_column = batch.column(column_identity_name(*aggregate.argument));
+        compiled.argument_values = &storage_column.values();
+        compiled.argument_validity = storage_column.has_nulls() ? &storage_column.validity() : nullptr;
     }
     return compiled;
 }
@@ -536,9 +674,12 @@ std::vector<CompiledAggregateExpression> compile_aggregate_expressions(
     return compiled;
 }
 
-std::int64_t aggregate_argument_value(const CompiledAggregateExpression& aggregate, std::size_t row) {
+Cell aggregate_argument_value(const CompiledAggregateExpression& aggregate, std::size_t row) {
     if (aggregate.argument_values == nullptr) {
         throw std::logic_error("aggregate argument is missing");
+    }
+    if (aggregate.argument_validity != nullptr && (*aggregate.argument_validity)[row] == 0) {
+        return std::nullopt;
     }
     return (*aggregate.argument_values)[row];
 }
@@ -549,30 +690,42 @@ void update_aggregate(AggregateValue& value,
     const auto& aggregate = *compiled.aggregate;
     switch (aggregate.function) {
     case sql::AggregateFunction::Count:
+        if (aggregate.argument.has_value() && !aggregate_argument_value(compiled, row).has_value()) {
+            return;
+        }
         increment_count(value, aggregate.output_name);
         return;
     case sql::AggregateFunction::Sum: {
         const auto argument = aggregate_argument_value(compiled, row);
+        if (!argument.has_value()) {
+            return;
+        }
         if (!value.has_value) {
-            value.sum = argument;
+            value.sum = *argument;
             value.has_value = true;
             return;
         }
-        value.sum = checked_sum(value.sum, argument, aggregate.output_name);
+        value.sum = checked_sum(value.sum, *argument, aggregate.output_name);
         return;
     }
     case sql::AggregateFunction::Min: {
         const auto argument = aggregate_argument_value(compiled, row);
-        if (!value.has_value || argument < value.min) {
-            value.min = argument;
+        if (!argument.has_value()) {
+            return;
+        }
+        if (!value.has_value || *argument < value.min) {
+            value.min = *argument;
         }
         value.has_value = true;
         return;
     }
     case sql::AggregateFunction::Max: {
         const auto argument = aggregate_argument_value(compiled, row);
-        if (!value.has_value || argument > value.max) {
-            value.max = argument;
+        if (!argument.has_value()) {
+            return;
+        }
+        if (!value.has_value || *argument > value.max) {
+            value.max = *argument;
         }
         value.has_value = true;
         return;
@@ -619,11 +772,11 @@ JoinOutputBuilder make_join_output_builder(const storage::ColumnarBatch& left,
     builder.columns.resize(builder.names.size());
     builder.left_columns.reserve(left.column_names().size());
     for (const auto& column_name : left.column_names()) {
-        builder.left_columns.push_back(&left.column(column_name).values());
+        builder.left_columns.push_back(compile_named_column(left, column_name));
     }
     builder.right_columns.reserve(right.column_names().size());
     for (const auto& column_name : right.column_names()) {
-        builder.right_columns.push_back(&right.column(column_name).values());
+        builder.right_columns.push_back(compile_named_column(right, column_name));
     }
     return builder;
 }
@@ -632,11 +785,11 @@ void append_joined_row(JoinOutputBuilder& builder,
                        std::size_t left_row,
                        std::size_t right_row) {
     std::size_t output_index = 0;
-    for (const auto* values : builder.left_columns) {
-        builder.columns[output_index++].append((*values)[left_row]);
+    for (const auto& column : builder.left_columns) {
+        append_cell(builder.columns[output_index++], column.cell(left_row));
     }
-    for (const auto* values : builder.right_columns) {
-        builder.columns[output_index++].append((*values)[right_row]);
+    for (const auto& column : builder.right_columns) {
+        append_cell(builder.columns[output_index++], column.cell(right_row));
     }
 }
 
@@ -655,7 +808,7 @@ storage::ColumnarBatch execute_nested_loop_join(const BatchView& left,
     auto builder = make_join_output_builder(*left.batch, *right.batch);
     for (auto left_row : *left.selection) {
         for (auto right_row : *right.selection) {
-            if (evaluate_join_predicates(compiled_predicates, left_row, right_row)) {
+            if (evaluate_join_predicates(compiled_predicates, left_row, right_row) == TruthValue::True) {
                 append_joined_row(builder, left_row, right_row);
             }
         }
@@ -682,18 +835,26 @@ storage::ColumnarBatch execute_hash_join(const BatchView& left,
     // left rows in order and from each per-key right-row vector's insertion order.
     std::unordered_map<HashKey, std::vector<std::size_t>, HashKeyHash> right_rows_by_key;
     for (auto right_row : *right.selection) {
-        right_rows_by_key[make_key(right_row, compiled_right_key_columns)].push_back(right_row);
+        auto key = make_non_null_key(right_row, compiled_right_key_columns);
+        if (!key.has_value()) {
+            continue;
+        }
+        right_rows_by_key[*key].push_back(right_row);
     }
 
     auto builder = make_join_output_builder(*left.batch, *right.batch);
     for (auto left_row : *left.selection) {
-        const auto matching_right_rows = right_rows_by_key.find(make_key(left_row, compiled_left_key_columns));
+        auto key = make_non_null_key(left_row, compiled_left_key_columns);
+        if (!key.has_value()) {
+            continue;
+        }
+        const auto matching_right_rows = right_rows_by_key.find(*key);
         if (matching_right_rows == right_rows_by_key.end()) {
             continue;
         }
 
         for (auto right_row : matching_right_rows->second) {
-            if (evaluate_join_predicates(compiled_residuals, left_row, right_row)) {
+            if (evaluate_join_predicates(compiled_residuals, left_row, right_row) == TruthValue::True) {
                 append_joined_row(builder, left_row, right_row);
             }
         }
@@ -775,7 +936,7 @@ BatchView execute_filter(const plan::PhysicalPlan& plan, const Catalog& catalog)
     SelectionVector rows;
     rows.reserve(input.selection->size());
     for (auto row : *input.selection) {
-        if (evaluate_predicates(predicates, row)) {
+        if (evaluate_predicates(predicates, row) == TruthValue::True) {
             rows.push_back(row);
         }
     }
@@ -818,7 +979,7 @@ storage::ColumnarBatch materialize_projection(const plan::PhysicalPlan& plan, co
         storage::Int64Column column;
         column.reserve(input.selection->size());
         for (auto row : *input.selection) {
-            column.append(projection.expression.value(row));
+            append_cell(column, projection.expression.cell(row));
         }
         out.add_column(projection.output_name, std::move(column));
     }
@@ -828,9 +989,9 @@ storage::ColumnarBatch materialize_projection(const plan::PhysicalPlan& plan, co
 storage::Int64Column materialize_selected_column(const BatchView& input, const std::string& name) {
     storage::Int64Column column;
     column.reserve(input.selection->size());
-    const auto& input_column = input.batch->column(name).values();
+    const auto input_column = compile_named_column(*input.batch, name);
     for (auto row : *input.selection) {
-        column.append(input_column[row]);
+        append_cell(column, input_column.cell(row));
     }
     return column;
 }
@@ -866,9 +1027,9 @@ storage::ColumnarBatch materialize_project_output_columns(const plan::PhysicalPl
     for (const auto& projection : project.projections) {
         storage::Int64Column column;
         column.reserve(rows.size());
-        const auto& input_column = batch.column(projection.output_name).values();
+        const auto input_column = compile_named_column(batch, projection.output_name);
         for (auto row : rows) {
-            column.append(input_column[row]);
+            append_cell(column, input_column.cell(row));
         }
         out.add_column(projection.output_name, std::move(column));
     }
@@ -880,7 +1041,10 @@ std::vector<CompiledSortKey> compile_sort_keys(const std::vector<plan::SortKey>&
     std::vector<CompiledSortKey> compiled;
     compiled.reserve(sort_keys.size());
     for (const auto& key : sort_keys) {
-        compiled.push_back(CompiledSortKey{&batch.column(column_identity_name(key.column)).values(), key.direction});
+        const auto& storage_column = batch.column(column_identity_name(key.column));
+        compiled.push_back(CompiledSortKey{&storage_column.values(),
+                                           storage_column.has_nulls() ? &storage_column.validity() : nullptr,
+                                           key.direction});
     }
     return compiled;
 }
@@ -892,8 +1056,10 @@ SelectionVectorPtr sort_selection(const std::vector<plan::SortKey>& sort_keys, c
     SelectionVector rows = *input.selection;
     std::stable_sort(rows.begin(), rows.end(), [&](std::size_t left, std::size_t right) {
         for (const auto& key : compiled_sort_keys) {
-            const auto left_value = (*key.values)[left];
-            const auto right_value = (*key.values)[right];
+            const auto left_value =
+                key.validity != nullptr && (*key.validity)[left] == 0 ? Cell{} : Cell{(*key.values)[left]};
+            const auto right_value =
+                key.validity != nullptr && (*key.validity)[right] == 0 ? Cell{} : Cell{(*key.values)[right]};
             if (left_value == right_value) {
                 continue;
             }
@@ -952,7 +1118,7 @@ storage::ColumnarBatch materialize_aggregate(const plan::PhysicalPlan& plan, con
         storage::Int64Column column;
         column.reserve(groups.size());
         for (const auto& group : groups) {
-            column.append(group.key.values.at(key_index));
+            append_cell(column, group.key.values.at(key_index));
         }
         out.add_column(column_identity_name(plan.group_keys[key_index]), std::move(column));
     }
@@ -1055,9 +1221,9 @@ storage::ColumnarBatch materialize_view(const BatchView& view) {
     for (const auto& name : view.batch->column_names()) {
         storage::Int64Column column;
         column.reserve(view.selection->size());
-        const auto& input_column = view.batch->column(name).values();
+        const auto input_column = compile_named_column(*view.batch, name);
         for (auto row : *view.selection) {
-            column.append(input_column[row]);
+            append_cell(column, input_column.cell(row));
         }
         out.add_column(name, std::move(column));
     }

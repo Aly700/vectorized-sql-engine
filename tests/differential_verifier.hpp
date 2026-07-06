@@ -21,6 +21,8 @@
 
 namespace differential {
 
+using Cell = std::optional<std::int64_t>;
+
 struct ComparisonStats {
     std::size_t alternative_count{0};
     std::size_t max_group_expression_count{0};
@@ -50,7 +52,12 @@ inline std::string format_batch(const storage::ColumnarBatch& batch) {
             if (col != 0) {
                 out << ",";
             }
-            out << batch.column(column_order[col]).at(row);
+            const auto& column = batch.column(column_order[col]);
+            if (column.is_null(row)) {
+                out << "NULL";
+            } else {
+                out << column.at(row);
+            }
         }
         out << "]";
     }
@@ -68,15 +75,22 @@ inline std::vector<std::string> sorted_column_names(const storage::ColumnarBatch
     return names;
 }
 
-inline std::vector<std::vector<std::int64_t>> sorted_rows_by_column_identity(const storage::ColumnarBatch& batch) {
+inline Cell cell_at(const storage::Int64Column& column, std::size_t row) {
+    if (column.is_null(row)) {
+        return std::nullopt;
+    }
+    return column.at(row);
+}
+
+inline std::vector<std::vector<Cell>> sorted_rows_by_column_identity(const storage::ColumnarBatch& batch) {
     const auto names = sorted_column_names(batch);
-    std::vector<std::vector<std::int64_t>> rows;
+    std::vector<std::vector<Cell>> rows;
     rows.reserve(batch.row_count());
     for (std::size_t row = 0; row < batch.row_count(); ++row) {
-        std::vector<std::int64_t> values;
+        std::vector<Cell> values;
         values.reserve(names.size());
         for (const auto& name : names) {
-            values.push_back(batch.column(name).at(row));
+            values.push_back(cell_at(batch.column(name), row));
         }
         rows.push_back(std::move(values));
     }
@@ -118,7 +132,11 @@ inline std::string format_sorted_bag(const storage::ColumnarBatch& batch) {
             if (col != 0) {
                 out << ",";
             }
-            out << rows[row][col];
+            if (rows[row][col].has_value()) {
+                out << *rows[row][col];
+            } else {
+                out << "NULL";
+            }
         }
         out << "]";
     }
@@ -147,8 +165,9 @@ inline bool is_sorted_by_keys(const storage::ColumnarBatch& batch, const std::ve
     for (std::size_t row = 1; row < batch.row_count(); ++row) {
         for (const auto& key : keys) {
             const auto column_name = *output_column_for_sort_key(key, batch);
-            const auto previous = batch.column(column_name).at(row - 1);
-            const auto current = batch.column(column_name).at(row);
+            const auto& column = batch.column(column_name);
+            const auto previous = cell_at(column, row - 1);
+            const auto current = cell_at(column, row);
             if (previous == current) {
                 continue;
             }
@@ -204,18 +223,18 @@ inline bool root_order_boundary_is_valid(const plan::LogicalPlan& logical) {
            boundary.input->order_permission == plan::OrderPermission::Arbitrary;
 }
 
-inline std::vector<std::int64_t> row_by_output_order(const storage::ColumnarBatch& batch, std::size_t row) {
-    std::vector<std::int64_t> values;
+inline std::vector<Cell> row_by_output_order(const storage::ColumnarBatch& batch, std::size_t row) {
+    std::vector<Cell> values;
     values.reserve(batch.column_names().size());
     for (const auto& name : batch.column_names()) {
-        values.push_back(batch.column(name).at(row));
+        values.push_back(cell_at(batch.column(name), row));
     }
     return values;
 }
 
-inline std::map<std::vector<std::int64_t>, std::size_t> row_multiset_by_output_order(
+inline std::map<std::vector<Cell>, std::size_t> row_multiset_by_output_order(
     const storage::ColumnarBatch& batch) {
-    std::map<std::vector<std::int64_t>, std::size_t> counts;
+    std::map<std::vector<Cell>, std::size_t> counts;
     for (std::size_t row = 0; row < batch.row_count(); ++row) {
         ++counts[row_by_output_order(batch, row)];
     }
@@ -235,26 +254,26 @@ inline bool multiset_contains_rows(const storage::ColumnarBatch& superset, const
     return true;
 }
 
-inline std::optional<std::vector<std::int64_t>> key_tuple_for_row(const storage::ColumnarBatch& batch,
-                                                                  const std::vector<plan::SortKey>& keys,
-                                                                  std::size_t row) {
-    std::vector<std::int64_t> tuple;
+inline std::optional<std::vector<Cell>> key_tuple_for_row(const storage::ColumnarBatch& batch,
+                                                          const std::vector<plan::SortKey>& keys,
+                                                          std::size_t row) {
+    std::vector<Cell> tuple;
     tuple.reserve(keys.size());
     for (const auto& key : keys) {
         const auto column_name = output_column_for_sort_key(key, batch);
         if (!column_name.has_value()) {
             return std::nullopt;
         }
-        tuple.push_back(batch.column(*column_name).at(row));
+        tuple.push_back(cell_at(batch.column(*column_name), row));
     }
     return tuple;
 }
 
-inline std::optional<std::map<std::vector<std::int64_t>, std::size_t>> key_tuple_multiset_prefix(
+inline std::optional<std::map<std::vector<Cell>, std::size_t>> key_tuple_multiset_prefix(
     const storage::ColumnarBatch& batch,
     const std::vector<plan::SortKey>& keys,
     std::size_t row_count) {
-    std::map<std::vector<std::int64_t>, std::size_t> counts;
+    std::map<std::vector<Cell>, std::size_t> counts;
     for (std::size_t row = 0; row < row_count; ++row) {
         const auto tuple = key_tuple_for_row(batch, keys, row);
         if (!tuple.has_value()) {

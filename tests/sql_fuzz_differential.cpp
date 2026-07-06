@@ -19,27 +19,33 @@ namespace {
 
 constexpr std::size_t kDefaultSeedCount = 160;
 
+using Cell = std::optional<std::int64_t>;
+
 struct GeneratedTable {
     std::string name;
     std::vector<std::string> columns;
-    std::vector<std::vector<std::int64_t>> rows;
+    std::vector<bool> nullable;
+    std::vector<std::vector<Cell>> rows;
 };
 
 struct ColumnRef {
     std::string alias;
     std::string column;
+    bool nullable{false};
 };
 
 struct RangeItem {
     std::string table;
     std::string alias;
     std::vector<std::string> columns;
+    std::vector<bool> nullable;
 };
 
 struct SelectItem {
     std::string expression;
     std::string alias;
     std::optional<ColumnRef> source_column;
+    bool nullable{false};
 };
 
 struct GeneratedCase {
@@ -75,7 +81,12 @@ storage::ColumnarBatch make_batch(const GeneratedTable& table) {
     for (std::size_t column_index = 0; column_index < table.columns.size(); ++column_index) {
         storage::Int64Column column;
         for (const auto& row : table.rows) {
-            column.append(row[column_index]);
+            const auto value = row[column_index];
+            if (value.has_value()) {
+                column.append(*value);
+            } else {
+                column.append_null();
+            }
         }
         batch.add_column(table.columns[column_index], std::move(column));
     }
@@ -111,7 +122,12 @@ std::string format_catalog(const std::vector<GeneratedTable>& tables) {
                 if (column != 0) {
                     out << ",";
                 }
-                out << table.rows[row][column];
+                const auto value = table.rows[row][column];
+                if (value.has_value()) {
+                    out << *value;
+                } else {
+                    out << "NULL";
+                }
             }
             out << "]";
         }
@@ -133,6 +149,7 @@ public:
         auto catalog = make_catalog(tables);
         auto ranges = choose_ranges(tables);
         const auto all_columns = columns_for_ranges(ranges);
+        const auto non_nullable_columns = non_nullable(all_columns);
         const auto from_sql = from_clause(ranges);
         const auto aggregate_query = chance(48);
         std::vector<std::string> group_keys;
@@ -141,13 +158,14 @@ public:
 
         if (aggregate_query) {
             if (chance(70)) {
-                group_keys = sample_unique(column_sqls(all_columns), between(1, std::min<std::size_t>(3, all_columns.size())));
+                group_keys = sample_unique(column_sqls(non_nullable_columns),
+                                           between(1, std::min<std::size_t>(3, non_nullable_columns.size())));
             }
             const auto aggregate_count = between(1, 3);
             for (std::size_t i = 0; i < aggregate_count; ++i) {
-                aggregate_exprs.push_back(random_aggregate(all_columns));
+                aggregate_exprs.push_back(random_aggregate(non_nullable_columns));
             }
-            select_items = aggregate_select_items(group_keys, aggregate_exprs, all_columns);
+            select_items = aggregate_select_items(group_keys, aggregate_exprs, non_nullable_columns);
         } else {
             select_items = scalar_select_items(all_columns);
         }
@@ -211,13 +229,14 @@ private:
             const auto column_count = between(2, 4);
             for (std::size_t column_index = 0; column_index < column_count; ++column_index) {
                 table.columns.push_back("c" + std::to_string(column_index));
+                table.nullable.push_back(column_index != 0 && chance(65));
             }
             const auto row_count = between(0, 12);
             for (std::size_t row_index = 0; row_index < row_count; ++row_index) {
-                std::vector<std::int64_t> row;
+                std::vector<Cell> row;
                 row.reserve(column_count);
                 for (std::size_t column_index = 0; column_index < column_count; ++column_index) {
-                    row.push_back(random_value());
+                    row.push_back(random_cell(table.nullable[column_index]));
                 }
                 table.rows.push_back(std::move(row));
             }
@@ -232,7 +251,7 @@ private:
         ranges.reserve(range_count);
         for (std::size_t i = 0; i < range_count; ++i) {
             const auto& table = pick(tables);
-            ranges.push_back(RangeItem{table.name, "r" + std::to_string(i), table.columns});
+            ranges.push_back(RangeItem{table.name, "r" + std::to_string(i), table.columns, table.nullable});
         }
         return ranges;
     }
@@ -260,12 +279,12 @@ private:
         auto projected_groups = sample_unique(group_keys, projected_group_count);
         for (const auto& key : projected_groups) {
             const auto source = column_ref_for_sql(all_columns, key);
-            items.push_back(SelectItem{key, next_alias(all_columns, source), source});
+            items.push_back(SelectItem{key, next_alias(all_columns, source), source, source->nullable});
         }
 
         auto projected_aggregates = sample_with_replacement(aggregate_exprs, between(1, aggregate_exprs.size()));
         for (const auto& aggregate : projected_aggregates) {
-            items.push_back(SelectItem{aggregate, next_alias(all_columns), std::nullopt});
+            items.push_back(SelectItem{aggregate, next_alias(all_columns), std::nullopt, false});
         }
         return items;
     }
@@ -276,9 +295,10 @@ private:
         for (std::size_t i = 0; i < item_count; ++i) {
             if (chance(82)) {
                 const auto column = pick(all_columns);
-                items.push_back(SelectItem{sql_text(column), next_alias(all_columns, column), column});
+                items.push_back(SelectItem{sql_text(column), next_alias(all_columns, column), column, column.nullable});
             } else {
-                items.push_back(SelectItem{literal(), next_alias(all_columns), std::nullopt});
+                const auto value = literal();
+                items.push_back(SelectItem{value, next_alias(all_columns), std::nullopt, value == "NULL"});
             }
         }
         return items;
@@ -291,7 +311,9 @@ private:
                                                  const std::vector<ColumnRef>& all_columns) {
         std::vector<std::string> candidates;
         for (const auto& item : select_items) {
-            candidates.push_back(item.alias);
+            if (!item.nullable) {
+                candidates.push_back(item.alias);
+            }
         }
         if (distinct) {
             return candidates;
@@ -307,7 +329,8 @@ private:
     void add_safe_from_scope_order_keys(const std::vector<SelectItem>& select_items,
                                         std::vector<std::string>* candidates) {
         for (const auto& item : select_items) {
-            if (!item.source_column.has_value() || item.alias != item.source_column->column) {
+            if (!item.source_column.has_value() || item.source_column->nullable ||
+                item.alias != item.source_column->column) {
                 continue;
             }
             const auto text = sql_text(*item.source_column);
@@ -338,6 +361,11 @@ private:
     }
 
     std::string predicate_leaf(const std::vector<ColumnRef>& columns) {
+        if (chance(18)) {
+            const auto expression = chance(85) ? sql_text(pick(columns)) : std::string{"NULL"};
+            return expression + (chance(55) ? " IS NULL" : " IS NOT NULL");
+        }
+
         const auto op = comparison_op_text(random_op());
         const auto column_first = chance(70);
         const auto use_two_columns = chance(24);
@@ -420,8 +448,20 @@ private:
     std::vector<ColumnRef> columns_for_ranges(const std::vector<RangeItem>& ranges) const {
         std::vector<ColumnRef> refs;
         for (const auto& range : ranges) {
-            for (const auto& column : range.columns) {
-                refs.push_back(ColumnRef{range.alias, column});
+            for (std::size_t column_index = 0; column_index < range.columns.size(); ++column_index) {
+                refs.push_back(ColumnRef{range.alias,
+                                         range.columns[column_index],
+                                         range.nullable[column_index]});
+            }
+        }
+        return refs;
+    }
+
+    std::vector<ColumnRef> non_nullable(const std::vector<ColumnRef>& columns) const {
+        std::vector<ColumnRef> refs;
+        for (const auto& column : columns) {
+            if (!column.nullable) {
+                refs.push_back(column);
             }
         }
         return refs;
@@ -508,7 +548,19 @@ private:
         return static_cast<std::int64_t>(between(0, 20)) - 10;
     }
 
-    std::string literal() { return std::to_string(random_value()); }
+    Cell random_cell(bool nullable) {
+        if (nullable && chance(22)) {
+            return std::nullopt;
+        }
+        return random_value();
+    }
+
+    std::string literal() {
+        if (chance(14)) {
+            return "NULL";
+        }
+        return std::to_string(random_value());
+    }
 
     bool chance(int percent) { return between(1, 100) <= static_cast<std::size_t>(percent); }
 
