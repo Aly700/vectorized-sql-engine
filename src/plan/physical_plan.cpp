@@ -12,6 +12,20 @@ const LogicalPlan& require_input(const LogicalPlan& logical) {
     return *logical.input;
 }
 
+const LogicalPlan& require_left(const LogicalPlan& logical) {
+    if (!logical.left) {
+        throw std::invalid_argument("logical join node is missing its left input");
+    }
+    return *logical.left;
+}
+
+const LogicalPlan& require_right(const LogicalPlan& logical) {
+    if (!logical.right) {
+        throw std::invalid_argument("logical join node is missing its right input");
+    }
+    return *logical.right;
+}
+
 } // namespace
 
 PhysicalPlan lower_to_physical(const LogicalPlan& logical) {
@@ -19,7 +33,9 @@ PhysicalPlan lower_to_physical(const LogicalPlan& logical) {
     case LogicalKind::Scan:
         return PhysicalPlan::scan(logical.table);
     case LogicalKind::Join:
-        throw std::logic_error("vectorized inner join is not supported yet");
+        return PhysicalPlan::join(logical.predicates,
+                                  lower_to_physical(require_left(logical)),
+                                  lower_to_physical(require_right(logical)));
     case LogicalKind::Filter:
         return PhysicalPlan::filter(logical.predicates, lower_to_physical(require_input(logical)));
     case LogicalKind::Project:
