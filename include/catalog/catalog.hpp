@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <optional>
 #include <string>
 #include <utility>
@@ -17,6 +18,7 @@ struct ColumnSchema {
 struct TableSchema {
     std::string name;
     std::vector<ColumnSchema> columns;
+    std::optional<std::size_t> row_count;
 
     [[nodiscard]] bool has_column(const std::string& column_name) const {
         for (const auto& column : columns) {

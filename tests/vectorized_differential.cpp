@@ -385,6 +385,33 @@ bool compare_engines(const std::string& sql,
         return false;
     }
 
+    const auto best = memo.extract_best(root, catalog);
+    const auto best_oracle = execution::execute_interpreted(best, catalog);
+    const auto best_vectorized = execution::execute_vectorized(best, catalog);
+    const auto best_cross_plan_equal =
+        is_join_query ? same_sorted_bag(unrewritten_oracle, best_oracle) : same_batch(unrewritten_oracle, best_oracle);
+    const auto best_vectorized_equal = same_batch(best_oracle, best_vectorized);
+    const auto best_column_sets_match = same_column_identity_set(unrewritten_oracle, best_oracle) &&
+                                        same_column_identity_set(best_oracle, best_vectorized);
+    const auto best_output_order_matches = same_column_order(unrewritten_oracle, best_oracle) &&
+                                           same_column_order(best_oracle, best_vectorized);
+    if (!best_cross_plan_equal || !best_vectorized_equal || !best_column_sets_match || !best_output_order_matches) {
+        std::cerr << "best memo/vectorized divergence\n"
+                  << "sql: " << sql << "\n"
+                  << table_text << "\n"
+                  << "memo trace: " << format_trace(explored.fired_rules) << "\n"
+                  << "before plan:\n"
+                  << plan::to_string(logical) << "\n"
+                  << "memo dump:\n"
+                  << memo.dump()
+                  << "best plan:\n"
+                  << plan::to_string(best) << "\n"
+                  << "unrewritten oracle: " << format_batch(unrewritten_oracle) << "\n"
+                  << "best oracle:        " << format_batch(best_oracle) << "\n"
+                  << "best vectorized:    " << format_batch(best_vectorized) << "\n";
+        return false;
+    }
+
     return true;
 }
 
