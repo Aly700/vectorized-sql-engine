@@ -51,11 +51,39 @@ void assert_column_reserve_detaches_shared_storage_without_changing_values() {
     assert(column.size() == 3);
 }
 
+void assert_column_validity_copy_reuses_storage_until_mutation() {
+    storage::Int64Column original;
+    original.append(10);
+    original.append_null();
+    original.append(30);
+
+    storage::ColumnarBatch batch;
+    batch.add_column("qualified.a", original);
+
+    const auto& shared = batch.column("qualified.a");
+    assert(shared.has_nulls());
+    assert(&shared.values() == &original.values());
+    assert(&shared.validity() == &original.validity());
+    assert(!shared.is_null(0));
+    assert(shared.is_null(1));
+    assert(!shared.is_null(2));
+
+    auto mutated = shared;
+    mutated.append_null();
+
+    assert(&mutated.values() != &shared.values());
+    assert(&mutated.validity() != &shared.validity());
+    assert(shared.size() == 3);
+    assert(mutated.size() == 4);
+    assert(mutated.is_null(3));
+}
+
 } // namespace
 
 int main() {
     assert_column_copy_reuses_storage_until_mutation();
     assert_column_reserve_detaches_shared_storage_without_changing_values();
+    assert_column_validity_copy_reuses_storage_until_mutation();
 
     auto query = sql::parse_select("SELECT a FROM t WHERE a = 2");
     assert(query.projection.size() == 1);

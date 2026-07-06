@@ -68,7 +68,8 @@ bool is_reserved_keyword(std::string_view text) {
            equals_keyword(text, "ORDER") || equals_keyword(text, "BY") || equals_keyword(text, "ASC") ||
            equals_keyword(text, "DESC") || equals_keyword(text, "GROUP") || equals_keyword(text, "COUNT") ||
            equals_keyword(text, "SUM") || equals_keyword(text, "MIN") || equals_keyword(text, "MAX") ||
-           equals_keyword(text, "HAVING") || equals_keyword(text, "DISTINCT") || equals_keyword(text, "LIMIT");
+           equals_keyword(text, "HAVING") || equals_keyword(text, "DISTINCT") || equals_keyword(text, "LIMIT") ||
+           equals_keyword(text, "NULL") || equals_keyword(text, "IS") || equals_keyword(text, "NOT");
 }
 
 class Lexer {
@@ -414,7 +415,7 @@ private:
             expression.parenthesized = true;
             return expression;
         }
-        return PredicateExpr::comparison_expr(parse_comparison());
+        return parse_predicate_leaf();
     }
 
     static void append_top_level_conjunct(PredicateExpr expression, std::vector<PredicateExpr>& conjuncts) {
@@ -472,7 +473,7 @@ private:
             expression.parenthesized = true;
             return expression;
         }
-        return HavingPredicateExpr::comparison_expr(parse_having_comparison());
+        return parse_having_predicate_leaf();
     }
 
     static void append_having_top_level_conjunct(HavingPredicateExpr expression,
@@ -486,20 +487,45 @@ private:
         conjuncts.push_back(std::move(expression));
     }
 
-    ComparisonExpr parse_comparison() {
+    PredicateExpr parse_predicate_leaf() {
         auto left = parse_scalar_expr("expected expression in comparison");
+        if (is_keyword("IS")) {
+            const auto position = current_.position;
+            advance();
+            auto kind = PredicateKind::IsNull;
+            if (is_keyword("NOT")) {
+                kind = PredicateKind::IsNotNull;
+                advance();
+            }
+            expect_keyword("NULL", "expected NULL after IS");
+            return PredicateExpr::null_check_expr(kind, std::move(left), position);
+        }
+
         const auto op_position = current_.position;
         const auto op = parse_comparison_op();
         auto right = parse_scalar_expr("expected expression in comparison");
-        return ComparisonExpr{std::move(left), op, std::move(right), op_position};
+        return PredicateExpr::comparison_expr(ComparisonExpr{std::move(left), op, std::move(right), op_position});
     }
 
-    HavingComparisonExpr parse_having_comparison() {
+    HavingPredicateExpr parse_having_predicate_leaf() {
         auto left = parse_having_expr("expected expression in HAVING comparison");
+        if (is_keyword("IS")) {
+            const auto position = current_.position;
+            advance();
+            auto kind = PredicateKind::IsNull;
+            if (is_keyword("NOT")) {
+                kind = PredicateKind::IsNotNull;
+                advance();
+            }
+            expect_keyword("NULL", "expected NULL after IS");
+            return HavingPredicateExpr::null_check_expr(kind, std::move(left), position);
+        }
+
         const auto op_position = current_.position;
         const auto op = parse_comparison_op();
         auto right = parse_having_expr("expected expression in HAVING comparison");
-        return HavingComparisonExpr{std::move(left), op, std::move(right), op_position};
+        return HavingPredicateExpr::comparison_expr(
+            HavingComparisonExpr{std::move(left), op, std::move(right), op_position});
     }
 
     ComparisonOp parse_comparison_op() {
@@ -548,6 +574,12 @@ private:
     }
 
     ScalarExpr parse_scalar_expr(const std::string& message) {
+        if (is_keyword("NULL")) {
+            auto literal = NullLiteral{current_.position};
+            advance();
+            return literal;
+        }
+
         if (current_.kind == TokenKind::Identifier && !is_reserved_keyword(current_.text)) {
             return parse_column_ref(message);
         }
@@ -571,6 +603,11 @@ private:
     HavingExpr parse_having_expr(const std::string& message) {
         if (is_aggregate_function()) {
             return parse_aggregate_call();
+        }
+        if (is_keyword("NULL")) {
+            auto literal = NullLiteral{current_.position};
+            advance();
+            return literal;
         }
         if (current_.kind == TokenKind::Identifier && !is_reserved_keyword(current_.text)) {
             return parse_column_ref(message);

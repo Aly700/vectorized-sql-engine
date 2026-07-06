@@ -171,6 +171,9 @@ std::vector<std::string> referenced_tables(const plan::BoundPredicate& predicate
     switch (predicate.kind) {
     case sql::PredicateKind::Comparison:
         return referenced_tables(predicate.comparison);
+    case sql::PredicateKind::IsNull:
+    case sql::PredicateKind::IsNotNull:
+        return referenced_tables(predicate.null_check);
     case sql::PredicateKind::And:
     case sql::PredicateKind::Or:
         if (predicate.left == nullptr || predicate.right == nullptr) {
@@ -200,6 +203,9 @@ std::vector<plan::BoundColumnRef> referenced_columns(const plan::BoundPredicate&
     switch (predicate.kind) {
     case sql::PredicateKind::Comparison:
         return referenced_columns(predicate.comparison);
+    case sql::PredicateKind::IsNull:
+    case sql::PredicateKind::IsNotNull:
+        return referenced_columns(predicate.null_check);
     case sql::PredicateKind::And:
     case sql::PredicateKind::Or: {
         if (predicate.left == nullptr || predicate.right == nullptr) {
@@ -397,6 +403,9 @@ plan::BoundPredicate fold_predicate_tree(const plan::BoundPredicate& predicate, 
         changed = true;
         return compare_values(*left, predicate.comparison.op, *right) ? canonical_true() : canonical_false();
     }
+    case sql::PredicateKind::IsNull:
+    case sql::PredicateKind::IsNotNull:
+        return predicate;
     case sql::PredicateKind::And:
     case sql::PredicateKind::Or:
         if (predicate.left == nullptr || predicate.right == nullptr) {

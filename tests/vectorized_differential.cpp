@@ -21,6 +21,8 @@
 
 namespace {
 
+using Cell = std::optional<std::int64_t>;
+
 struct TableSpec {
     std::string name;
     std::vector<std::int64_t> a;
@@ -73,6 +75,49 @@ execution::Catalog make_golden_catalog() {
 
     execution::Catalog catalog;
     catalog.add_table("t", std::move(batch));
+
+    storage::Int64Column nullable_k;
+    nullable_k.append(1);
+    nullable_k.append_null();
+    nullable_k.append(2);
+    nullable_k.append_null();
+    storage::Int64Column nullable_v;
+    nullable_v.append(10);
+    nullable_v.append(20);
+    nullable_v.append_null();
+    nullable_v.append(30);
+    storage::ColumnarBatch nullable;
+    nullable.add_column("k", std::move(nullable_k));
+    nullable.add_column("v", std::move(nullable_v));
+    catalog.add_table("nullable", std::move(nullable));
+
+    storage::Int64Column j1_k;
+    j1_k.append(1);
+    j1_k.append_null();
+    j1_k.append(2);
+    j1_k.append_null();
+    storage::Int64Column j1_v;
+    for (auto value : {10, 20, 30, 40}) {
+        j1_v.append(value);
+    }
+    storage::ColumnarBatch j1;
+    j1.add_column("k", std::move(j1_k));
+    j1.add_column("v", std::move(j1_v));
+    catalog.add_table("j1", std::move(j1));
+
+    storage::Int64Column j2_k;
+    j2_k.append_null();
+    j2_k.append(1);
+    j2_k.append(2);
+    j2_k.append_null();
+    storage::Int64Column j2_w;
+    for (auto value : {100, 101, 102, 103}) {
+        j2_w.append(value);
+    }
+    storage::ColumnarBatch j2;
+    j2.add_column("k", std::move(j2_k));
+    j2.add_column("w", std::move(j2_w));
+    catalog.add_table("j2", std::move(j2));
 
     storage::Int64Column t1_a;
     for (auto value : {1, 2, 2}) {
@@ -183,7 +228,12 @@ std::string format_batch(const storage::ColumnarBatch& batch) {
             if (col != 0) {
                 out << ",";
             }
-            out << batch.column(column_order[col]).at(row);
+            const auto& column = batch.column(column_order[col]);
+            if (column.is_null(row)) {
+                out << "NULL";
+            } else {
+                out << column.at(row);
+            }
         }
         out << "]";
     }
@@ -214,15 +264,22 @@ std::vector<std::string> sorted_column_names(const storage::ColumnarBatch& batch
     return names;
 }
 
-std::vector<std::vector<std::int64_t>> sorted_rows_by_column_identity(const storage::ColumnarBatch& batch) {
+Cell cell_at(const storage::Int64Column& column, std::size_t row) {
+    if (column.is_null(row)) {
+        return std::nullopt;
+    }
+    return column.at(row);
+}
+
+std::vector<std::vector<Cell>> sorted_rows_by_column_identity(const storage::ColumnarBatch& batch) {
     const auto names = sorted_column_names(batch);
-    std::vector<std::vector<std::int64_t>> rows;
+    std::vector<std::vector<Cell>> rows;
     rows.reserve(batch.row_count());
     for (std::size_t row = 0; row < batch.row_count(); ++row) {
-        std::vector<std::int64_t> values;
+        std::vector<Cell> values;
         values.reserve(names.size());
         for (const auto& name : names) {
-            values.push_back(batch.column(name).at(row));
+            values.push_back(cell_at(batch.column(name), row));
         }
         rows.push_back(std::move(values));
     }
@@ -264,7 +321,11 @@ std::string format_sorted_bag(const storage::ColumnarBatch& batch) {
             if (col != 0) {
                 out << ",";
             }
-            out << rows[row][col];
+            if (rows[row][col].has_value()) {
+                out << *rows[row][col];
+            } else {
+                out << "NULL";
+            }
         }
         out << "]";
     }
@@ -293,8 +354,9 @@ bool is_sorted_by_keys(const storage::ColumnarBatch& batch, const std::vector<pl
         bool decided = false;
         for (const auto& key : keys) {
             const auto column_name = *output_column_for_sort_key(key, batch);
-            const auto previous = batch.column(column_name).at(row - 1);
-            const auto current = batch.column(column_name).at(row);
+            const auto& column = batch.column(column_name);
+            const auto previous = cell_at(column, row - 1);
+            const auto current = cell_at(column, row);
             if (previous == current) {
                 continue;
             }
@@ -352,17 +414,17 @@ bool root_order_boundary_is_valid(const plan::LogicalPlan& logical) {
            boundary.input->order_permission == plan::OrderPermission::Arbitrary;
 }
 
-std::vector<std::int64_t> row_by_output_order(const storage::ColumnarBatch& batch, std::size_t row) {
-    std::vector<std::int64_t> values;
+std::vector<Cell> row_by_output_order(const storage::ColumnarBatch& batch, std::size_t row) {
+    std::vector<Cell> values;
     values.reserve(batch.column_names().size());
     for (const auto& name : batch.column_names()) {
-        values.push_back(batch.column(name).at(row));
+        values.push_back(cell_at(batch.column(name), row));
     }
     return values;
 }
 
-std::map<std::vector<std::int64_t>, std::size_t> row_multiset_by_output_order(const storage::ColumnarBatch& batch) {
-    std::map<std::vector<std::int64_t>, std::size_t> counts;
+std::map<std::vector<Cell>, std::size_t> row_multiset_by_output_order(const storage::ColumnarBatch& batch) {
+    std::map<std::vector<Cell>, std::size_t> counts;
     for (std::size_t row = 0; row < batch.row_count(); ++row) {
         ++counts[row_by_output_order(batch, row)];
     }
@@ -382,26 +444,26 @@ bool multiset_contains_rows(const storage::ColumnarBatch& superset, const storag
     return true;
 }
 
-std::optional<std::vector<std::int64_t>> key_tuple_for_row(const storage::ColumnarBatch& batch,
-                                                           const std::vector<plan::SortKey>& keys,
-                                                           std::size_t row) {
-    std::vector<std::int64_t> tuple;
+std::optional<std::vector<Cell>> key_tuple_for_row(const storage::ColumnarBatch& batch,
+                                                   const std::vector<plan::SortKey>& keys,
+                                                   std::size_t row) {
+    std::vector<Cell> tuple;
     tuple.reserve(keys.size());
     for (const auto& key : keys) {
         const auto column_name = output_column_for_sort_key(key, batch);
         if (!column_name.has_value()) {
             return std::nullopt;
         }
-        tuple.push_back(batch.column(*column_name).at(row));
+        tuple.push_back(cell_at(batch.column(*column_name), row));
     }
     return tuple;
 }
 
-std::optional<std::map<std::vector<std::int64_t>, std::size_t>>
+std::optional<std::map<std::vector<Cell>, std::size_t>>
 key_tuple_multiset_prefix(const storage::ColumnarBatch& batch,
                           const std::vector<plan::SortKey>& keys,
                           std::size_t row_count) {
-    std::map<std::vector<std::int64_t>, std::size_t> counts;
+    std::map<std::vector<Cell>, std::size_t> counts;
     for (std::size_t row = 0; row < row_count; ++row) {
         const auto tuple = key_tuple_for_row(batch, keys, row);
         if (!tuple.has_value()) {
@@ -518,12 +580,22 @@ bool run_result_golden_queries() {
         "SELECT a FROM t WHERE (a = 1 OR b = 20) AND c >= 6",
         "SELECT a FROM t WHERE 2 > 1 OR a = 5",
         "SELECT a FROM t WHERE 2 < 1 OR a = 2",
+        "SELECT NULL FROM t LIMIT 2",
+        "SELECT k, v FROM nullable",
+        "SELECT k, v FROM nullable WHERE k IS NULL",
+        "SELECT k, v FROM nullable WHERE k IS NOT NULL",
+        "SELECT k FROM nullable WHERE k = NULL",
+        "SELECT k FROM nullable WHERE k = NULL OR 1 = 1",
+        "SELECT v FROM nullable WHERE k = NULL OR v = 30",
+        "SELECT k FROM nullable WHERE k = NULL AND 1 = 0",
+        "SELECT v FROM nullable WHERE k = NULL AND v = 30",
         "SELECT COUNT(*), COUNT(b), SUM(a), MIN(b), MAX(b) FROM t",
         "SELECT b, COUNT(*), SUM(a), MIN(a), MAX(a) FROM t GROUP BY b",
         "SELECT b, COUNT(*) FROM t GROUP BY b ORDER BY b DESC",
         "SELECT a FROM t GROUP BY a HAVING SUM(b) > 20",
         "SELECT a, COUNT(*) FROM t GROUP BY a HAVING SUM(b) > 1000",
         "SELECT b, COUNT(*) FROM t GROUP BY b HAVING b = 10 OR COUNT(*) > 1",
+        "SELECT a, COUNT(*) FROM t GROUP BY a HAVING COUNT(*) = NULL",
         "SELECT a, SUM(b) AS total FROM t GROUP BY a HAVING SUM(b) >= 20 ORDER BY total DESC",
         "SELECT a, SUM(b) FROM t GROUP BY a ORDER BY SUM(b) DESC",
         "SELECT DISTINCT b FROM t",
@@ -587,6 +659,8 @@ bool run_join_oracle_corpus() {
         "SELECT x.a FROM t AS x WHERE x.a >= 2 ORDER BY x.a DESC",
         "SELECT x.b, y.c FROM t1 AS x JOIN t2 AS y ON x.a = y.a ORDER BY y.c DESC, x.b ASC",
         "SELECT x.a, y.b FROM t1 AS x JOIN t1 AS y ON x.a = y.a WHERE x.b = 20 ORDER BY y.b ASC",
+        "SELECT l.v, r.w FROM j1 AS l JOIN j2 AS r ON l.k = r.k",
+        "SELECT x.v, y.v FROM j1 AS x JOIN j1 AS y ON x.k = y.k",
         "SELECT x.b, y.b, z.b FROM t1 AS x JOIN t1 AS y ON x.a = y.a "
         "JOIN t1 AS z ON y.a = z.a WHERE z.b >= 20",
         "SELECT x.b, y.c, z.d FROM t1 AS x JOIN t2 AS y ON x.a = y.a "

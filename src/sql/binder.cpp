@@ -118,7 +118,10 @@ plan::BoundScalarExpr bind_expression(const ScalarExpr& expression, const std::v
     if (const auto* column = std::get_if<ColumnRef>(&expression)) {
         return bind_column_ref(*column, scopes);
     }
-    return std::get<IntLiteral>(expression);
+    if (const auto* literal = std::get_if<IntLiteral>(&expression)) {
+        return *literal;
+    }
+    return std::get<NullLiteral>(expression);
 }
 
 plan::BoundComparisonExpr bind_comparison(const ComparisonExpr& comparison, const std::vector<TableScope>& scopes) {
@@ -134,6 +137,11 @@ plan::BoundPredicate bind_predicate(const PredicateExpr& predicate, const std::v
     switch (predicate.kind) {
     case PredicateKind::Comparison:
         return plan::BoundPredicate::comparison_expr(bind_comparison(predicate.comparison, scopes));
+    case PredicateKind::IsNull:
+    case PredicateKind::IsNotNull:
+        return plan::BoundPredicate::null_check_expr(predicate.kind,
+                                                    bind_expression(predicate.null_check, scopes),
+                                                    predicate.operator_position);
     case PredicateKind::And:
     case PredicateKind::Or:
         if (predicate.left == nullptr || predicate.right == nullptr) {
@@ -262,6 +270,9 @@ plan::BoundScalarExpr bind_having_expression(const HavingExpr& expression,
     if (const auto* literal = std::get_if<IntLiteral>(&expression)) {
         return *literal;
     }
+    if (const auto* literal = std::get_if<NullLiteral>(&expression)) {
+        return *literal;
+    }
     return ensure_aggregate_expression(std::get<AggregateCall>(expression), scopes, aggregate_expressions);
 }
 
@@ -285,6 +296,12 @@ plan::BoundPredicate bind_having_predicate(const HavingPredicateExpr& predicate,
     case PredicateKind::Comparison:
         return plan::BoundPredicate::comparison_expr(
             bind_having_comparison(predicate.comparison, scopes, group_keys, aggregate_expressions));
+    case PredicateKind::IsNull:
+    case PredicateKind::IsNotNull:
+        return plan::BoundPredicate::null_check_expr(
+            predicate.kind,
+            bind_having_expression(predicate.null_check, scopes, group_keys, aggregate_expressions),
+            predicate.operator_position);
     case PredicateKind::And:
     case PredicateKind::Or:
         if (predicate.left == nullptr || predicate.right == nullptr) {

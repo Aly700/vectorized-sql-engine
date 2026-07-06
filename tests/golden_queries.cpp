@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <iostream>
 #include <limits>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -13,9 +14,11 @@
 
 namespace {
 
+using ExpectedCell = std::optional<std::int64_t>;
+
 struct ExpectedResult {
     std::vector<std::string> columns;
-    std::vector<std::vector<std::int64_t>> rows;
+    std::vector<std::vector<ExpectedCell>> rows;
 };
 
 enum class ErrorKind { Parse, Bind, Runtime };
@@ -57,6 +60,49 @@ execution::Catalog make_catalog() {
 
     execution::Catalog catalog;
     catalog.add_table("t", batch);
+
+    storage::Int64Column nullable_k;
+    nullable_k.append(1);
+    nullable_k.append_null();
+    nullable_k.append(2);
+    nullable_k.append_null();
+    storage::Int64Column nullable_v;
+    nullable_v.append(10);
+    nullable_v.append(20);
+    nullable_v.append_null();
+    nullable_v.append(30);
+    storage::ColumnarBatch nullable;
+    nullable.add_column("k", std::move(nullable_k));
+    nullable.add_column("v", std::move(nullable_v));
+    catalog.add_table("nullable", std::move(nullable));
+
+    storage::Int64Column j1_k;
+    j1_k.append(1);
+    j1_k.append_null();
+    j1_k.append(2);
+    j1_k.append_null();
+    storage::Int64Column j1_v;
+    for (auto value : {10, 20, 30, 40}) {
+        j1_v.append(value);
+    }
+    storage::ColumnarBatch j1;
+    j1.add_column("k", std::move(j1_k));
+    j1.add_column("v", std::move(j1_v));
+    catalog.add_table("j1", std::move(j1));
+
+    storage::Int64Column j2_k;
+    j2_k.append_null();
+    j2_k.append(1);
+    j2_k.append(2);
+    j2_k.append_null();
+    storage::Int64Column j2_w;
+    for (auto value : {100, 101, 102, 103}) {
+        j2_w.append(value);
+    }
+    storage::ColumnarBatch j2;
+    j2.add_column("k", std::move(j2_k));
+    j2.add_column("w", std::move(j2_w));
+    catalog.add_table("j2", std::move(j2));
 
     storage::Int64Column dup_k;
     for (auto value : {1, 1, 2, 1, 2}) {
@@ -142,7 +188,11 @@ std::string format_result(const ExpectedResult& result) {
             if (col != 0) {
                 out << ",";
             }
-            out << result.rows[row][col];
+            if (result.rows[row][col].has_value()) {
+                out << *result.rows[row][col];
+            } else {
+                out << "NULL";
+            }
         }
         out << "]";
     }
@@ -173,7 +223,12 @@ std::string format_result(const storage::ColumnarBatch& batch) {
             if (!batch.has_column(column_order[col])) {
                 out << "<missing:" << column_order[col] << ">";
             } else {
-                out << batch.column(column_order[col]).at(row);
+                const auto& column = batch.column(column_order[col]);
+                if (column.is_null(row)) {
+                    out << "NULL";
+                } else {
+                    out << column.at(row);
+                }
             }
         }
         out << "]";
@@ -227,6 +282,66 @@ int main() {
             "multi projection literal and AND comparisons",
             "SELECT a, b, 99 FROM t WHERE a >= 2 AND b <> 40",
             ExpectedResult{{"a", "b", "99"}, {{2, 20, 99}, {3, 20, 99}}},
+        },
+        GoldenQuery{
+            "projected NULL literal uses literal output name",
+            "SELECT NULL FROM t LIMIT 2",
+            ExpectedResult{{"NULL"}, {{std::nullopt}, {std::nullopt}}},
+        },
+        GoldenQuery{
+            "nullable column projection preserves validity",
+            "SELECT k, v FROM nullable",
+            ExpectedResult{{"k", "v"}, {{1, 10}, {std::nullopt, 20}, {2, std::nullopt}, {std::nullopt, 30}}},
+        },
+        GoldenQuery{
+            "IS NULL keeps exactly null rows",
+            "SELECT k, v FROM nullable WHERE k IS NULL",
+            ExpectedResult{{"k", "v"}, {{std::nullopt, 20}, {std::nullopt, 30}}},
+        },
+        GoldenQuery{
+            "IS NOT NULL keeps exactly present rows",
+            "SELECT k, v FROM nullable WHERE k IS NOT NULL",
+            ExpectedResult{{"k", "v"}, {{1, 10}, {2, std::nullopt}}},
+        },
+        GoldenQuery{
+            "comparison with NULL literal is UNKNOWN and rejected by WHERE",
+            "SELECT k FROM nullable WHERE k = NULL",
+            ExpectedResult{{"k"}, {}},
+        },
+        GoldenQuery{
+            "UNKNOWN OR TRUE keeps TRUE rows",
+            "SELECT k FROM nullable WHERE k = NULL OR 1 = 1",
+            ExpectedResult{{"k"}, {{1}, {std::nullopt}, {2}, {std::nullopt}}},
+        },
+        GoldenQuery{
+            "UNKNOWN OR data TRUE keeps TRUE rows",
+            "SELECT v FROM nullable WHERE k = NULL OR v = 30",
+            ExpectedResult{{"v"}, {{30}}},
+        },
+        GoldenQuery{
+            "UNKNOWN AND FALSE rejects rows",
+            "SELECT k FROM nullable WHERE k = NULL AND 1 = 0",
+            ExpectedResult{{"k"}, {}},
+        },
+        GoldenQuery{
+            "UNKNOWN AND data TRUE still rejects UNKNOWN",
+            "SELECT v FROM nullable WHERE k = NULL AND v = 30",
+            ExpectedResult{{"v"}, {}},
+        },
+        GoldenQuery{
+            "HAVING UNKNOWN rejects grouped rows",
+            "SELECT a, COUNT(*) FROM t GROUP BY a HAVING COUNT(*) = NULL",
+            ExpectedResult{{"a", "COUNT(*)"}, {}},
+        },
+        GoldenQuery{
+            "hash join null keys never match",
+            "SELECT l.v, r.w FROM j1 AS l JOIN j2 AS r ON l.k = r.k",
+            ExpectedResult{{"l.v", "r.w"}, {{10, 101}, {30, 102}}},
+        },
+        GoldenQuery{
+            "self join null keys never match themselves",
+            "SELECT x.v, y.v FROM j1 AS x JOIN j1 AS y ON x.k = y.k",
+            ExpectedResult{{"x.v", "y.v"}, {{10, 10}, {30, 30}}},
         },
         GoldenQuery{
             "less than comparison",

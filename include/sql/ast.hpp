@@ -21,7 +21,11 @@ struct IntLiteral {
     std::size_t position{0};
 };
 
-using ScalarExpr = std::variant<ColumnRef, IntLiteral>;
+struct NullLiteral {
+    std::size_t position{0};
+};
+
+using ScalarExpr = std::variant<ColumnRef, IntLiteral, NullLiteral>;
 
 enum class AggregateFunction { Count, Sum, Min, Max };
 
@@ -36,7 +40,7 @@ struct AggregateCall {
 };
 
 using SelectExpr = std::variant<ScalarExpr, AggregateCall>;
-using HavingExpr = std::variant<ColumnRef, IntLiteral, AggregateCall>;
+using HavingExpr = std::variant<ColumnRef, IntLiteral, NullLiteral, AggregateCall>;
 using OrderByExpr = std::variant<ColumnRef, AggregateCall>;
 
 enum class ComparisonOp { Equal, NotEqual, Less, LessEqual, Greater, GreaterEqual };
@@ -48,11 +52,12 @@ struct ComparisonExpr {
     std::size_t operator_position{0};
 };
 
-enum class PredicateKind { Comparison, And, Or };
+enum class PredicateKind { Comparison, IsNull, IsNotNull, And, Or };
 
 struct PredicateExpr {
     PredicateKind kind{PredicateKind::Comparison};
     ComparisonExpr comparison;
+    ScalarExpr null_check;
     std::shared_ptr<PredicateExpr> left;
     std::shared_ptr<PredicateExpr> right;
     std::size_t operator_position{0};
@@ -62,6 +67,14 @@ struct PredicateExpr {
         PredicateExpr predicate;
         predicate.kind = PredicateKind::Comparison;
         predicate.comparison = std::move(comparison);
+        return predicate;
+    }
+
+    static PredicateExpr null_check_expr(PredicateKind kind, ScalarExpr expression, std::size_t position) {
+        PredicateExpr predicate;
+        predicate.kind = kind;
+        predicate.null_check = std::move(expression);
+        predicate.operator_position = position;
         return predicate;
     }
 
@@ -89,6 +102,7 @@ struct HavingComparisonExpr {
 struct HavingPredicateExpr {
     PredicateKind kind{PredicateKind::Comparison};
     HavingComparisonExpr comparison;
+    HavingExpr null_check;
     std::shared_ptr<HavingPredicateExpr> left;
     std::shared_ptr<HavingPredicateExpr> right;
     std::size_t operator_position{0};
@@ -98,6 +112,14 @@ struct HavingPredicateExpr {
         HavingPredicateExpr predicate;
         predicate.kind = PredicateKind::Comparison;
         predicate.comparison = std::move(comparison);
+        return predicate;
+    }
+
+    static HavingPredicateExpr null_check_expr(PredicateKind kind, HavingExpr expression, std::size_t position) {
+        HavingPredicateExpr predicate;
+        predicate.kind = kind;
+        predicate.null_check = std::move(expression);
+        predicate.operator_position = position;
         return predicate;
     }
 
@@ -162,7 +184,10 @@ inline std::size_t expression_position(const ScalarExpr& expression) {
     if (const auto* column = std::get_if<ColumnRef>(&expression)) {
         return column->position;
     }
-    return std::get<IntLiteral>(expression).position;
+    if (const auto* literal = std::get_if<IntLiteral>(&expression)) {
+        return literal->position;
+    }
+    return std::get<NullLiteral>(expression).position;
 }
 
 inline std::size_t expression_position(const SelectExpr& expression) {
@@ -177,6 +202,9 @@ inline std::size_t expression_position(const HavingExpr& expression) {
         return column->position;
     }
     if (const auto* literal = std::get_if<IntLiteral>(&expression)) {
+        return literal->position;
+    }
+    if (const auto* literal = std::get_if<NullLiteral>(&expression)) {
         return literal->position;
     }
     return std::get<AggregateCall>(expression).position;
@@ -210,7 +238,10 @@ inline std::string output_name(const ScalarExpr& expression) {
         }
         return column->name;
     }
-    return std::to_string(std::get<IntLiteral>(expression).value);
+    if (const auto* literal = std::get_if<IntLiteral>(&expression)) {
+        return std::to_string(literal->value);
+    }
+    return "NULL";
 }
 
 inline std::string output_name(const ColumnRef& column) {
@@ -246,6 +277,9 @@ inline std::string output_name(const HavingExpr& expression) {
     }
     if (const auto* literal = std::get_if<IntLiteral>(&expression)) {
         return std::to_string(literal->value);
+    }
+    if (std::holds_alternative<NullLiteral>(expression)) {
+        return "NULL";
     }
     return output_name(std::get<AggregateCall>(expression));
 }

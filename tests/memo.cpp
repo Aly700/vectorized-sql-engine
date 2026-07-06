@@ -82,7 +82,12 @@ std::string format_batch(const storage::ColumnarBatch& batch) {
             if (col != 0) {
                 out << ",";
             }
-            out << batch.column(column_order[col]).at(row);
+            const auto& column = batch.column(column_order[col]);
+            if (column.is_null(row)) {
+                out << "NULL";
+            } else {
+                out << column.at(row);
+            }
         }
         out << "]";
     }

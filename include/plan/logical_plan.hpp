@@ -21,7 +21,7 @@ struct BoundColumnRef {
     std::size_t position{0};
 };
 
-using BoundScalarExpr = std::variant<BoundColumnRef, sql::IntLiteral>;
+using BoundScalarExpr = std::variant<BoundColumnRef, sql::IntLiteral, sql::NullLiteral>;
 
 struct BoundComparisonExpr {
     BoundScalarExpr left;
@@ -33,6 +33,7 @@ struct BoundComparisonExpr {
 struct BoundPredicate {
     sql::PredicateKind kind{sql::PredicateKind::Comparison};
     BoundComparisonExpr comparison;
+    BoundScalarExpr null_check;
     std::shared_ptr<BoundPredicate> left;
     std::shared_ptr<BoundPredicate> right;
     std::size_t operator_position{0};
@@ -41,6 +42,16 @@ struct BoundPredicate {
         BoundPredicate predicate;
         predicate.kind = sql::PredicateKind::Comparison;
         predicate.comparison = std::move(comparison);
+        return predicate;
+    }
+
+    static BoundPredicate null_check_expr(sql::PredicateKind kind,
+                                          BoundScalarExpr expression,
+                                          std::size_t position) {
+        BoundPredicate predicate;
+        predicate.kind = kind;
+        predicate.null_check = std::move(expression);
+        predicate.operator_position = position;
         return predicate;
     }
 

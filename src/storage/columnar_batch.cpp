@@ -44,7 +44,11 @@ ColumnarBatch ColumnarBatch::filter(const RowMask& mask) const {
         Int64Column filtered;
         for (std::size_t i = 0; i < mask.keep.size(); ++i) {
             if (mask.keep[i]) {
-                filtered.append(col.at(i));
+                if (col.is_null(i)) {
+                    filtered.append_null();
+                } else {
+                    filtered.append(col.at(i));
+                }
             }
         }
         out.add_column(name, filtered);
@@ -56,8 +60,8 @@ RowMask equals_i64(const ColumnarBatch& batch, const std::string& column, std::i
     const auto& col = batch.column(column);
     RowMask mask;
     mask.keep.reserve(col.size());
-    for (auto v : col.values()) {
-        mask.keep.push_back(v == value ? 1 : 0);
+    for (std::size_t row = 0; row < col.size(); ++row) {
+        mask.keep.push_back(!col.is_null(row) && col.at(row) == value ? 1 : 0);
     }
     return mask;
 }

@@ -10,11 +10,14 @@
 #include <cmath>
 #include <cstdint>
 #include <iostream>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
 
 namespace {
+
+using Cell = std::optional<std::int64_t>;
 
 storage::ColumnarBatch make_single_key_batch(std::int64_t row_count) {
     storage::Int64Column key;
@@ -56,15 +59,22 @@ std::vector<std::string> sorted_column_names(const storage::ColumnarBatch& batch
     return names;
 }
 
-std::vector<std::vector<std::int64_t>> sorted_rows_by_column_identity(const storage::ColumnarBatch& batch) {
+Cell cell_at(const storage::Int64Column& column, std::size_t row) {
+    if (column.is_null(row)) {
+        return std::nullopt;
+    }
+    return column.at(row);
+}
+
+std::vector<std::vector<Cell>> sorted_rows_by_column_identity(const storage::ColumnarBatch& batch) {
     const auto names = sorted_column_names(batch);
-    std::vector<std::vector<std::int64_t>> rows;
+    std::vector<std::vector<Cell>> rows;
     rows.reserve(batch.row_count());
     for (std::size_t row = 0; row < batch.row_count(); ++row) {
-        std::vector<std::int64_t> values;
+        std::vector<Cell> values;
         values.reserve(names.size());
         for (const auto& name : names) {
-            values.push_back(batch.column(name).at(row));
+            values.push_back(cell_at(batch.column(name), row));
         }
         rows.push_back(std::move(values));
     }

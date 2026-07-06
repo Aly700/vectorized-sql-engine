@@ -35,7 +35,10 @@ std::string expression_to_string(const BoundScalarExpr& expression) {
         }
         return "col(" + column->binding + "." + column->column + ")";
     }
-    return "lit(" + std::to_string(std::get<sql::IntLiteral>(expression).value) + ")";
+    if (const auto* literal = std::get_if<sql::IntLiteral>(&expression)) {
+        return "lit(" + std::to_string(literal->value) + ")";
+    }
+    return "lit(NULL)";
 }
 
 std::string column_to_string(const BoundColumnRef& column) {
@@ -86,6 +89,10 @@ std::string predicate_to_string(const BoundPredicate& predicate) {
     switch (predicate.kind) {
     case sql::PredicateKind::Comparison:
         return comparison_to_string(predicate.comparison);
+    case sql::PredicateKind::IsNull:
+        return expression_to_string(predicate.null_check) + " IS NULL";
+    case sql::PredicateKind::IsNotNull:
+        return expression_to_string(predicate.null_check) + " IS NOT NULL";
     case sql::PredicateKind::And:
         return "(" + predicate_to_string(require_left_predicate(predicate)) + " AND " +
                predicate_to_string(require_right_predicate(predicate)) + ")";
