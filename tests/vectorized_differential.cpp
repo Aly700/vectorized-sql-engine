@@ -67,6 +67,36 @@ execution::Catalog make_golden_catalog() {
 
     execution::Catalog catalog;
     catalog.add_table("t", std::move(batch));
+
+    storage::Int64Column t1_a;
+    for (auto value : {1, 2, 2}) {
+        t1_a.append(value);
+    }
+    storage::Int64Column t1_b;
+    for (auto value : {10, 20, 30}) {
+        t1_b.append(value);
+    }
+    storage::ColumnarBatch t1;
+    t1.add_column("a", std::move(t1_a));
+    t1.add_column("b", std::move(t1_b));
+    catalog.add_table("t1", std::move(t1));
+
+    storage::Int64Column t2_a;
+    for (auto value : {2, 2, 3}) {
+        t2_a.append(value);
+    }
+    storage::Int64Column t2_c;
+    for (auto value : {200, 201, 300}) {
+        t2_c.append(value);
+    }
+    storage::ColumnarBatch t2;
+    t2.add_column("a", std::move(t2_a));
+    t2.add_column("c", std::move(t2_c));
+    catalog.add_table("t2", std::move(t2));
+
+    storage::ColumnarBatch empty;
+    empty.add_column("a", storage::Int64Column{});
+    catalog.add_table("empty", std::move(empty));
     return catalog;
 }
 
@@ -153,6 +183,40 @@ bool compare_engines(const std::string& sql, const execution::Catalog& catalog, 
     return false;
 }
 
+bool compare_oracle_paths_vectorized_unsupported(const std::string& sql,
+                                                 const execution::Catalog& catalog,
+                                                 const std::string& table_text) {
+    const auto parsed = sql::parse_select(sql);
+    const auto logical = sql::bind_select(parsed, catalog);
+    const auto rewritten = optimizer::rewrite_to_fixpoint(logical, optimizer::default_rules());
+    const auto unrewritten_oracle = execution::execute_interpreted(logical, catalog);
+    const auto rewritten_oracle = execution::execute_interpreted(rewritten.plan, catalog);
+    if (!same_batch(unrewritten_oracle, rewritten_oracle)) {
+        std::cerr << "join oracle rewrite divergence\n"
+                  << "sql: " << sql << "\n"
+                  << table_text << "\n"
+                  << "rewrite trace: " << format_trace(rewritten.trace) << "\n"
+                  << "before plan:\n"
+                  << plan::to_string(logical) << "\n"
+                  << "after plan:\n"
+                  << plan::to_string(rewritten.plan) << "\n"
+                  << "unrewritten oracle: " << format_batch(unrewritten_oracle) << "\n"
+                  << "rewritten oracle:   " << format_batch(rewritten_oracle) << "\n";
+        return false;
+    }
+
+    try {
+        (void)execution::execute_vectorized(rewritten.plan, catalog);
+    } catch (const std::logic_error& error) {
+        return std::string(error.what()) == "vectorized inner join is not supported yet";
+    }
+
+    std::cerr << "join query unexpectedly executed in vectorized engine\n"
+              << "sql: " << sql << "\n"
+              << table_text << "\n";
+    return false;
+}
+
 bool run_result_golden_queries() {
     const auto catalog = make_golden_catalog();
     const std::vector<std::string> result_sqls{
@@ -166,6 +230,24 @@ bool run_result_golden_queries() {
     bool ok = true;
     for (const auto& sql : result_sqls) {
         ok = compare_engines(sql, catalog, "golden table t: columns=[a,b,c] rows=[[1,10,5],[2,20,6],[3,20,7],[4,40,8]]") && ok;
+    }
+    return ok;
+}
+
+bool run_join_oracle_corpus() {
+    const auto catalog = make_golden_catalog();
+    const auto table_text =
+        "join tables: t1 rows=[[1,10],[2,20],[2,30]], t2 rows=[[2,200],[2,201],[3,300]], empty rows=[]";
+    const std::vector<std::string> join_sqls{
+        "SELECT t1.a, t1.b, t2.c FROM t1 JOIN t2 ON t1.a = t2.a",
+        "SELECT t1.b, t2.c FROM t1 JOIN t2 ON t1.a = t2.a WHERE 2 > 1 AND t2.c > 200",
+        "SELECT t1.a FROM t1 JOIN empty ON t1.a = empty.a",
+        "SELECT t1.b FROM t1 JOIN t2 ON t1.a = t2.a WHERE 2 < 1",
+    };
+
+    bool ok = true;
+    for (const auto& sql : join_sqls) {
+        ok = compare_oracle_paths_vectorized_unsupported(sql, catalog, table_text) && ok;
     }
     return ok;
 }
@@ -282,6 +364,7 @@ int main() {
 
     bool ok = true;
     ok = run_result_golden_queries() && ok;
+    ok = run_join_oracle_corpus() && ok;
     ok = run_generated_corpus() && ok;
     return ok ? 0 : 1;
 }

@@ -36,6 +36,16 @@ StaticSchemaCatalog make_schema_catalog() {
         {catalog::ColumnSchema{"a", catalog::ColumnType::Int64},
          catalog::ColumnSchema{"b", catalog::ColumnType::Int64}},
     });
+    catalog.add_table(catalog::TableSchema{
+        "t1",
+        {catalog::ColumnSchema{"a", catalog::ColumnType::Int64},
+         catalog::ColumnSchema{"b", catalog::ColumnType::Int64}},
+    });
+    catalog.add_table(catalog::TableSchema{
+        "t2",
+        {catalog::ColumnSchema{"a", catalog::ColumnType::Int64},
+         catalog::ColumnSchema{"c", catalog::ColumnType::Int64}},
+    });
     return catalog;
 }
 
@@ -67,10 +77,54 @@ void assert_unknown_column_still_reports_bind_error() {
     throw std::logic_error("expected unknown column bind error");
 }
 
+void assert_join_binds_qualified_columns_to_stable_plan() {
+    auto catalog = make_schema_catalog();
+    const auto logical =
+        sql::bind_select(sql::parse_select("SELECT t1.b, t2.c FROM t1 JOIN t2 ON t1.a = t2.a WHERE t2.c > 200"),
+                         catalog);
+
+    assert(logical.kind == plan::LogicalKind::Project);
+    assert(logical.projections.size() == 2);
+    assert(logical.projections[0].output_name == "t1.b");
+    assert(logical.projections[1].output_name == "t2.c");
+
+    const auto printed = plan::to_string(logical);
+    assert(printed.find("Join[") != std::string::npos);
+    assert(printed.find("col(t1.a) = col(t2.a)") != std::string::npos);
+    assert(printed.find("col(t2.c) > lit(200)") != std::string::npos);
+}
+
+void assert_unknown_qualifier_reports_bind_error() {
+    auto catalog = make_schema_catalog();
+    try {
+        (void)sql::bind_select(sql::parse_select("SELECT nope.a FROM t1 JOIN t2 ON t1.a = t2.a"), catalog);
+    } catch (const sql::BindError& error) {
+        assert(error.position() == 7);
+        assert(error.message() == "unknown table qualifier 'nope'");
+        return;
+    }
+    throw std::logic_error("expected unknown qualifier bind error");
+}
+
+void assert_ambiguous_unqualified_column_reports_candidates() {
+    auto catalog = make_schema_catalog();
+    try {
+        (void)sql::bind_select(sql::parse_select("SELECT a FROM t1 JOIN t2 ON t1.a = t2.a"), catalog);
+    } catch (const sql::BindError& error) {
+        assert(error.position() == 7);
+        assert(error.message() == "ambiguous column 'a' matches tables 't1', 't2'");
+        return;
+    }
+    throw std::logic_error("expected ambiguous column bind error");
+}
+
 } // namespace
 
 int main() {
     assert_binds_against_schema_only_catalog();
     assert_unknown_column_still_reports_bind_error();
+    assert_join_binds_qualified_columns_to_stable_plan();
+    assert_unknown_qualifier_reports_bind_error();
+    assert_ambiguous_unqualified_column_reports_candidates();
     return 0;
 }

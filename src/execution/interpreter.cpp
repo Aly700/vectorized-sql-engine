@@ -2,14 +2,36 @@
 
 #include <cstdint>
 #include <stdexcept>
+#include <string>
 #include <utility>
+#include <vector>
 
 namespace execution {
 namespace {
 
-std::int64_t evaluate_scalar(const sql::ScalarExpr& expression, const storage::ColumnarBatch& batch, std::size_t row) {
-    if (const auto* column = std::get_if<sql::ColumnRef>(&expression)) {
-        return batch.column(column->name).at(row);
+const plan::LogicalPlan& require_left(const plan::LogicalPlan& plan) {
+    if (!plan.left) {
+        throw std::invalid_argument("logical join node is missing its left input");
+    }
+    return *plan.left;
+}
+
+const plan::LogicalPlan& require_right(const plan::LogicalPlan& plan) {
+    if (!plan.right) {
+        throw std::invalid_argument("logical join node is missing its right input");
+    }
+    return *plan.right;
+}
+
+std::string column_identity_name(const plan::BoundColumnRef& column) {
+    return column.table + "." + column.column;
+}
+
+std::int64_t evaluate_scalar(const plan::BoundScalarExpr& expression,
+                             const storage::ColumnarBatch& batch,
+                             std::size_t row) {
+    if (const auto* column = std::get_if<plan::BoundColumnRef>(&expression)) {
+        return batch.column(column_identity_name(*column)).at(row);
     }
     return std::get<sql::IntLiteral>(expression).value;
 }
@@ -32,13 +54,16 @@ bool compare_values(std::int64_t left, sql::ComparisonOp op, std::int64_t right)
     throw std::logic_error("unreachable comparison operator");
 }
 
-bool evaluate_comparison(const sql::ComparisonExpr& comparison, const storage::ColumnarBatch& batch, std::size_t row) {
+bool evaluate_comparison(const plan::BoundComparisonExpr& comparison,
+                         const storage::ColumnarBatch& batch,
+                         std::size_t row) {
     return compare_values(evaluate_scalar(comparison.left, batch, row),
                           comparison.op,
                           evaluate_scalar(comparison.right, batch, row));
 }
 
-storage::RowMask evaluate_filter(const std::vector<sql::ComparisonExpr>& predicates, const storage::ColumnarBatch& batch) {
+storage::RowMask evaluate_filter(const std::vector<plan::BoundComparisonExpr>& predicates,
+                                 const storage::ColumnarBatch& batch) {
     storage::RowMask mask;
     mask.keep.reserve(batch.row_count());
     for (std::size_t row = 0; row < batch.row_count(); ++row) {
@@ -60,6 +85,90 @@ storage::Int64Column evaluate_projection(const plan::Projection& projection, con
         column.append(evaluate_scalar(projection.expression, batch, row));
     }
     return column;
+}
+
+storage::ColumnarBatch execute_scan(const plan::LogicalPlan& plan, const Catalog& catalog) {
+    const auto& input = catalog.table(plan.table);
+    storage::ColumnarBatch out;
+    for (const auto& column_name : input.column_names()) {
+        out.add_column(plan.table + "." + column_name, input.column(column_name));
+    }
+    return out;
+}
+
+std::int64_t evaluate_join_scalar(const plan::BoundScalarExpr& expression,
+                                  const storage::ColumnarBatch& left,
+                                  std::size_t left_row,
+                                  const storage::ColumnarBatch& right,
+                                  std::size_t right_row) {
+    if (const auto* column = std::get_if<plan::BoundColumnRef>(&expression)) {
+        const auto name = column_identity_name(*column);
+        if (left.has_column(name)) {
+            return left.column(name).at(left_row);
+        }
+        if (right.has_column(name)) {
+            return right.column(name).at(right_row);
+        }
+        throw std::logic_error("bound join column identity is missing from both inputs: " + name);
+    }
+    return std::get<sql::IntLiteral>(expression).value;
+}
+
+bool evaluate_join_comparison(const plan::BoundComparisonExpr& comparison,
+                              const storage::ColumnarBatch& left,
+                              std::size_t left_row,
+                              const storage::ColumnarBatch& right,
+                              std::size_t right_row) {
+    return compare_values(evaluate_join_scalar(comparison.left, left, left_row, right, right_row),
+                          comparison.op,
+                          evaluate_join_scalar(comparison.right, left, left_row, right, right_row));
+}
+
+bool evaluate_join_predicates(const std::vector<plan::BoundComparisonExpr>& predicates,
+                              const storage::ColumnarBatch& left,
+                              std::size_t left_row,
+                              const storage::ColumnarBatch& right,
+                              std::size_t right_row) {
+    for (const auto& predicate : predicates) {
+        if (!evaluate_join_comparison(predicate, left, left_row, right, right_row)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+storage::ColumnarBatch execute_join(const plan::LogicalPlan& plan, const Catalog& catalog) {
+    const auto left = execute_interpreted(require_left(plan), catalog);
+    const auto right = execute_interpreted(require_right(plan), catalog);
+
+    std::vector<std::string> output_names = left.column_names();
+    output_names.insert(output_names.end(), right.column_names().begin(), right.column_names().end());
+    std::vector<storage::Int64Column> output_columns(output_names.size());
+
+    // Inner join order is part of the oracle contract: for each left row in
+    // input order, scan every right row in input order. Future vectorized join
+    // work must reproduce this left-row-major bag order exactly.
+    for (std::size_t left_row = 0; left_row < left.row_count(); ++left_row) {
+        for (std::size_t right_row = 0; right_row < right.row_count(); ++right_row) {
+            if (!evaluate_join_predicates(plan.predicates, left, left_row, right, right_row)) {
+                continue;
+            }
+
+            std::size_t output_index = 0;
+            for (const auto& column_name : left.column_names()) {
+                output_columns[output_index++].append(left.column(column_name).at(left_row));
+            }
+            for (const auto& column_name : right.column_names()) {
+                output_columns[output_index++].append(right.column(column_name).at(right_row));
+            }
+        }
+    }
+
+    storage::ColumnarBatch out;
+    for (std::size_t i = 0; i < output_names.size(); ++i) {
+        out.add_column(output_names[i], std::move(output_columns[i]));
+    }
+    return out;
 }
 
 } // namespace
@@ -96,7 +205,9 @@ const storage::ColumnarBatch& Catalog::table(const std::string& name) const {
 storage::ColumnarBatch execute_interpreted(const plan::LogicalPlan& plan, const Catalog& catalog) {
     switch (plan.kind) {
     case plan::LogicalKind::Scan:
-        return catalog.table(plan.table);
+        return execute_scan(plan, catalog);
+    case plan::LogicalKind::Join:
+        return execute_join(plan, catalog);
     case plan::LogicalKind::Filter: {
         auto input = execute_interpreted(*plan.input, catalog);
         return input.filter(evaluate_filter(plan.predicates, input));

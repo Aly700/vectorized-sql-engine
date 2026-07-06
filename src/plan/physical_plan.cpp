@@ -18,6 +18,8 @@ PhysicalPlan lower_to_physical(const LogicalPlan& logical) {
     switch (logical.kind) {
     case LogicalKind::Scan:
         return PhysicalPlan::scan(logical.table);
+    case LogicalKind::Join:
+        throw std::logic_error("vectorized inner join is not supported yet");
     case LogicalKind::Filter:
         return PhysicalPlan::filter(logical.predicates, lower_to_physical(require_input(logical)));
     case LogicalKind::Project:

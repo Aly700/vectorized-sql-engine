@@ -15,7 +15,21 @@ const plan::LogicalPlan& require_input(const plan::LogicalPlan& logical) {
     return *logical.input;
 }
 
-std::optional<std::int64_t> literal_value(const sql::ScalarExpr& expression) {
+const plan::LogicalPlan& require_left(const plan::LogicalPlan& logical) {
+    if (!logical.left) {
+        throw std::invalid_argument("logical join node is missing its left input");
+    }
+    return *logical.left;
+}
+
+const plan::LogicalPlan& require_right(const plan::LogicalPlan& logical) {
+    if (!logical.right) {
+        throw std::invalid_argument("logical join node is missing its right input");
+    }
+    return *logical.right;
+}
+
+std::optional<std::int64_t> literal_value(const plan::BoundScalarExpr& expression) {
     if (const auto* literal = std::get_if<sql::IntLiteral>(&expression)) {
         return literal->value;
     }
@@ -40,8 +54,8 @@ bool compare_values(std::int64_t left, sql::ComparisonOp op, std::int64_t right)
     throw std::logic_error("unreachable comparison operator");
 }
 
-sql::ComparisonExpr canonical_true() {
-    return sql::ComparisonExpr{
+plan::BoundComparisonExpr canonical_true() {
+    return plan::BoundComparisonExpr{
         sql::IntLiteral{1, 0},
         sql::ComparisonOp::Equal,
         sql::IntLiteral{1, 0},
@@ -49,8 +63,8 @@ sql::ComparisonExpr canonical_true() {
     };
 }
 
-sql::ComparisonExpr canonical_false() {
-    return sql::ComparisonExpr{
+plan::BoundComparisonExpr canonical_false() {
+    return plan::BoundComparisonExpr{
         sql::IntLiteral{1, 0},
         sql::ComparisonOp::Equal,
         sql::IntLiteral{0, 0},
@@ -58,17 +72,17 @@ sql::ComparisonExpr canonical_false() {
     };
 }
 
-bool is_literal_with_value(const sql::ScalarExpr& expression, std::int64_t expected) {
+bool is_literal_with_value(const plan::BoundScalarExpr& expression, std::int64_t expected) {
     const auto value = literal_value(expression);
     return value.has_value() && *value == expected;
 }
 
-bool is_canonical_true(const sql::ComparisonExpr& comparison) {
+bool is_canonical_true(const plan::BoundComparisonExpr& comparison) {
     return comparison.op == sql::ComparisonOp::Equal && is_literal_with_value(comparison.left, 1) &&
            is_literal_with_value(comparison.right, 1);
 }
 
-bool is_canonical_false(const sql::ComparisonExpr& comparison) {
+bool is_canonical_false(const plan::BoundComparisonExpr& comparison) {
     return comparison.op == sql::ComparisonOp::Equal && is_literal_with_value(comparison.left, 1) &&
            is_literal_with_value(comparison.right, 0);
 }
@@ -77,13 +91,35 @@ std::optional<plan::LogicalPlan> rewrite_once(
     const plan::LogicalPlan& logical,
     const std::vector<std::reference_wrapper<const Rule>>& rules,
     RewriteTrace& trace) {
-    if (logical.kind != plan::LogicalKind::Scan) {
+    switch (logical.kind) {
+    case plan::LogicalKind::Project:
+    case plan::LogicalKind::Filter: {
         const auto rewritten_child = rewrite_once(require_input(logical), rules, trace);
         if (rewritten_child.has_value()) {
             auto rewritten = logical;
             rewritten.input = std::make_shared<plan::LogicalPlan>(*rewritten_child);
             return rewritten;
         }
+        break;
+    }
+    case plan::LogicalKind::Join: {
+        const auto rewritten_left = rewrite_once(require_left(logical), rules, trace);
+        if (rewritten_left.has_value()) {
+            auto rewritten = logical;
+            rewritten.left = std::make_shared<plan::LogicalPlan>(*rewritten_left);
+            return rewritten;
+        }
+
+        const auto rewritten_right = rewrite_once(require_right(logical), rules, trace);
+        if (rewritten_right.has_value()) {
+            auto rewritten = logical;
+            rewritten.right = std::make_shared<plan::LogicalPlan>(*rewritten_right);
+            return rewritten;
+        }
+        break;
+    }
+    case plan::LogicalKind::Scan:
+        break;
     }
 
     for (const auto& rule : rules) {
@@ -134,7 +170,7 @@ std::optional<plan::LogicalPlan> DropAlwaysTrueFilterRule::apply(const plan::Log
         return std::nullopt;
     }
 
-    std::vector<sql::ComparisonExpr> predicates;
+    std::vector<plan::BoundComparisonExpr> predicates;
     predicates.reserve(logical.predicates.size());
     bool changed = false;
     for (const auto& predicate : logical.predicates) {
@@ -189,7 +225,7 @@ std::optional<plan::LogicalPlan> MergeAdjacentFiltersRule::apply(const plan::Log
         return std::nullopt;
     }
 
-    std::vector<sql::ComparisonExpr> predicates;
+    std::vector<plan::BoundComparisonExpr> predicates;
     predicates.reserve(child.predicates.size() + logical.predicates.size());
     predicates.insert(predicates.end(), child.predicates.begin(), child.predicates.end());
     predicates.insert(predicates.end(), logical.predicates.begin(), logical.predicates.end());
