@@ -3,6 +3,7 @@
 #include "sql/ast.hpp"
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <variant>
@@ -10,7 +11,7 @@
 
 namespace plan {
 
-enum class LogicalKind { Scan, Join, Filter, Project, Sort };
+enum class LogicalKind { Scan, Join, Filter, Project, Aggregate, Sort };
 enum class OrderPermission { Deterministic, Arbitrary };
 
 struct BoundColumnRef {
@@ -38,6 +39,13 @@ struct SortKey {
     sql::SortDirection direction{sql::SortDirection::Asc};
 };
 
+struct AggregateExpression {
+    std::string output_name;
+    sql::AggregateFunction function{sql::AggregateFunction::Count};
+    std::optional<BoundColumnRef> argument;
+    std::size_t position{0};
+};
+
 struct LogicalPlan {
     LogicalKind kind{LogicalKind::Scan};
     OrderPermission order_permission{OrderPermission::Deterministic};
@@ -46,6 +54,8 @@ struct LogicalPlan {
     std::string table;
     std::string binding_name;
     std::vector<Projection> projections;
+    std::vector<BoundColumnRef> group_keys;
+    std::vector<AggregateExpression> aggregate_expressions;
     std::vector<SortKey> sort_keys;
     std::vector<BoundComparisonExpr> predicates;
     std::shared_ptr<LogicalPlan> input;
@@ -89,6 +99,17 @@ struct LogicalPlan {
         LogicalPlan p;
         p.kind = LogicalKind::Project;
         p.projections = std::move(projections);
+        p.input = std::make_shared<LogicalPlan>(std::move(child));
+        return p;
+    }
+
+    static LogicalPlan aggregate(std::vector<BoundColumnRef> group_keys,
+                                 std::vector<AggregateExpression> aggregate_expressions,
+                                 LogicalPlan child) {
+        LogicalPlan p;
+        p.kind = LogicalKind::Aggregate;
+        p.group_keys = std::move(group_keys);
+        p.aggregate_expressions = std::move(aggregate_expressions);
         p.input = std::make_shared<LogicalPlan>(std::move(child));
         return p;
     }

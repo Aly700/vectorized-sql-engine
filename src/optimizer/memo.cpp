@@ -46,9 +46,22 @@ void hash_projection(std::size_t& seed, const plan::Projection& projection) {
     hash_scalar(seed, projection.expression);
 }
 
+void hash_column(std::size_t& seed, const plan::BoundColumnRef& column) {
+    hash_string(seed, column.binding);
+    hash_string(seed, column.column);
+}
+
+void hash_aggregate_expression(std::size_t& seed, const plan::AggregateExpression& aggregate) {
+    hash_string(seed, aggregate.output_name);
+    hash_combine(seed, static_cast<std::size_t>(aggregate.function));
+    hash_combine(seed, aggregate.argument.has_value() ? 1 : 0);
+    if (aggregate.argument.has_value()) {
+        hash_column(seed, *aggregate.argument);
+    }
+}
+
 void hash_sort_key(std::size_t& seed, const plan::SortKey& key) {
-    hash_string(seed, key.column.binding);
-    hash_string(seed, key.column.column);
+    hash_column(seed, key.column);
     hash_combine(seed, static_cast<std::size_t>(key.direction));
 }
 
@@ -62,6 +75,16 @@ std::size_t structural_hash(const MemoExpression& expression) {
     hash_combine(seed, expression.projections.size());
     for (const auto& projection : expression.projections) {
         hash_projection(seed, projection);
+    }
+
+    hash_combine(seed, expression.group_keys.size());
+    for (const auto& key : expression.group_keys) {
+        hash_column(seed, key);
+    }
+
+    hash_combine(seed, expression.aggregate_expressions.size());
+    for (const auto& aggregate : expression.aggregate_expressions) {
+        hash_aggregate_expression(seed, aggregate);
     }
 
     hash_combine(seed, expression.sort_keys.size());
@@ -101,9 +124,23 @@ bool projection_equal(const plan::Projection& left, const plan::Projection& righ
     return left.output_name == right.output_name && scalar_equal(left.expression, right.expression);
 }
 
+bool column_equal(const plan::BoundColumnRef& left, const plan::BoundColumnRef& right) {
+    return left.binding == right.binding && left.column == right.column;
+}
+
+bool aggregate_expression_equal(const plan::AggregateExpression& left, const plan::AggregateExpression& right) {
+    if (left.output_name != right.output_name || left.function != right.function ||
+        left.argument.has_value() != right.argument.has_value()) {
+        return false;
+    }
+    if (!left.argument.has_value()) {
+        return true;
+    }
+    return column_equal(*left.argument, *right.argument);
+}
+
 bool sort_key_equal(const plan::SortKey& left, const plan::SortKey& right) {
-    return left.column.binding == right.column.binding && left.column.column == right.column.column &&
-           left.direction == right.direction;
+    return column_equal(left.column, right.column) && left.direction == right.direction;
 }
 
 template <typename T, typename Equal>
@@ -123,6 +160,8 @@ bool structural_equal(const MemoExpression& left, const MemoExpression& right) {
     return left.kind == right.kind && left.order_permission == right.order_permission && left.table == right.table &&
            left.binding_name == right.binding_name &&
            vector_equal(left.projections, right.projections, projection_equal) &&
+           vector_equal(left.group_keys, right.group_keys, column_equal) &&
+           vector_equal(left.aggregate_expressions, right.aggregate_expressions, aggregate_expression_equal) &&
            vector_equal(left.sort_keys, right.sort_keys, sort_key_equal) &&
            vector_equal(left.predicates, right.predicates, comparison_equal) && left.children == right.children;
 }
@@ -150,9 +189,19 @@ const plan::LogicalPlan& require_right(const plan::LogicalPlan& logical) {
 
 std::string expression_to_string(const plan::BoundScalarExpr& expression) {
     if (const auto* column = std::get_if<plan::BoundColumnRef>(&expression)) {
+        if (column->binding.empty()) {
+            return "col(" + column->column + ")";
+        }
         return "col(" + column->binding + "." + column->column + ")";
     }
     return "lit(" + std::to_string(std::get<sql::IntLiteral>(expression).value) + ")";
+}
+
+std::string column_to_string(const plan::BoundColumnRef& column) {
+    if (column.binding.empty()) {
+        return "col(" + column.column + ")";
+    }
+    return "col(" + column.binding + "." + column.column + ")";
 }
 
 std::string comparison_op_to_string(sql::ComparisonOp op) {
@@ -198,7 +247,7 @@ std::string sort_direction_to_string(sql::SortDirection direction) {
 }
 
 std::string sort_key_to_string(const plan::SortKey& key) {
-    return "col(" + key.column.binding + "." + key.column.column + ") " + sort_direction_to_string(key.direction);
+    return column_to_string(key.column) + " " + sort_direction_to_string(key.direction);
 }
 
 void append_sort_keys(std::ostringstream& out, const std::vector<plan::SortKey>& sort_keys) {
@@ -207,6 +256,33 @@ void append_sort_keys(std::ostringstream& out, const std::vector<plan::SortKey>&
             out << ", ";
         }
         out << sort_key_to_string(sort_keys[i]);
+    }
+}
+
+void append_group_keys(std::ostringstream& out, const std::vector<plan::BoundColumnRef>& group_keys) {
+    for (std::size_t i = 0; i < group_keys.size(); ++i) {
+        if (i != 0) {
+            out << ", ";
+        }
+        out << column_to_string(group_keys[i]);
+    }
+}
+
+std::string aggregate_expression_to_string(const plan::AggregateExpression& aggregate) {
+    auto text = aggregate.output_name;
+    if (aggregate.argument.has_value()) {
+        text += "=" + column_to_string(*aggregate.argument);
+    }
+    return text;
+}
+
+void append_aggregate_expressions(std::ostringstream& out,
+                                  const std::vector<plan::AggregateExpression>& aggregates) {
+    for (std::size_t i = 0; i < aggregates.size(); ++i) {
+        if (i != 0) {
+            out << ", ";
+        }
+        out << aggregate_expression_to_string(aggregates[i]);
     }
 }
 
@@ -253,6 +329,14 @@ std::string memo_expression_to_string(const MemoExpression& expression) {
                 << expression_to_string(expression.projections[i].expression);
         }
         out << "]";
+        append_children(out, expression.children);
+        return out.str();
+    case MemoExpressionKind::Aggregate:
+        out << "Aggregate[group_keys=[";
+        append_group_keys(out, expression.group_keys);
+        out << "], aggregates=[";
+        append_aggregate_expressions(out, expression.aggregate_expressions);
+        out << "]]";
         append_children(out, expression.children);
         return out.str();
     case MemoExpressionKind::Sort:
@@ -350,6 +434,9 @@ catalog::TableSchema require_costed_table_schema(const std::string& table, const
 }
 
 std::string column_key(const std::string& table, const std::string& column) {
+    if (table.empty()) {
+        return column;
+    }
     return table + "." + column;
 }
 
@@ -505,6 +592,38 @@ RelationEstimate project_estimate(const std::vector<plan::Projection>& projectio
     return estimate;
 }
 
+RelationEstimate aggregate_estimate(const std::vector<plan::BoundColumnRef>& group_keys,
+                                    const std::vector<plan::AggregateExpression>& aggregate_expressions,
+                                    RelationEstimate child,
+                                    plan::OrderPermission order_permission) {
+    RelationEstimate estimate;
+    if (group_keys.empty()) {
+        estimate.rows = 1.0;
+    } else {
+        double group_rows = 1.0;
+        for (const auto& key : group_keys) {
+            group_rows = safe_multiply(group_rows, distinct_for(child, key));
+        }
+        estimate.rows = std::min(child.rows, group_rows);
+    }
+
+    // Aggregate performs one linear input pass plus one output pass over the
+    // first-appearance group vector. Global aggregation returns one group even
+    // for empty input so COUNT(*) can produce zero in the NULL-free slice.
+    estimate.cost = safe_add(safe_add(child.cost, child.rows), estimate.rows);
+    for (const auto& key : group_keys) {
+        const auto key_name = column_key(key);
+        estimate.distinct_by_column[key_name] =
+            std::min(distinct_for(child, key), estimate.rows);
+    }
+    for (const auto& aggregate : aggregate_expressions) {
+        estimate.distinct_by_column[column_key("", aggregate.output_name)] = estimate.rows;
+    }
+    estimate.plan = plan::LogicalPlan::aggregate(group_keys, aggregate_expressions, std::move(child.plan));
+    estimate.plan.order_permission = order_permission;
+    return estimate;
+}
+
 RelationEstimate sort_estimate(const std::vector<plan::SortKey>& sort_keys,
                                RelationEstimate child,
                                plan::OrderPermission order_permission) {
@@ -574,6 +693,11 @@ RelationEstimate estimate_logical_relation(const plan::LogicalPlan& logical, con
         return project_estimate(logical.projections,
                                 estimate_logical_relation(require_input(logical), catalog),
                                 logical.order_permission);
+    case plan::LogicalKind::Aggregate:
+        return aggregate_estimate(logical.group_keys,
+                                  logical.aggregate_expressions,
+                                  estimate_logical_relation(require_input(logical), catalog),
+                                  logical.order_permission);
     case plan::LogicalKind::Sort:
         return sort_estimate(logical.sort_keys,
                              estimate_logical_relation(require_input(logical), catalog),
@@ -652,6 +776,11 @@ private:
             return project_estimate(expression.projections,
                                     best_for_group(expression.children.at(0), stack).estimate,
                                     expression.order_permission);
+        case MemoExpressionKind::Aggregate:
+            return aggregate_estimate(expression.group_keys,
+                                      expression.aggregate_expressions,
+                                      best_for_group(expression.children.at(0), stack).estimate,
+                                      expression.order_permission);
         case MemoExpressionKind::Sort:
             return sort_estimate(expression.sort_keys,
                                  best_for_group(expression.children.at(0), stack).estimate,
@@ -691,6 +820,12 @@ GroupId Memo::insert(const plan::LogicalPlan& logical) {
     case plan::LogicalKind::Project:
         expression.kind = MemoExpressionKind::Project;
         expression.projections = logical.projections;
+        expression.children.push_back(insert(require_input(logical)));
+        return insert_expression(std::move(expression));
+    case plan::LogicalKind::Aggregate:
+        expression.kind = MemoExpressionKind::Aggregate;
+        expression.group_keys = logical.group_keys;
+        expression.aggregate_expressions = logical.aggregate_expressions;
         expression.children.push_back(insert(require_input(logical)));
         return insert_expression(std::move(expression));
     case plan::LogicalKind::Sort:
@@ -1003,6 +1138,13 @@ plan::LogicalPlan Memo::extract_expression(const MemoExpression& expression, std
         result.order_permission = expression.order_permission;
         return result;
     }
+    case MemoExpressionKind::Aggregate: {
+        auto result = plan::LogicalPlan::aggregate(expression.group_keys,
+                                                  expression.aggregate_expressions,
+                                                  extract(expression.children.at(0), stack));
+        result.order_permission = expression.order_permission;
+        return result;
+    }
     case MemoExpressionKind::Sort: {
         auto result = plan::LogicalPlan::sort(expression.sort_keys, extract(expression.children.at(0), stack));
         result.order_permission = expression.order_permission;
@@ -1032,37 +1174,50 @@ void Memo::validate_expression(const MemoExpression& expression) const {
     switch (expression.kind) {
     case MemoExpressionKind::Scan:
         if (expression.table.empty() || expression.binding_name.empty() || !expression.projections.empty() ||
-            !expression.sort_keys.empty() || !expression.predicates.empty() || !expression.children.empty()) {
+            !expression.group_keys.empty() || !expression.aggregate_expressions.empty() || !expression.sort_keys.empty() ||
+            !expression.predicates.empty() || !expression.children.empty()) {
             throw std::logic_error("malformed memo scan expression");
         }
         return;
     case MemoExpressionKind::Filter:
         if (!expression.table.empty() || !expression.binding_name.empty() || !expression.projections.empty() ||
-            !expression.sort_keys.empty() || expression.predicates.empty() || expression.children.size() != 1) {
+            !expression.group_keys.empty() || !expression.aggregate_expressions.empty() || !expression.sort_keys.empty() ||
+            expression.predicates.empty() || expression.children.size() != 1) {
             throw std::logic_error("malformed memo filter expression");
         }
         return;
     case MemoExpressionKind::Project:
         if (!expression.table.empty() || !expression.binding_name.empty() || expression.projections.empty() ||
-            !expression.sort_keys.empty() || !expression.predicates.empty() || expression.children.size() != 1) {
+            !expression.group_keys.empty() || !expression.aggregate_expressions.empty() || !expression.sort_keys.empty() ||
+            !expression.predicates.empty() || expression.children.size() != 1) {
             throw std::logic_error("malformed memo project expression");
+        }
+        return;
+    case MemoExpressionKind::Aggregate:
+        if (!expression.table.empty() || !expression.binding_name.empty() || !expression.projections.empty() ||
+            (expression.group_keys.empty() && expression.aggregate_expressions.empty()) || !expression.sort_keys.empty() ||
+            !expression.predicates.empty() || expression.children.size() != 1) {
+            throw std::logic_error("malformed memo aggregate expression");
         }
         return;
     case MemoExpressionKind::Sort:
         if (!expression.table.empty() || !expression.binding_name.empty() || !expression.projections.empty() ||
-            expression.sort_keys.empty() || !expression.predicates.empty() || expression.children.size() != 1) {
+            !expression.group_keys.empty() || !expression.aggregate_expressions.empty() || expression.sort_keys.empty() ||
+            !expression.predicates.empty() || expression.children.size() != 1) {
             throw std::logic_error("malformed memo sort expression");
         }
         return;
     case MemoExpressionKind::Join:
         if (!expression.table.empty() || !expression.binding_name.empty() || !expression.projections.empty() ||
-            !expression.sort_keys.empty() || expression.children.size() != 2) {
+            !expression.group_keys.empty() || !expression.aggregate_expressions.empty() || !expression.sort_keys.empty() ||
+            expression.children.size() != 2) {
             throw std::logic_error("malformed memo join expression");
         }
         return;
     case MemoExpressionKind::GroupRef:
         if (!expression.table.empty() || !expression.binding_name.empty() || !expression.projections.empty() ||
-            !expression.sort_keys.empty() || !expression.predicates.empty() || expression.children.size() != 1) {
+            !expression.group_keys.empty() || !expression.aggregate_expressions.empty() || !expression.sort_keys.empty() ||
+            !expression.predicates.empty() || expression.children.size() != 1) {
             throw std::logic_error("malformed memo group reference expression");
         }
         return;
@@ -1307,6 +1462,22 @@ std::vector<plan::LogicalPlan> Memo::extract_alternatives_for_expression(
             auto project = plan::LogicalPlan::project(expression.projections, std::move(child));
             project.order_permission = expression.order_permission;
             alternatives.push_back(std::move(project));
+        }
+        return alternatives;
+    }
+    case MemoExpressionKind::Aggregate: {
+        auto children = extract_alternatives_for_group(expression.children.at(0), options, result, stack);
+        std::vector<plan::LogicalPlan> alternatives;
+        alternatives.reserve(children.size());
+        for (auto& child : children) {
+            if (alternatives.size() >= options.max_plans) {
+                result.hit_plan_bound = true;
+                break;
+            }
+            auto aggregate =
+                plan::LogicalPlan::aggregate(expression.group_keys, expression.aggregate_expressions, std::move(child));
+            aggregate.order_permission = expression.order_permission;
+            alternatives.push_back(std::move(aggregate));
         }
         return alternatives;
     }

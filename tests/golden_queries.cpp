@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -17,7 +18,7 @@ struct ExpectedResult {
     std::vector<std::vector<std::int64_t>> rows;
 };
 
-enum class ErrorKind { Parse, Bind };
+enum class ErrorKind { Parse, Bind, Runtime };
 
 struct ExpectedError {
     ErrorKind kind;
@@ -99,6 +100,13 @@ execution::Catalog make_catalog() {
     storage::ColumnarBatch empty;
     empty.add_column("a", storage::Int64Column{});
     catalog.add_table("empty", std::move(empty));
+
+    storage::Int64Column overflow_value;
+    overflow_value.append(std::numeric_limits<std::int64_t>::max());
+    overflow_value.append(1);
+    storage::ColumnarBatch overflow;
+    overflow.add_column("v", std::move(overflow_value));
+    catalog.add_table("overflow", std::move(overflow));
     return catalog;
 }
 
@@ -163,7 +171,8 @@ std::string format_result(const storage::ColumnarBatch& batch) {
 
 std::string format_error(const ExpectedError& error) {
     std::ostringstream out;
-    out << (error.kind == ErrorKind::Parse ? "parse" : "bind") << "@" << error.position << ": " << error.message;
+    const auto kind = error.kind == ErrorKind::Parse ? "parse" : error.kind == ErrorKind::Bind ? "bind" : "runtime";
+    out << kind << "@" << error.position << ": " << error.message;
     return out.str();
 }
 
@@ -178,7 +187,7 @@ std::string run_query(const GoldenQuery& test, const execution::Catalog& catalog
     } catch (const sql::BindError& error) {
         return format_error(ExpectedError{ErrorKind::Bind, error.position(), error.message()});
     } catch (const std::exception& error) {
-        return std::string("unexpected exception: ") + error.what();
+        return format_error(ExpectedError{ErrorKind::Runtime, 0, error.what()});
     }
 }
 
@@ -285,6 +294,73 @@ int main() {
             "self join memo-dedup regression result",
             "SELECT x.a, y.b FROM t1 AS x JOIN t1 AS y ON x.a = y.a WHERE x.b = 20 ORDER BY y.b ASC",
             ExpectedResult{{"x.a", "y.b"}, {{2, 20}, {2, 30}}},
+        },
+        GoldenQuery{
+            "ungrouped aggregates use one global group",
+            "SELECT COUNT(*), COUNT(b), SUM(a), MIN(b), MAX(b) FROM t",
+            ExpectedResult{{"COUNT(*)", "COUNT(b)", "SUM(a)", "MIN(b)", "MAX(b)"}, {{4, 4, 10, 10, 40}}},
+        },
+        GoldenQuery{
+            "group by preserves first appearance group order",
+            "SELECT t1.a, COUNT(*), COUNT(t1.b), SUM(t1.b), MIN(t1.b), MAX(t1.b) FROM t1 GROUP BY t1.a",
+            ExpectedResult{{"t1.a", "COUNT(*)", "COUNT(t1.b)", "SUM(t1.b)", "MIN(t1.b)", "MAX(t1.b)"},
+                           {{1, 1, 1, 10, 10, 10}, {2, 2, 2, 50, 20, 30}}},
+        },
+        GoldenQuery{
+            "join group by aggregates matched join rows",
+            "SELECT t1.a, COUNT(*), SUM(t2.c), MIN(t2.c), MAX(t2.c) FROM t1 JOIN t2 ON t1.a = t2.a GROUP BY t1.a",
+            ExpectedResult{{"t1.a", "COUNT(*)", "SUM(t2.c)", "MIN(t2.c)", "MAX(t2.c)"},
+                           {{2, 4, 802, 200, 201}}},
+        },
+        GoldenQuery{
+            "group by order by sorts grouping keys",
+            "SELECT t1.a, COUNT(*) FROM t1 GROUP BY t1.a ORDER BY t1.a DESC",
+            ExpectedResult{{"t1.a", "COUNT(*)"}, {{2, 2}, {1, 1}}},
+        },
+        GoldenQuery{
+            "global count over empty input returns zero",
+            "SELECT COUNT(*) FROM empty",
+            ExpectedResult{{"COUNT(*)"}, {{0}}},
+        },
+        GoldenQuery{
+            "grouped empty input returns no groups",
+            "SELECT a, COUNT(*) FROM empty GROUP BY a",
+            ExpectedResult{{"a", "COUNT(*)"}, {}},
+        },
+        GoldenQuery{
+            "sum over empty global group fails loudly",
+            "SELECT SUM(empty.a) FROM empty",
+            ExpectedResult{},
+            true,
+            ExpectedError{ErrorKind::Runtime, 0, "SUM(empty.a) over empty input has no NULL-free result"},
+        },
+        GoldenQuery{
+            "sum overflow fails loudly",
+            "SELECT SUM(v) FROM overflow",
+            ExpectedResult{},
+            true,
+            ExpectedError{ErrorKind::Runtime, 0, "SUM(v) overflowed int64"},
+        },
+        GoldenQuery{
+            "non grouped projected column is a bind error",
+            "SELECT a, b, COUNT(*) FROM t GROUP BY a",
+            ExpectedResult{},
+            true,
+            ExpectedError{ErrorKind::Bind, 10, "non-grouped column 'b' must appear in GROUP BY or be aggregated"},
+        },
+        GoldenQuery{
+            "nested aggregate is a bind error",
+            "SELECT SUM(COUNT(*)) FROM t",
+            ExpectedResult{},
+            true,
+            ExpectedError{ErrorKind::Bind, 11, "nested aggregate 'COUNT' is not allowed"},
+        },
+        GoldenQuery{
+            "grouped ORDER BY must use grouping columns",
+            "SELECT a, COUNT(*) FROM t GROUP BY a ORDER BY b",
+            ExpectedResult{},
+            true,
+            ExpectedError{ErrorKind::Bind, 46, "ORDER BY column 'b' must be a GROUP BY column in aggregate queries"},
         },
         GoldenQuery{
             "unsupported OR is rejected at token position",
