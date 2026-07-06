@@ -128,6 +128,44 @@ public:
     [[nodiscard]] bool apply(Memo& memo, GroupId group, const MemoExpression& expression) const override;
 };
 
+// Pattern matched: Join(A, B, predicates) in an arbitrary-order, identity-addressed memo context.
+// Replacement expression: Join(B, A, predicates).
+// Semantic equivalence argument: Inner join is symmetric under SQL bag semantics: each matching
+// pair from A and B appears with the same multiplicity after swapping the inputs. Predicates are
+// bound to stable table/column identities rather than positions, so their truth values are
+// unchanged. The join node's internal output identity order flips, but admitted bound SQL plans
+// consume join columns by identity and the final Project fixes user-visible output names/order.
+// Preconditions: The expression must explicitly permit arbitrary row order; the plan context must
+// have a final Project or another identity-addressed consumer that does not observe raw join column
+// order; no NULLs, outer joins, side effects, or volatile expressions exist in the slice.
+// Golden query: `SELECT t1.b, t2.c FROM t1 JOIN t2 ON t1.a = t2.a` proves sorted-bag equality for
+// commuted memo alternatives.
+class JoinCommuteRule final : public MemoRule {
+public:
+    [[nodiscard]] std::string_view name() const override { return "JoinCommuteRule"; }
+    [[nodiscard]] bool apply(Memo& memo, GroupId group, const MemoExpression& expression) const override;
+};
+
+// Pattern matched: Join(Join(A, B, p_ab), C, p_abc) or Join(A, Join(B, C, p_bc), p_abc)
+// in an arbitrary-order, identity-addressed memo context.
+// Replacement expression: The opposite association, with conjuncts placed only at join nodes where
+// all referenced table identities are available.
+// Semantic equivalence argument: Inner join over pure two-valued predicates is associative under
+// bag semantics when the same conjuncts are evaluated after both sides they reference are present.
+// Multiplicities are preserved because no duplicate-eliminating operator is introduced.
+// Preconditions: The expression must explicitly permit arbitrary row order; every relocated
+// conjunct must reference only tables available at its new join node; the newly created inner join
+// must receive at least one predicate that connects its left and right children, so the rule does
+// not introduce a cross-product-shaped intermediate; no NULLs, outer joins, side effects, or
+// volatile expressions exist in the slice.
+// Golden query: `SELECT t1.b, t2.c, t3.d FROM t1 JOIN t2 ON t1.a = t2.a JOIN t3 ON t2.c = t3.c`
+// proves sorted-bag equality for associated memo alternatives.
+class JoinAssociateRule final : public MemoRule {
+public:
+    [[nodiscard]] std::string_view name() const override { return "JoinAssociateRule"; }
+    [[nodiscard]] bool apply(Memo& memo, GroupId group, const MemoExpression& expression) const override;
+};
+
 [[nodiscard]] RewriteResult rewrite_to_fixpoint(
     const plan::LogicalPlan& logical,
     const std::vector<std::reference_wrapper<const Rule>>& rules,
