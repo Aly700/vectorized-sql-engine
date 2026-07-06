@@ -8,8 +8,10 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 add_library(sql_engine
     src/sql/parser.cpp
     src/sql/binder.cpp
+    src/plan/physical_plan.cpp
     src/storage/columnar_batch.cpp
     src/execution/interpreter.cpp
+    src/execution/vectorized.cpp
     src/optimizer/memo.cpp
 )
 target_include_directories(sql_engine PUBLIC include)
@@ -21,6 +23,10 @@ target_link_libraries(sql_smoke PRIVATE sql_engine)
 add_executable(sql_golden tests/golden_queries.cpp)
 target_link_libraries(sql_golden PRIVATE sql_engine)
 
+add_executable(sql_vectorized_differential tests/vectorized_differential.cpp)
+target_link_libraries(sql_vectorized_differential PRIVATE sql_engine)
+
 include(CTest)
 add_test(NAME sql_smoke COMMAND sql_smoke)
 add_test(NAME sql_golden COMMAND sql_golden)
+add_test(NAME sql_vectorized_differential COMMAND sql_vectorized_differential)
