@@ -34,6 +34,8 @@ struct AggregateCall {
 };
 
 using SelectExpr = std::variant<ScalarExpr, AggregateCall>;
+using HavingExpr = std::variant<ColumnRef, IntLiteral, AggregateCall>;
+using OrderByExpr = std::variant<ColumnRef, AggregateCall>;
 
 enum class ComparisonOp { Equal, NotEqual, Less, LessEqual, Greater, GreaterEqual };
 
@@ -48,16 +50,30 @@ struct WhereClause {
     std::vector<ComparisonExpr> conjuncts;
 };
 
+struct HavingComparisonExpr {
+    HavingExpr left;
+    ComparisonOp op{ComparisonOp::Equal};
+    HavingExpr right;
+    std::size_t operator_position{0};
+};
+
+struct HavingClause {
+    std::size_t position{0};
+    std::vector<HavingComparisonExpr> conjuncts;
+};
+
 enum class SortDirection { Asc, Desc };
 
 struct OrderByKey {
-    ColumnRef column;
+    OrderByExpr expression;
     SortDirection direction{SortDirection::Asc};
 };
 
 struct SelectItem {
     SelectExpr expression;
     std::size_t position{0};
+    std::optional<std::string> alias;
+    std::size_t alias_position{0};
 };
 
 struct JoinClause {
@@ -77,6 +93,7 @@ struct SelectQuery {
     std::vector<JoinClause> joins;
     std::optional<WhereClause> predicate;
     std::vector<ColumnRef> group_by;
+    std::optional<HavingClause> having;
     std::vector<OrderByKey> order_by;
 };
 
@@ -92,6 +109,23 @@ inline std::size_t expression_position(const ScalarExpr& expression) {
 inline std::size_t expression_position(const SelectExpr& expression) {
     if (const auto* scalar = std::get_if<ScalarExpr>(&expression)) {
         return expression_position(*scalar);
+    }
+    return std::get<AggregateCall>(expression).position;
+}
+
+inline std::size_t expression_position(const HavingExpr& expression) {
+    if (const auto* column = std::get_if<ColumnRef>(&expression)) {
+        return column->position;
+    }
+    if (const auto* literal = std::get_if<IntLiteral>(&expression)) {
+        return literal->position;
+    }
+    return std::get<AggregateCall>(expression).position;
+}
+
+inline std::size_t expression_position(const OrderByExpr& expression) {
+    if (const auto* column = std::get_if<ColumnRef>(&expression)) {
+        return column->position;
     }
     return std::get<AggregateCall>(expression).position;
 }
@@ -143,6 +177,23 @@ inline std::string output_name(const AggregateCall& aggregate) {
 inline std::string output_name(const SelectExpr& expression) {
     if (const auto* scalar = std::get_if<ScalarExpr>(&expression)) {
         return output_name(*scalar);
+    }
+    return output_name(std::get<AggregateCall>(expression));
+}
+
+inline std::string output_name(const HavingExpr& expression) {
+    if (const auto* column = std::get_if<ColumnRef>(&expression)) {
+        return output_name(*column);
+    }
+    if (const auto* literal = std::get_if<IntLiteral>(&expression)) {
+        return std::to_string(literal->value);
+    }
+    return output_name(std::get<AggregateCall>(expression));
+}
+
+inline std::string output_name(const OrderByExpr& expression) {
+    if (const auto* column = std::get_if<ColumnRef>(&expression)) {
+        return output_name(*column);
     }
     return output_name(std::get<AggregateCall>(expression));
 }

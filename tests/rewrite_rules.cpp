@@ -257,6 +257,31 @@ void assert_filter_rewrites_above_join_remain_equivalent() {
     assert_rewrite_equivalent_oracle_only(sql);
 }
 
+void assert_having_filter_rewrites_fire() {
+    const auto catalog = make_catalog();
+    const auto sql = "SELECT a FROM t GROUP BY a HAVING 2 > 1 AND SUM(b) > 20";
+    const auto rewritten = rewrite_sql(sql, catalog, optimizer::default_rules());
+
+    assert(trace_contains(rewritten.trace, "ConstantFoldComparisonRule"));
+    assert(trace_contains(rewritten.trace, "DropAlwaysTrueFilterRule"));
+    const auto printed = plan::to_string(rewritten.plan);
+    assert(printed.find("Filter[col(SUM(b)) > lit(20)]") != std::string::npos);
+    assert(printed.find("Aggregate[group_keys=[col(t.a)], aggregates=[SUM(b)=col(t.b)]]") != std::string::npos);
+    assert_rewrite_equivalent(sql);
+}
+
+void assert_having_always_false_rule_fires() {
+    const auto catalog = make_catalog();
+    const auto sql = "SELECT a FROM t GROUP BY a HAVING SUM(b) > 20 AND 2 < 1";
+    const auto rewritten = rewrite_sql(sql, catalog, optimizer::default_rules());
+
+    assert(trace_contains(rewritten.trace, "AlwaysFalseFilterRule"));
+    const auto printed = plan::to_string(rewritten.plan);
+    assert(printed.find("Filter[lit(1) = lit(0)]") != std::string::npos);
+    assert(printed.find("col(SUM(b)) > lit(20)") == std::string::npos);
+    assert_rewrite_equivalent(sql);
+}
+
 void assert_rewrite_driver_traverses_join_children() {
     const auto left_filter = plan::LogicalPlan::filter(
         {comparison(literal(2), sql::ComparisonOp::Greater, literal(1))},
@@ -287,6 +312,8 @@ int main() {
     assert_merge_adjacent_filters_rule_fires();
     assert_all_true_filter_is_removed();
     assert_filter_rewrites_above_join_remain_equivalent();
+    assert_having_filter_rewrites_fire();
+    assert_having_always_false_rule_fires();
     assert_rewrite_driver_traverses_join_children();
     return 0;
 }
