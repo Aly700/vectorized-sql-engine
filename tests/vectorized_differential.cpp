@@ -1,3 +1,4 @@
+#include "differential_verifier.hpp"
 #include "execution/interpreter.hpp"
 #include "execution/vectorized.hpp"
 #include "optimizer/memo.hpp"
@@ -488,138 +489,16 @@ bool compare_engines(const std::string& sql,
                      const execution::Catalog& catalog,
                      const std::string& table_text,
                      ComparisonStats* stats = nullptr) {
-    const auto parsed = sql::parse_select(sql);
-    const auto logical = sql::bind_select(parsed, catalog);
-    const auto is_join_query = contains_join(logical);
-    const auto* order_keys = root_sort_keys(logical);
-    const auto limit_count = root_limit_count(logical);
-    const auto is_ordered_query = order_keys != nullptr;
-    if (is_join_query && !is_ordered_query && logical.order_permission != plan::OrderPermission::Arbitrary) {
-        std::cerr << "join query did not carry arbitrary-order permission\n"
-                  << "sql: " << sql << "\n"
-                  << "plan:\n"
-                  << plan::to_string(logical) << "\n";
-        return false;
-    }
-    if (is_ordered_query && !root_order_boundary_is_valid(logical)) {
-        std::cerr << "ordered query did not keep a required root above arbitrary-order input\n"
-                  << "sql: " << sql << "\n"
-                  << "plan:\n"
-                  << plan::to_string(logical) << "\n";
-        return false;
-    }
-
-    optimizer::Memo memo;
-    const auto root = memo.insert(logical);
-    const auto explored = optimizer::explore_memo_to_fixpoint(memo, optimizer::default_memo_rules());
-    const auto alternatives = memo.extract_alternatives(root, optimizer::AlternativeExtractionOptions{64, 512});
+    differential::ComparisonStats shared_stats;
+    const auto ok =
+        differential::compare_engines(sql, catalog, table_text, stats == nullptr ? nullptr : &shared_stats);
     if (stats != nullptr) {
-        stats->alternative_count = alternatives.plans.size();
-        stats->max_group_expression_count = alternatives.max_group_expression_count;
-        stats->hit_expression_bound = alternatives.hit_expression_bound;
-        stats->hit_plan_bound = alternatives.hit_plan_bound;
+        stats->alternative_count = shared_stats.alternative_count;
+        stats->max_group_expression_count = shared_stats.max_group_expression_count;
+        stats->hit_expression_bound = shared_stats.hit_expression_bound;
+        stats->hit_plan_bound = shared_stats.hit_plan_bound;
     }
-
-    const auto unrewritten_oracle = execution::execute_interpreted(logical, catalog);
-    const auto full_unlimited_oracle =
-        limit_count.has_value() ? execution::execute_interpreted(without_root_limit(logical), catalog)
-                                : unrewritten_oracle;
-    if (alternatives.plans.empty()) {
-        std::cerr << "memo alternative extraction returned no plans\n"
-                  << "sql: " << sql << "\n"
-                  << table_text << "\n"
-                  << "memo trace: " << format_trace(explored.fired_rules) << "\n"
-                  << "memo dump:\n"
-                  << memo.dump();
-        return false;
-    }
-
-    for (std::size_t alternative_index = 0; alternative_index < alternatives.plans.size(); ++alternative_index) {
-        const auto& extracted = alternatives.plans[alternative_index];
-        const auto memo_oracle = execution::execute_interpreted(extracted, catalog);
-        const auto memo_vectorized = execution::execute_vectorized(extracted, catalog);
-        const auto* extracted_order_keys = root_sort_keys(extracted);
-        const auto ordered_outputs_are_sorted =
-            !is_ordered_query ||
-            (extracted_order_keys != nullptr && is_sorted_by_keys(unrewritten_oracle, *order_keys) &&
-             is_sorted_by_keys(memo_oracle, *extracted_order_keys));
-        const auto cross_plan_equal =
-            limit_count.has_value()
-                ? valid_limit_answer(memo_oracle, full_unlimited_oracle, *limit_count, order_keys)
-                : is_ordered_query || is_join_query ? same_sorted_bag(unrewritten_oracle, memo_oracle)
-                                                    : same_batch(unrewritten_oracle, memo_oracle);
-        const auto vectorized_equal = same_batch(memo_oracle, memo_vectorized);
-        const auto column_sets_match = same_column_identity_set(unrewritten_oracle, memo_oracle) &&
-                                       same_column_identity_set(memo_oracle, memo_vectorized);
-        const auto output_order_matches = same_column_order(unrewritten_oracle, memo_oracle) &&
-                                          same_column_order(memo_oracle, memo_vectorized);
-        if (cross_plan_equal && vectorized_equal && column_sets_match && output_order_matches &&
-            ordered_outputs_are_sorted) {
-            continue;
-        }
-
-        std::cerr << "memo/vectorized divergence\n"
-                  << "sql: " << sql << "\n"
-                  << table_text << "\n"
-                  << "alternative index: " << alternative_index << " of " << alternatives.plans.size() << "\n"
-                  << "hit expression bound: " << (alternatives.hit_expression_bound ? "yes" : "no") << "\n"
-                  << "hit plan bound: " << (alternatives.hit_plan_bound ? "yes" : "no") << "\n"
-                  << "memo trace: " << format_trace(explored.fired_rules) << "\n"
-                  << "before plan:\n"
-                  << plan::to_string(logical) << "\n"
-                  << "memo dump:\n"
-                  << memo.dump()
-                  << "extracted plan:\n"
-                  << plan::to_string(extracted) << "\n"
-                  << "unrewritten oracle:     " << format_batch(unrewritten_oracle) << "\n"
-                  << "full unlimited oracle:  " << format_batch(full_unlimited_oracle) << "\n"
-                  << "unrewritten bag:        " << format_sorted_bag(unrewritten_oracle) << "\n"
-                  << "alternative oracle:     " << format_batch(memo_oracle) << "\n"
-                  << "alternative oracle bag: " << format_sorted_bag(memo_oracle) << "\n"
-                  << "alternative vectorized: " << format_batch(memo_vectorized) << "\n"
-                  << "ordered outputs sorted: " << (ordered_outputs_are_sorted ? "yes" : "no") << "\n";
-        return false;
-    }
-
-    const auto best = memo.extract_best(root, catalog);
-    const auto best_oracle = execution::execute_interpreted(best, catalog);
-    const auto best_vectorized = execution::execute_vectorized(best, catalog);
-    const auto* best_order_keys = root_sort_keys(best);
-    const auto best_ordered_outputs_are_sorted =
-        !is_ordered_query ||
-        (best_order_keys != nullptr && is_sorted_by_keys(unrewritten_oracle, *order_keys) &&
-         is_sorted_by_keys(best_oracle, *best_order_keys));
-    const auto best_cross_plan_equal =
-        limit_count.has_value()
-            ? valid_limit_answer(best_oracle, full_unlimited_oracle, *limit_count, order_keys)
-            : is_ordered_query || is_join_query ? same_sorted_bag(unrewritten_oracle, best_oracle)
-                                                : same_batch(unrewritten_oracle, best_oracle);
-    const auto best_vectorized_equal = same_batch(best_oracle, best_vectorized);
-    const auto best_column_sets_match = same_column_identity_set(unrewritten_oracle, best_oracle) &&
-                                        same_column_identity_set(best_oracle, best_vectorized);
-    const auto best_output_order_matches = same_column_order(unrewritten_oracle, best_oracle) &&
-                                           same_column_order(best_oracle, best_vectorized);
-    if (!best_cross_plan_equal || !best_vectorized_equal || !best_column_sets_match || !best_output_order_matches ||
-        !best_ordered_outputs_are_sorted) {
-        std::cerr << "best memo/vectorized divergence\n"
-                  << "sql: " << sql << "\n"
-                  << table_text << "\n"
-                  << "memo trace: " << format_trace(explored.fired_rules) << "\n"
-                  << "before plan:\n"
-                  << plan::to_string(logical) << "\n"
-                  << "memo dump:\n"
-                  << memo.dump()
-                  << "best plan:\n"
-                  << plan::to_string(best) << "\n"
-                  << "unrewritten oracle: " << format_batch(unrewritten_oracle) << "\n"
-                  << "full unlimited oracle: " << format_batch(full_unlimited_oracle) << "\n"
-                  << "best oracle:        " << format_batch(best_oracle) << "\n"
-                  << "best vectorized:    " << format_batch(best_vectorized) << "\n"
-                  << "ordered outputs sorted: " << (best_ordered_outputs_are_sorted ? "yes" : "no") << "\n";
-        return false;
-    }
-
-    return true;
+    return ok;
 }
 
 bool run_result_golden_queries() {
