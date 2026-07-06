@@ -14,13 +14,14 @@ namespace optimizer {
 
 using GroupId = std::uint64_t;
 
-enum class MemoExpressionKind { Scan, Join, Filter, Project, GroupRef };
+enum class MemoExpressionKind { Scan, Join, Filter, Project, Sort, GroupRef };
 
 struct MemoExpression {
     MemoExpressionKind kind{MemoExpressionKind::Scan};
     plan::OrderPermission order_permission{plan::OrderPermission::Deterministic};
     std::string table;
     std::vector<plan::Projection> projections;
+    std::vector<plan::SortKey> sort_keys;
     std::vector<plan::BoundComparisonExpr> predicates;
     std::vector<GroupId> children;
 };

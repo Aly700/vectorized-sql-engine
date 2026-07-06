@@ -252,6 +252,21 @@ int main() {
             ExpectedResult{{"t1.a", "t2.a"}, {{2, 2}, {2, 2}, {2, 2}, {2, 2}}},
         },
         GoldenQuery{
+            "order by single key descending keeps equal-key ties stable",
+            "SELECT a, b FROM t ORDER BY b DESC",
+            ExpectedResult{{"a", "b"}, {{4, 40}, {2, 20}, {3, 20}, {1, 10}}},
+        },
+        GoldenQuery{
+            "order by multiple keys with mixed directions",
+            "SELECT a, b FROM t ORDER BY b ASC, a DESC",
+            ExpectedResult{{"a", "b"}, {{1, 10}, {3, 20}, {2, 20}, {4, 40}}},
+        },
+        GoldenQuery{
+            "order by binds unprojected qualified join column from FROM scope",
+            "SELECT t1.b FROM t1 JOIN t2 ON t1.a = t2.a ORDER BY t2.c DESC, t1.b ASC",
+            ExpectedResult{{"t1.b"}, {{20}, {30}, {20}, {30}}},
+        },
+        GoldenQuery{
             "unsupported OR is rejected at token position",
             "SELECT a FROM t WHERE a = 2 OR b = 20",
             ExpectedResult{},
@@ -313,6 +328,27 @@ int main() {
             ExpectedResult{},
             true,
             ExpectedError{ErrorKind::Parse, 9, "expected ',' or FROM after projection expression"},
+        },
+        GoldenQuery{
+            "ORDER must be followed by BY",
+            "SELECT a FROM t ORDER a",
+            ExpectedResult{},
+            true,
+            ExpectedError{ErrorKind::Parse, 22, "expected BY after ORDER"},
+        },
+        GoldenQuery{
+            "ORDER BY sort keys must be column references",
+            "SELECT a FROM t ORDER BY 1",
+            ExpectedResult{},
+            true,
+            ExpectedError{ErrorKind::Parse, 25, "expected ORDER BY column name"},
+        },
+        GoldenQuery{
+            "ORDER BY unknown FROM-scope column is a bind error",
+            "SELECT a FROM t ORDER BY missing",
+            ExpectedResult{},
+            true,
+            ExpectedError{ErrorKind::Bind, 25, "unknown column 'missing' in table 't'"},
         },
     };
 

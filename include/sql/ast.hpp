@@ -34,6 +34,13 @@ struct WhereClause {
     std::vector<ComparisonExpr> conjuncts;
 };
 
+enum class SortDirection { Asc, Desc };
+
+struct OrderByKey {
+    ColumnRef column;
+    SortDirection direction{SortDirection::Asc};
+};
+
 struct SelectItem {
     ScalarExpr expression;
     std::size_t position{0};
@@ -51,6 +58,7 @@ struct SelectQuery {
     std::size_t table_position{0};
     std::vector<JoinClause> joins;
     std::optional<WhereClause> predicate;
+    std::vector<OrderByKey> order_by;
 };
 
 SelectQuery parse_select(const std::string& sql);

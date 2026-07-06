@@ -1,5 +1,6 @@
 #include "execution/vectorized.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -314,6 +315,7 @@ BatchView execute_scan(const plan::PhysicalPlan& plan, const Catalog& catalog) {
 BatchView execute_filter(const plan::PhysicalPlan& plan, const Catalog& catalog);
 BatchView execute_join(const plan::PhysicalPlan& plan, const Catalog& catalog);
 BatchView execute_project(const plan::PhysicalPlan& plan, const Catalog& catalog);
+BatchView execute_sort(const plan::PhysicalPlan& plan, const Catalog& catalog);
 
 BatchView execute_to_view(const plan::PhysicalPlan& plan, const Catalog& catalog) {
     switch (plan.kind) {
@@ -325,6 +327,8 @@ BatchView execute_to_view(const plan::PhysicalPlan& plan, const Catalog& catalog
         return execute_filter(plan, catalog);
     case plan::PhysicalKind::Project:
         return execute_project(plan, catalog);
+    case plan::PhysicalKind::Sort:
+        return execute_sort(plan, catalog);
     }
     throw std::logic_error("unreachable physical plan kind");
 }
@@ -407,6 +411,25 @@ storage::ColumnarBatch materialize_projection(const plan::PhysicalPlan& plan, co
     return out;
 }
 
+SelectionVectorPtr sort_selection(const std::vector<plan::SortKey>& sort_keys, const BatchView& input) {
+    validate_view(input);
+
+    SelectionVector rows = *input.selection;
+    std::stable_sort(rows.begin(), rows.end(), [&](std::size_t left, std::size_t right) {
+        for (const auto& key : sort_keys) {
+            const auto& column = input.batch->column(column_identity_name(key.column));
+            const auto left_value = column.at(left);
+            const auto right_value = column.at(right);
+            if (left_value == right_value) {
+                continue;
+            }
+            return key.direction == sql::SortDirection::Asc ? left_value < right_value : left_value > right_value;
+        }
+        return false;
+    });
+    return make_selection(std::move(rows));
+}
+
 BatchView execute_project(const plan::PhysicalPlan& plan, const Catalog& catalog) {
     auto input = execute_to_view(require_input(plan), catalog);
     auto materialized = std::make_shared<const storage::ColumnarBatch>(materialize_projection(plan, input));
@@ -417,6 +440,27 @@ BatchView execute_project(const plan::PhysicalPlan& plan, const Catalog& catalog
     view.selection = identity_selection(materialized->row_count());
     validate_view(view);
     return view;
+}
+
+BatchView execute_sort(const plan::PhysicalPlan& plan, const Catalog& catalog) {
+    const auto& input_plan = require_input(plan);
+    if (input_plan.kind == plan::PhysicalKind::Project) {
+        auto source = execute_to_view(require_input(input_plan), catalog);
+        source.selection = sort_selection(plan.sort_keys, source);
+        auto materialized = std::make_shared<const storage::ColumnarBatch>(materialize_projection(input_plan, source));
+
+        BatchView view;
+        view.owned_batch = materialized;
+        view.batch = materialized.get();
+        view.selection = identity_selection(materialized->row_count());
+        validate_view(view);
+        return view;
+    }
+
+    auto input = execute_to_view(input_plan, catalog);
+    input.selection = sort_selection(plan.sort_keys, input);
+    validate_view(input);
+    return input;
 }
 
 storage::ColumnarBatch materialize_view(const BatchView& view) {

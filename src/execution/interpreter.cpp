@@ -1,5 +1,6 @@
 #include "execution/interpreter.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -8,6 +9,13 @@
 
 namespace execution {
 namespace {
+
+const plan::LogicalPlan& require_input(const plan::LogicalPlan& plan) {
+    if (!plan.input) {
+        throw std::invalid_argument("logical plan node is missing its input");
+    }
+    return *plan.input;
+}
 
 const plan::LogicalPlan& require_left(const plan::LogicalPlan& plan) {
     if (!plan.left) {
@@ -85,6 +93,62 @@ storage::Int64Column evaluate_projection(const plan::Projection& projection, con
         column.append(evaluate_scalar(projection.expression, batch, row));
     }
     return column;
+}
+
+storage::Int64Column evaluate_projection(const plan::Projection& projection,
+                                         const storage::ColumnarBatch& batch,
+                                         const std::vector<std::size_t>& rows) {
+    storage::Int64Column column;
+    for (auto row : rows) {
+        column.append(evaluate_scalar(projection.expression, batch, row));
+    }
+    return column;
+}
+
+std::vector<std::size_t> stable_sorted_rows(const std::vector<plan::SortKey>& sort_keys,
+                                            const storage::ColumnarBatch& batch) {
+    std::vector<std::size_t> rows;
+    rows.reserve(batch.row_count());
+    for (std::size_t row = 0; row < batch.row_count(); ++row) {
+        rows.push_back(row);
+    }
+
+    std::stable_sort(rows.begin(), rows.end(), [&](std::size_t left, std::size_t right) {
+        for (const auto& key : sort_keys) {
+            const auto& column = batch.column(column_identity_name(key.column));
+            const auto left_value = column.at(left);
+            const auto right_value = column.at(right);
+            if (left_value == right_value) {
+                continue;
+            }
+            return key.direction == sql::SortDirection::Asc ? left_value < right_value : left_value > right_value;
+        }
+        return false;
+    });
+    return rows;
+}
+
+storage::ColumnarBatch materialize_rows(const storage::ColumnarBatch& batch, const std::vector<std::size_t>& rows) {
+    storage::ColumnarBatch out;
+    for (const auto& name : batch.column_names()) {
+        storage::Int64Column column;
+        const auto& input_column = batch.column(name);
+        for (auto row : rows) {
+            column.append(input_column.at(row));
+        }
+        out.add_column(name, std::move(column));
+    }
+    return out;
+}
+
+storage::ColumnarBatch materialize_project_rows(const plan::LogicalPlan& project,
+                                                const storage::ColumnarBatch& batch,
+                                                const std::vector<std::size_t>& rows) {
+    storage::ColumnarBatch out;
+    for (const auto& projection : project.projections) {
+        out.add_column(projection.output_name, evaluate_projection(projection, batch, rows));
+    }
+    return out;
 }
 
 storage::ColumnarBatch execute_scan(const plan::LogicalPlan& plan, const Catalog& catalog) {
@@ -171,6 +235,19 @@ storage::ColumnarBatch execute_join(const plan::LogicalPlan& plan, const Catalog
     return out;
 }
 
+storage::ColumnarBatch execute_sort(const plan::LogicalPlan& plan, const Catalog& catalog) {
+    const auto& input_plan = require_input(plan);
+    if (input_plan.kind == plan::LogicalKind::Project) {
+        const auto source = execute_interpreted(require_input(input_plan), catalog);
+        const auto rows = stable_sorted_rows(plan.sort_keys, source);
+        return materialize_project_rows(input_plan, source, rows);
+    }
+
+    auto input = execute_interpreted(input_plan, catalog);
+    const auto rows = stable_sorted_rows(plan.sort_keys, input);
+    return materialize_rows(input, rows);
+}
+
 } // namespace
 
 void Catalog::add_table(std::string name, storage::ColumnarBatch batch) {
@@ -221,6 +298,8 @@ storage::ColumnarBatch execute_interpreted(const plan::LogicalPlan& plan, const 
         }
         return out;
     }
+    case plan::LogicalKind::Sort:
+        return execute_sort(plan, catalog);
     }
     throw std::logic_error("unreachable logical plan kind");
 }

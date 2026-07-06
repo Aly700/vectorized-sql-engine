@@ -58,6 +58,20 @@ std::string comparison_to_string(const BoundComparisonExpr& comparison) {
            expression_to_string(comparison.right);
 }
 
+std::string sort_direction_to_string(sql::SortDirection direction) {
+    switch (direction) {
+    case sql::SortDirection::Asc:
+        return "ASC";
+    case sql::SortDirection::Desc:
+        return "DESC";
+    }
+    throw std::logic_error("unreachable sort direction");
+}
+
+std::string sort_key_to_string(const SortKey& key) {
+    return "col(" + key.column.table + "." + key.column.column + ") " + sort_direction_to_string(key.direction);
+}
+
 void append_indent(std::ostringstream& out, std::size_t depth) {
     for (std::size_t i = 0; i < depth; ++i) {
         out << "  ";
@@ -101,6 +115,17 @@ void append_plan(std::ostringstream& out, const LogicalPlan& logical, std::size_
                 out << ", ";
             }
             out << logical.projections[i].output_name << "=" << expression_to_string(logical.projections[i].expression);
+        }
+        out << "]\n";
+        append_plan(out, require_input(logical), depth + 1);
+        return;
+    case LogicalKind::Sort:
+        out << "Sort[";
+        for (std::size_t i = 0; i < logical.sort_keys.size(); ++i) {
+            if (i != 0) {
+                out << ", ";
+            }
+            out << sort_key_to_string(logical.sort_keys[i]);
         }
         out << "]\n";
         append_plan(out, require_input(logical), depth + 1);

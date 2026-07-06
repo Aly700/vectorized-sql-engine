@@ -61,7 +61,9 @@ bool equals_keyword(std::string_view text, std::string_view keyword) {
 bool is_reserved_keyword(std::string_view text) {
     return equals_keyword(text, "SELECT") || equals_keyword(text, "FROM") || equals_keyword(text, "WHERE") ||
            equals_keyword(text, "AND") || equals_keyword(text, "OR") || equals_keyword(text, "AS") ||
-           equals_keyword(text, "JOIN") || equals_keyword(text, "INNER") || equals_keyword(text, "ON");
+           equals_keyword(text, "JOIN") || equals_keyword(text, "INNER") || equals_keyword(text, "ON") ||
+           equals_keyword(text, "ORDER") || equals_keyword(text, "BY") || equals_keyword(text, "ASC") ||
+           equals_keyword(text, "DESC");
 }
 
 class Lexer {
@@ -161,6 +163,10 @@ public:
             query.predicate = parse_where();
         }
 
+        if (is_keyword("ORDER")) {
+            query.order_by = parse_order_by();
+        }
+
         if (current_.kind == TokenKind::Semicolon) {
             advance();
         }
@@ -209,6 +215,31 @@ private:
         WhereClause where;
         where.conjuncts = parse_comparison_conjunction();
         return where;
+    }
+
+    std::vector<OrderByKey> parse_order_by() {
+        expect_keyword("ORDER", "expected ORDER");
+        expect_keyword("BY", "expected BY after ORDER");
+
+        std::vector<OrderByKey> keys;
+        keys.push_back(parse_order_by_key());
+        while (current_.kind == TokenKind::Comma) {
+            advance();
+            keys.push_back(parse_order_by_key());
+        }
+        return keys;
+    }
+
+    OrderByKey parse_order_by_key() {
+        auto column = parse_column_ref("expected ORDER BY column name");
+        auto direction = SortDirection::Asc;
+        if (is_keyword("ASC")) {
+            advance();
+        } else if (is_keyword("DESC")) {
+            direction = SortDirection::Desc;
+            advance();
+        }
+        return OrderByKey{std::move(column), direction};
     }
 
     JoinClause parse_join() {
@@ -275,7 +306,7 @@ private:
         }
     }
 
-    ScalarExpr parse_scalar_expr(const std::string& message) {
+    ColumnRef parse_column_ref(const std::string& message) {
         if (current_.kind == TokenKind::Identifier && !is_reserved_keyword(current_.text)) {
             auto first = current_;
             advance();
@@ -290,6 +321,14 @@ private:
             }
             auto column = ColumnRef{std::nullopt, first.text, first.position};
             return column;
+        }
+
+        throw ParseError(current_.position, message);
+    }
+
+    ScalarExpr parse_scalar_expr(const std::string& message) {
+        if (current_.kind == TokenKind::Identifier && !is_reserved_keyword(current_.text)) {
+            return parse_column_ref(message);
         }
 
         if (current_.kind == TokenKind::Integer) {
