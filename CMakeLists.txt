@@ -43,6 +43,9 @@ target_link_libraries(sql_optimizer_memo PRIVATE sql_engine)
 add_executable(sql_optimizer_cost_model tests/cost_model.cpp)
 target_link_libraries(sql_optimizer_cost_model PRIVATE sql_engine)
 
+add_executable(sql_bench benchmarks/sql_bench.cpp)
+target_link_libraries(sql_bench PRIVATE sql_engine)
+
 include(CTest)
 add_test(NAME sql_smoke COMMAND sql_smoke)
 add_test(NAME sql_golden COMMAND sql_golden)

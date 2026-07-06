@@ -6,7 +6,34 @@
 
 #include <cassert>
 
+namespace {
+
+void assert_column_copy_reuses_storage_until_mutation() {
+    storage::Int64Column original;
+    original.append(10);
+    original.append(20);
+    original.append(30);
+
+    storage::ColumnarBatch batch;
+    batch.add_column("qualified.a", original);
+
+    const auto& shared = batch.column("qualified.a");
+    assert(&shared.values() == &original.values());
+
+    auto mutated = shared;
+    mutated.append(40);
+
+    assert(&mutated.values() != &shared.values());
+    assert(shared.size() == 3);
+    assert(mutated.size() == 4);
+    assert(mutated.at(3) == 40);
+}
+
+} // namespace
+
 int main() {
+    assert_column_copy_reuses_storage_until_mutation();
+
     auto query = sql::parse_select("SELECT a FROM t WHERE a = 2");
     assert(query.projection.size() == 1);
     assert(sql::output_name(query.projection[0].expression) == "a");
