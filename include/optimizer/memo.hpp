@@ -19,7 +19,10 @@ enum class MemoExpressionKind { Scan, Join, Filter, Project, Sort, GroupRef };
 struct MemoExpression {
     MemoExpressionKind kind{MemoExpressionKind::Scan};
     plan::OrderPermission order_permission{plan::OrderPermission::Deterministic};
+    // Scan expressions read physical `table` and expose identities under
+    // `binding_name`; both are structural fields.
     std::string table;
+    std::string binding_name;
     std::vector<plan::Projection> projections;
     std::vector<plan::SortKey> sort_keys;
     std::vector<plan::BoundComparisonExpr> predicates;

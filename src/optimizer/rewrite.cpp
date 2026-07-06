@@ -129,7 +129,7 @@ std::vector<std::string> merge_tables(std::vector<std::string> left, const std::
 std::vector<std::string> referenced_tables(const plan::BoundScalarExpr& expression) {
     std::vector<std::string> tables;
     if (const auto* column = std::get_if<plan::BoundColumnRef>(&expression)) {
-        add_unique_table(tables, column->table);
+        add_unique_table(tables, column->binding);
     }
     return tables;
 }
@@ -184,7 +184,7 @@ std::vector<std::string> output_tables_for_expression(const Memo& memo,
                                                       std::vector<GroupId>& stack) {
     switch (expression.kind) {
     case MemoExpressionKind::Scan:
-        return {expression.table};
+        return {expression.binding_name};
     case MemoExpressionKind::Filter:
     case MemoExpressionKind::Project:
     case MemoExpressionKind::Sort:
@@ -209,7 +209,7 @@ std::vector<std::string> output_tables_for_group(const Memo& memo, GroupId group
     for (std::size_t i = 1; i < memo_group.expressions.size(); ++i) {
         const auto alternative_tables = output_tables_for_expression(memo, memo_group.expressions[i].expression, stack);
         if (alternative_tables != tables) {
-            throw std::logic_error("memo group alternatives expose different table identity sets");
+            throw std::logic_error("memo group alternatives expose different binding identity sets");
         }
     }
     stack.pop_back();

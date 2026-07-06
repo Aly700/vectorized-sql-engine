@@ -271,7 +271,7 @@ std::string format_sorted_bag(const storage::ColumnarBatch& batch) {
 }
 
 std::optional<std::string> output_column_for_sort_key(const plan::SortKey& key, const storage::ColumnarBatch& batch) {
-    const auto qualified = key.column.table + "." + key.column.column;
+    const auto qualified = key.column.binding + "." + key.column.column;
     if (batch.has_column(qualified)) {
         return qualified;
     }
@@ -542,6 +542,13 @@ bool run_join_oracle_corpus() {
         "JOIN t3 ON t2.c = t3.c ORDER BY t3.d DESC, t2.c ASC",
         "SELECT t1.b, t2.c, t3.d, t4.e FROM t1 JOIN t2 ON t1.a = t2.a "
         "JOIN t3 ON t2.c = t3.c JOIN t4 ON t3.d = t4.d ORDER BY t4.e DESC, t2.c ASC",
+        "SELECT x.a FROM t AS x WHERE x.a >= 2 ORDER BY x.a DESC",
+        "SELECT x.b, y.c FROM t1 AS x JOIN t2 AS y ON x.a = y.a ORDER BY y.c DESC, x.b ASC",
+        "SELECT x.a, y.b FROM t1 AS x JOIN t1 AS y ON x.a = y.a WHERE x.b = 20 ORDER BY y.b ASC",
+        "SELECT x.b, y.b, z.b FROM t1 AS x JOIN t1 AS y ON x.a = y.a "
+        "JOIN t1 AS z ON y.a = z.a WHERE z.b >= 20",
+        "SELECT x.b, y.c, z.d FROM t1 AS x JOIN t2 AS y ON x.a = y.a "
+        "JOIN t3 AS z ON y.c = z.c ORDER BY z.d DESC, x.b ASC",
     };
 
     bool ok = true;

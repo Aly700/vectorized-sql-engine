@@ -32,7 +32,7 @@ const plan::LogicalPlan& require_right(const plan::LogicalPlan& plan) {
 }
 
 std::string column_identity_name(const plan::BoundColumnRef& column) {
-    return column.table + "." + column.column;
+    return column.binding + "." + column.column;
 }
 
 std::int64_t evaluate_scalar(const plan::BoundScalarExpr& expression,
@@ -155,7 +155,7 @@ storage::ColumnarBatch execute_scan(const plan::LogicalPlan& plan, const Catalog
     const auto& input = catalog.table(plan.table);
     storage::ColumnarBatch out;
     for (const auto& column_name : input.column_names()) {
-        out.add_column(plan.table + "." + column_name, input.column(column_name));
+        out.add_column(plan.binding_name + "." + column_name, input.column(column_name));
     }
     return out;
 }

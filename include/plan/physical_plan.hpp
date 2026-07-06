@@ -13,7 +13,10 @@ enum class PhysicalKind { Scan, Join, Filter, Project, Sort };
 
 struct PhysicalPlan {
     PhysicalKind kind{PhysicalKind::Scan};
+    // Physical scans read `table` and expose output identities under
+    // `binding_name`, matching the bound logical scan.
     std::string table;
+    std::string binding_name;
     std::vector<Projection> projections;
     std::vector<SortKey> sort_keys;
     std::vector<BoundComparisonExpr> predicates;
@@ -22,9 +25,14 @@ struct PhysicalPlan {
     std::shared_ptr<PhysicalPlan> right;
 
     static PhysicalPlan scan(std::string table) {
+        return scan(table, table);
+    }
+
+    static PhysicalPlan scan(std::string table, std::string binding_name) {
         PhysicalPlan p;
         p.kind = PhysicalKind::Scan;
         p.table = std::move(table);
+        p.binding_name = std::move(binding_name);
         return p;
     }
 

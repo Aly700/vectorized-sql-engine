@@ -94,6 +94,30 @@ void assert_join_binds_qualified_columns_to_stable_plan() {
     assert(printed.find("col(t2.c) > lit(200)") != std::string::npos);
 }
 
+void assert_alias_binding_replaces_physical_qualifier() {
+    auto catalog = make_schema_catalog();
+    const auto logical =
+        sql::bind_select(sql::parse_select("SELECT x.b FROM t1 AS x WHERE x.a = 2"), catalog);
+
+    assert(logical.kind == plan::LogicalKind::Project);
+    assert(logical.projections.size() == 1);
+    assert(logical.projections[0].output_name == "x.b");
+
+    const auto printed = plan::to_string(logical);
+    assert(printed.find("Project[x.b=col(x.b)]") != std::string::npos);
+    assert(printed.find("Filter[col(x.a) = lit(2)]") != std::string::npos);
+    assert(printed.find("Scan[t1 AS x]") != std::string::npos);
+}
+
+void assert_unaliased_scan_keeps_existing_identity_text() {
+    auto catalog = make_schema_catalog();
+    const auto logical = sql::bind_select(sql::parse_select("SELECT t1.b FROM t1"), catalog);
+
+    const auto printed = plan::to_string(logical);
+    assert(printed.find("Project[t1.b=col(t1.b)]") != std::string::npos);
+    assert(printed.find("Scan[t1]") != std::string::npos);
+}
+
 void assert_order_by_uses_from_scope_not_projection_outputs() {
     auto catalog = make_schema_catalog();
     const auto logical =
@@ -112,6 +136,22 @@ void assert_order_by_uses_from_scope_not_projection_outputs() {
     assert(printed.find("Join[col(t1.a) = col(t2.a)]") != std::string::npos);
 }
 
+void assert_alias_order_by_uses_binding_scope() {
+    auto catalog = make_schema_catalog();
+    const auto logical =
+        sql::bind_select(sql::parse_select(
+                             "SELECT x.b FROM t1 AS x JOIN t2 AS y ON x.a = y.a ORDER BY y.c DESC"),
+                         catalog);
+
+    assert(logical.order_permission == plan::OrderPermission::Deterministic);
+    const auto printed = plan::to_string(logical);
+    assert(printed.find("Sort[col(y.c) DESC]") != std::string::npos);
+    assert(printed.find("Project[x.b=col(x.b)]") != std::string::npos);
+    assert(printed.find("Join[col(x.a) = col(y.a)]") != std::string::npos);
+    assert(printed.find("Scan[t1 AS x]") != std::string::npos);
+    assert(printed.find("Scan[t2 AS y]") != std::string::npos);
+}
+
 void assert_order_by_ambiguous_unqualified_column_reports_candidates() {
     auto catalog = make_schema_catalog();
     try {
@@ -122,6 +162,54 @@ void assert_order_by_ambiguous_unqualified_column_reports_candidates() {
         return;
     }
     throw std::logic_error("expected ambiguous ORDER BY bind error");
+}
+
+void assert_physical_table_qualifier_is_unknown_when_alias_exists() {
+    auto catalog = make_schema_catalog();
+    try {
+        (void)sql::bind_select(sql::parse_select("SELECT t1.a FROM t1 AS x"), catalog);
+    } catch (const sql::BindError& error) {
+        assert(error.position() == 7);
+        assert(error.message() == "unknown table qualifier 't1'");
+        return;
+    }
+    throw std::logic_error("expected physical-name qualifier bind error");
+}
+
+void assert_duplicate_binding_reports_alias_scope() {
+    auto catalog = make_schema_catalog();
+    try {
+        (void)sql::bind_select(sql::parse_select("SELECT x.a FROM t AS x JOIN t1 AS x ON x.a = x.a"), catalog);
+    } catch (const sql::BindError& error) {
+        assert(error.position() == 34);
+        assert(error.message() == "duplicate table binding 'x' requires a unique alias");
+        return;
+    }
+    throw std::logic_error("expected duplicate binding bind error");
+}
+
+void assert_unaliased_self_join_still_requires_aliases() {
+    auto catalog = make_schema_catalog();
+    try {
+        (void)sql::bind_select(sql::parse_select("SELECT t.a FROM t JOIN t ON t.a = t.a"), catalog);
+    } catch (const sql::BindError& error) {
+        assert(error.position() == 23);
+        assert(error.message() == "duplicate table binding 't' requires a unique alias");
+        return;
+    }
+    throw std::logic_error("expected unaliased self join duplicate binding error");
+}
+
+void assert_ambiguous_unqualified_column_reports_alias_candidates() {
+    auto catalog = make_schema_catalog();
+    try {
+        (void)sql::bind_select(sql::parse_select("SELECT a FROM t AS x JOIN t2 AS y ON x.a = y.a"), catalog);
+    } catch (const sql::BindError& error) {
+        assert(error.position() == 7);
+        assert(error.message() == "ambiguous column 'a' matches tables 'x', 'y'");
+        return;
+    }
+    throw std::logic_error("expected alias-scope ambiguous column bind error");
 }
 
 void assert_unknown_qualifier_reports_bind_error() {
@@ -154,8 +242,15 @@ int main() {
     assert_binds_against_schema_only_catalog();
     assert_unknown_column_still_reports_bind_error();
     assert_join_binds_qualified_columns_to_stable_plan();
+    assert_alias_binding_replaces_physical_qualifier();
+    assert_unaliased_scan_keeps_existing_identity_text();
     assert_order_by_uses_from_scope_not_projection_outputs();
+    assert_alias_order_by_uses_binding_scope();
     assert_order_by_ambiguous_unqualified_column_reports_candidates();
+    assert_physical_table_qualifier_is_unknown_when_alias_exists();
+    assert_duplicate_binding_reports_alias_scope();
+    assert_unaliased_self_join_still_requires_aliases();
+    assert_ambiguous_unqualified_column_reports_alias_candidates();
     assert_unknown_qualifier_reports_bind_error();
     assert_ambiguous_unqualified_column_reports_candidates();
     return 0;

@@ -6,6 +6,7 @@
 4. Rule-based rewrites with equivalence tests.
 5. Cascades memo, cost model, and join reordering. Delivered in Phase 5c: the memo now explores equivalent join orders, verifies all enumerated alternatives, and extracts a deterministic low-cost logical plan from catalog row-count statistics without changing semantics.
 6. ORDER BY end-to-end. Delivered in Phase 6: parser and binder support FROM-scope column sort keys, logical and physical plans include a required-order root `Sort`, both engines implement deterministic stable sorting, and memo verification distinguishes same-plan exact equality from cross-plan ordered bag-plus-sortedness checks.
+7. Table aliases and self-joins. Delivered in Phase 7: parser and binder support `FROM t [AS] x` and aliased join chains, bound column identities are binding-scoped, logical/physical scans carry physical table plus binding name, memo scan dedup includes aliases, cost stats look up physical tables while distinct keys remain binding-scoped, and both engines verify aliased self-joins through golden and differential memo alternatives.
 
 ## Phase 1 first tasks
 

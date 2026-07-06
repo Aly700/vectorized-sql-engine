@@ -30,7 +30,7 @@ const LogicalPlan& require_right(const LogicalPlan& logical) {
 
 std::string expression_to_string(const BoundScalarExpr& expression) {
     if (const auto* column = std::get_if<BoundColumnRef>(&expression)) {
-        return "col(" + column->table + "." + column->column + ")";
+        return "col(" + column->binding + "." + column->column + ")";
     }
     return "lit(" + std::to_string(std::get<sql::IntLiteral>(expression).value) + ")";
 }
@@ -69,7 +69,7 @@ std::string sort_direction_to_string(sql::SortDirection direction) {
 }
 
 std::string sort_key_to_string(const SortKey& key) {
-    return "col(" + key.column.table + "." + key.column.column + ") " + sort_direction_to_string(key.direction);
+    return "col(" + key.column.binding + "." + key.column.column + ") " + sort_direction_to_string(key.direction);
 }
 
 void append_indent(std::ostringstream& out, std::size_t depth) {
@@ -82,7 +82,11 @@ void append_plan(std::ostringstream& out, const LogicalPlan& logical, std::size_
     append_indent(out, depth);
     switch (logical.kind) {
     case LogicalKind::Scan:
-        out << "Scan[" << logical.table << "]";
+        out << "Scan[" << logical.table;
+        if (logical.binding_name != logical.table) {
+            out << " AS " << logical.binding_name;
+        }
+        out << "]";
         return;
     case LogicalKind::Join:
         out << "Join[";
