@@ -8,17 +8,18 @@ void ColumnarBatch::add_column(std::string name, Int64Column column) {
     if (!columns_.empty() && column.size() != row_count()) {
         throw std::invalid_argument("all columns in a batch must have the same row count");
     }
-    auto [_, inserted] = columns_.emplace(std::move(name), std::move(column));
+    auto [inserted_it, inserted] = columns_.emplace(std::move(name), std::move(column));
     if (!inserted) {
         throw std::invalid_argument("duplicate column name");
     }
+    column_names_.push_back(inserted_it->first);
 }
 
 std::size_t ColumnarBatch::row_count() const {
-    if (columns_.empty()) {
+    if (column_names_.empty()) {
         return 0;
     }
-    return columns_.begin()->second.size();
+    return columns_.at(column_names_.front()).size();
 }
 
 bool ColumnarBatch::has_column(const std::string& name) const {
@@ -38,7 +39,8 @@ ColumnarBatch ColumnarBatch::filter(const RowMask& mask) const {
         throw std::invalid_argument("row mask size must equal batch row count");
     }
     ColumnarBatch out;
-    for (const auto& [name, col] : columns_) {
+    for (const auto& name : column_names_) {
+        const auto& col = columns_.at(name);
         Int64Column filtered;
         for (std::size_t i = 0; i < mask.keep.size(); ++i) {
             if (mask.keep[i]) {

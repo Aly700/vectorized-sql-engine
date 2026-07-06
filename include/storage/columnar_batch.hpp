@@ -30,10 +30,12 @@ public:
     [[nodiscard]] bool has_column(const std::string& name) const;
     [[nodiscard]] const Int64Column& column(const std::string& name) const;
     [[nodiscard]] ColumnarBatch filter(const RowMask& mask) const;
+    [[nodiscard]] const std::vector<std::string>& column_names() const { return column_names_; }
     [[nodiscard]] const std::map<std::string, Int64Column>& columns() const { return columns_; }
 
 private:
     std::map<std::string, Int64Column> columns_;
+    std::vector<std::string> column_names_;
 };
 
 RowMask equals_i64(const ColumnarBatch& batch, const std::string& column, std::int64_t value);
