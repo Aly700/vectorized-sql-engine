@@ -128,6 +128,55 @@ public:
     [[nodiscard]] bool apply(Memo& memo, GroupId group, const MemoExpression& expression) const override;
 };
 
+// Pattern matched: Filter(P, Join(L, R, J)) in the memo.
+// Replacement expression: An equivalent join alternative where each filter conjunct that references
+// only L's binding identities becomes/merges with a Filter over L, each conjunct that references only
+// R's binding identities becomes/merges with a Filter over R, each conjunct that references both sides
+// is appended to the Join predicate list, and residual conjuncts remain in a smaller Filter above the
+// new Join. If no residual conjunct remains, the Filter disappears.
+// Semantic equivalence argument: For inner join under bag semantics, applying a pure two-valued
+// predicate that reads only one input before the join preserves exactly the matching pair
+// multiplicities that would survive filtering after the join. A predicate that reads both inputs is
+// semantically a join predicate because it can be evaluated precisely when both rows are available.
+// Conjuncts are independent in the current NULL-free, side-effect-free scalar slice, so splitting an
+// AND list across these scopes preserves accepted output rows and duplicates.
+// Preconditions: Only conjuncts whose referenced binding identities are wholly available at the
+// target scope move. Literal-only, unknown-scope, and aggregate-output predicates stay residual; no
+// NULLs, outer joins, volatile functions, or side effects exist; the original expression remains in
+// the memo and ordering permission is preserved on the inserted alternative.
+// Golden query: `SELECT t1.b, t2.c FROM t1 JOIN t2 ON t1.a = t2.a WHERE t1.b = 20 AND t2.c > 200
+// AND t1.b < t2.c` proves all pushed alternatives remain equal to the unrewritten oracle.
+class FilterIntoJoinRule final : public MemoRule {
+public:
+    [[nodiscard]] std::string_view name() const override { return "FilterIntoJoinRule"; }
+    [[nodiscard]] bool apply(Memo& memo, GroupId group, const MemoExpression& expression) const override;
+};
+
+// Pattern matched: Filter(P, Aggregate(group_keys, aggregates, input)) in the memo.
+// Replacement expression: Push each conjunct whose column references are exactly grouping-key
+// identities into a new/merged Filter over the Aggregate input, then rebuild the Aggregate above that
+// filtered input. Aggregate-output and other residual conjuncts stay in a smaller Filter above the
+// Aggregate; if no residual remains, the Filter disappears.
+// Semantic equivalence argument: Group membership is decided per input row solely by grouping-key
+// values. Filtering groups by a predicate over only those keys therefore keeps exactly the groups
+// whose member rows have key values satisfying the same predicate, which is equivalent to filtering
+// input rows by that predicate before aggregation. Aggregate outputs such as COUNT/SUM are computed
+// after grouping and are not available before aggregation, so predicates that reference them do not
+// move.
+// Preconditions: Every moved conjunct must reference at least one column and every referenced column
+// must match one of `group_keys` by bound identity. The current binder represents HAVING grouping-key
+// predicates with the original input `BoundColumnRef{binding, column}` and aggregate outputs with an
+// empty binding, so aggregate-output predicates fail this exact match. The scalar slice is pure,
+// NULL-free, two-valued, and side-effect-free; duplicates are preserved because aggregation still
+// sees exactly the filtered input row bag.
+// Golden query: `SELECT t1.a, COUNT(*) FROM t1 JOIN t2 ON t1.a = t2.a GROUP BY t1.a HAVING
+// t1.a = 2 AND COUNT(*) > 1` proves the grouping-key conjunct moves while COUNT(*) stays above.
+class FilterThroughAggregateRule final : public MemoRule {
+public:
+    [[nodiscard]] std::string_view name() const override { return "FilterThroughAggregateRule"; }
+    [[nodiscard]] bool apply(Memo& memo, GroupId group, const MemoExpression& expression) const override;
+};
+
 // Pattern matched: Join(A, B, predicates) in an arbitrary-order, identity-addressed memo context.
 // Replacement expression: Join(B, A, predicates).
 // Semantic equivalence argument: Inner join is symmetric under SQL bag semantics: each matching
