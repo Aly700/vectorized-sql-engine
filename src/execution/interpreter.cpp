@@ -188,6 +188,7 @@ std::optional<catalog::TableSchema> Catalog::find_table_schema(const std::string
 
     catalog::TableSchema schema;
     schema.name = it->first;
+    schema.row_count = it->second.row_count();
     for (const auto& column_name : it->second.column_names()) {
         schema.columns.push_back(catalog::ColumnSchema{column_name, catalog::ColumnType::Int64});
     }

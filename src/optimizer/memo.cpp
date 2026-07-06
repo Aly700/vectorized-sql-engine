@@ -1,8 +1,12 @@
 #include "optimizer/memo.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <functional>
 #include <iterator>
+#include <limits>
+#include <map>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <utility>
@@ -221,6 +225,377 @@ MemoExpression group_ref_expression(GroupId representative,
     return expression;
 }
 
+// Deterministic logical costing constants. The estimator is intentionally simple:
+// scans use exact catalog row counts; filters multiply input rows by one fixed
+// selectivity per comparison kind; equi-joins use
+// |L| * |R| / max(distinct(left_key), distinct(right_key)); non-equi joins use
+// the cross product. Distinct counts are heuristics derived from row counts:
+// scan columns start with distinct=row_count and later operators clamp them to
+// the estimated output rows. Estimates are clamped to finite non-negative
+// values; winner ties use exact double equality and lower expression index.
+constexpr double kMaxEstimate = 1.0e100;
+constexpr double kEqualitySelectivity = 0.10;
+constexpr double kNotEqualSelectivity = 0.90;
+constexpr double kInequalitySelectivity = 1.0 / 3.0;
+
+struct RelationEstimate {
+    double rows{0.0};
+    double cost{0.0};
+    std::map<std::string, double> distinct_by_column;
+    plan::LogicalPlan plan;
+};
+
+struct EquiJoinKeyEstimate {
+    std::string left_key;
+    std::string right_key;
+    double left_distinct{0.0};
+    double right_distinct{0.0};
+};
+
+double clamp_estimate(double value) {
+    if (std::isnan(value) || value <= 0.0) {
+        return 0.0;
+    }
+    if (!std::isfinite(value) || value > kMaxEstimate) {
+        return kMaxEstimate;
+    }
+    return value;
+}
+
+double safe_add(double left, double right) {
+    return clamp_estimate(left + right);
+}
+
+double safe_multiply(double left, double right) {
+    if (left <= 0.0 || right <= 0.0) {
+        return 0.0;
+    }
+    if (left > kMaxEstimate / right) {
+        return kMaxEstimate;
+    }
+    return clamp_estimate(left * right);
+}
+
+double safe_divide(double numerator, double denominator) {
+    if (numerator <= 0.0) {
+        return 0.0;
+    }
+    if (denominator <= 0.0) {
+        return kMaxEstimate;
+    }
+    return clamp_estimate(numerator / denominator);
+}
+
+catalog::TableSchema require_costed_table_schema(const std::string& table, const catalog::Catalog& catalog) {
+    auto schema = catalog.find_table_schema(table);
+    if (!schema.has_value()) {
+        throw std::invalid_argument("missing schema for costed table '" + table + "'");
+    }
+    if (!schema->row_count.has_value()) {
+        throw std::invalid_argument("missing row-count statistics for costed table '" + table + "'");
+    }
+    return std::move(*schema);
+}
+
+std::string column_key(const std::string& table, const std::string& column) {
+    return table + "." + column;
+}
+
+std::string column_key(const plan::BoundColumnRef& column) {
+    return column_key(column.table, column.column);
+}
+
+std::optional<std::int64_t> literal_value(const plan::BoundScalarExpr& expression) {
+    if (const auto* literal = std::get_if<sql::IntLiteral>(&expression)) {
+        return literal->value;
+    }
+    return std::nullopt;
+}
+
+bool compare_values(std::int64_t left, sql::ComparisonOp op, std::int64_t right) {
+    switch (op) {
+    case sql::ComparisonOp::Equal:
+        return left == right;
+    case sql::ComparisonOp::NotEqual:
+        return left != right;
+    case sql::ComparisonOp::Less:
+        return left < right;
+    case sql::ComparisonOp::LessEqual:
+        return left <= right;
+    case sql::ComparisonOp::Greater:
+        return left > right;
+    case sql::ComparisonOp::GreaterEqual:
+        return left >= right;
+    }
+    throw std::logic_error("unreachable comparison operator");
+}
+
+double comparison_selectivity(const plan::BoundComparisonExpr& predicate) {
+    const auto left_literal = literal_value(predicate.left);
+    const auto right_literal = literal_value(predicate.right);
+    if (left_literal.has_value() && right_literal.has_value()) {
+        return compare_values(*left_literal, predicate.op, *right_literal) ? 1.0 : 0.0;
+    }
+
+    switch (predicate.op) {
+    case sql::ComparisonOp::Equal:
+        return kEqualitySelectivity;
+    case sql::ComparisonOp::NotEqual:
+        return kNotEqualSelectivity;
+    case sql::ComparisonOp::Less:
+    case sql::ComparisonOp::LessEqual:
+    case sql::ComparisonOp::Greater:
+    case sql::ComparisonOp::GreaterEqual:
+        return kInequalitySelectivity;
+    }
+    throw std::logic_error("unreachable comparison operator");
+}
+
+double combined_selectivity(const std::vector<plan::BoundComparisonExpr>& predicates,
+                            std::optional<std::size_t> skipped_predicate = std::nullopt) {
+    double selectivity = 1.0;
+    for (std::size_t i = 0; i < predicates.size(); ++i) {
+        if (skipped_predicate.has_value() && *skipped_predicate == i) {
+            continue;
+        }
+        selectivity = safe_multiply(selectivity, comparison_selectivity(predicates[i]));
+    }
+    return selectivity;
+}
+
+double distinct_for(const RelationEstimate& estimate, const plan::BoundColumnRef& column) {
+    const auto it = estimate.distinct_by_column.find(column_key(column));
+    if (it == estimate.distinct_by_column.end()) {
+        throw std::logic_error("cost model could not find a distinct estimate for column '" + column_key(column) + "'");
+    }
+    return it->second;
+}
+
+std::optional<EquiJoinKeyEstimate> usable_equi_join_key(const plan::BoundComparisonExpr& predicate,
+                                                        const RelationEstimate& left,
+                                                        const RelationEstimate& right) {
+    if (predicate.op != sql::ComparisonOp::Equal) {
+        return std::nullopt;
+    }
+
+    const auto* left_column = std::get_if<plan::BoundColumnRef>(&predicate.left);
+    const auto* right_column = std::get_if<plan::BoundColumnRef>(&predicate.right);
+    if (left_column == nullptr || right_column == nullptr) {
+        return std::nullopt;
+    }
+
+    const auto left_key = column_key(*left_column);
+    const auto right_key = column_key(*right_column);
+    const auto left_has_left = left.distinct_by_column.contains(left_key);
+    const auto left_has_right = left.distinct_by_column.contains(right_key);
+    const auto right_has_left = right.distinct_by_column.contains(left_key);
+    const auto right_has_right = right.distinct_by_column.contains(right_key);
+
+    if (left_has_left && right_has_right) {
+        return EquiJoinKeyEstimate{left_key, right_key, distinct_for(left, *left_column), distinct_for(right, *right_column)};
+    }
+    if (left_has_right && right_has_left) {
+        return EquiJoinKeyEstimate{right_key, left_key, distinct_for(left, *right_column), distinct_for(right, *left_column)};
+    }
+    return std::nullopt;
+}
+
+RelationEstimate scan_estimate(const std::string& table,
+                               plan::OrderPermission order_permission,
+                               const catalog::Catalog& catalog) {
+    const auto schema = require_costed_table_schema(table, catalog);
+    RelationEstimate estimate;
+    estimate.rows = clamp_estimate(static_cast<double>(*schema.row_count));
+    estimate.cost = estimate.rows;
+    for (const auto& column : schema.columns) {
+        estimate.distinct_by_column[column_key(schema.name, column.name)] = estimate.rows <= 0.0 ? 0.0 : estimate.rows;
+    }
+    estimate.plan = plan::LogicalPlan::scan(table);
+    estimate.plan.order_permission = order_permission;
+    return estimate;
+}
+
+RelationEstimate filter_estimate(const std::vector<plan::BoundComparisonExpr>& predicates,
+                                 RelationEstimate child,
+                                 plan::OrderPermission order_permission) {
+    const auto selectivity = combined_selectivity(predicates);
+    RelationEstimate estimate;
+    estimate.rows = safe_multiply(child.rows, selectivity);
+    // Filter cost is one linear predicate pass over its input, plus child cost.
+    estimate.cost = safe_add(child.cost, child.rows);
+    for (const auto& [column, distinct] : child.distinct_by_column) {
+        estimate.distinct_by_column[column] = std::min(safe_multiply(distinct, selectivity), estimate.rows);
+    }
+    estimate.plan = plan::LogicalPlan::filter(predicates, std::move(child.plan));
+    estimate.plan.order_permission = order_permission;
+    return estimate;
+}
+
+RelationEstimate project_estimate(const std::vector<plan::Projection>& projections,
+                                  RelationEstimate child,
+                                  plan::OrderPermission order_permission) {
+    RelationEstimate estimate;
+    estimate.rows = child.rows;
+    // Project is cost-neutral for join-order choice in this logical slice.
+    estimate.cost = child.cost;
+    for (const auto& projection : projections) {
+        if (const auto* column = std::get_if<plan::BoundColumnRef>(&projection.expression)) {
+            const auto key = column_key(*column);
+            const auto it = child.distinct_by_column.find(key);
+            if (it != child.distinct_by_column.end()) {
+                estimate.distinct_by_column[key] = std::min(it->second, estimate.rows);
+            }
+        }
+    }
+    estimate.plan = plan::LogicalPlan::project(projections, std::move(child.plan));
+    estimate.plan.order_permission = order_permission;
+    return estimate;
+}
+
+RelationEstimate join_estimate(const std::vector<plan::BoundComparisonExpr>& predicates,
+                               RelationEstimate left,
+                               RelationEstimate right,
+                               plan::OrderPermission order_permission) {
+    std::optional<EquiJoinKeyEstimate> equi_key;
+    std::optional<std::size_t> equi_predicate_index;
+    for (std::size_t i = 0; i < predicates.size(); ++i) {
+        equi_key = usable_equi_join_key(predicates[i], left, right);
+        if (equi_key.has_value()) {
+            equi_predicate_index = i;
+            break;
+        }
+    }
+
+    const auto cross_rows = safe_multiply(left.rows, right.rows);
+    const auto base_rows = equi_key.has_value()
+                               ? safe_divide(cross_rows, std::max({1.0, equi_key->left_distinct, equi_key->right_distinct}))
+                               : cross_rows;
+    const auto residual_selectivity = combined_selectivity(predicates, equi_predicate_index);
+
+    RelationEstimate estimate;
+    estimate.rows = safe_multiply(base_rows, residual_selectivity);
+    // Equi-join cost models a linear hash build+probe; without an equi key the
+    // logical alternative is costed as nested-loop work over every pair.
+    const auto local_cost = equi_key.has_value() ? safe_add(left.rows, right.rows) : cross_rows;
+    estimate.cost = safe_add(safe_add(left.cost, right.cost), local_cost);
+    estimate.distinct_by_column = left.distinct_by_column;
+    estimate.distinct_by_column.insert(right.distinct_by_column.begin(), right.distinct_by_column.end());
+    for (auto& [_, distinct] : estimate.distinct_by_column) {
+        distinct = std::min(distinct, estimate.rows);
+    }
+    if (equi_key.has_value()) {
+        const auto joined_distinct = std::min({equi_key->left_distinct, equi_key->right_distinct, estimate.rows});
+        estimate.distinct_by_column[equi_key->left_key] = joined_distinct;
+        estimate.distinct_by_column[equi_key->right_key] = joined_distinct;
+    }
+
+    estimate.plan = plan::LogicalPlan::join(predicates, std::move(left.plan), std::move(right.plan));
+    estimate.plan.order_permission = order_permission;
+    return estimate;
+}
+
+RelationEstimate estimate_logical_relation(const plan::LogicalPlan& logical, const catalog::Catalog& catalog) {
+    switch (logical.kind) {
+    case plan::LogicalKind::Scan:
+        return scan_estimate(logical.table, logical.order_permission, catalog);
+    case plan::LogicalKind::Filter:
+        return filter_estimate(logical.predicates,
+                               estimate_logical_relation(require_input(logical), catalog),
+                               logical.order_permission);
+    case plan::LogicalKind::Project:
+        return project_estimate(logical.projections,
+                                estimate_logical_relation(require_input(logical), catalog),
+                                logical.order_permission);
+    case plan::LogicalKind::Join:
+        return join_estimate(logical.predicates,
+                             estimate_logical_relation(require_left(logical), catalog),
+                             estimate_logical_relation(require_right(logical), catalog),
+                             logical.order_permission);
+    }
+    throw std::logic_error("unreachable logical plan kind");
+}
+
+struct Winner {
+    RelationEstimate estimate;
+    std::size_t expression_index{0};
+};
+
+bool is_better_winner(const Winner& candidate, const Winner& incumbent) {
+    if (candidate.estimate.cost < incumbent.estimate.cost) {
+        return true;
+    }
+    if (candidate.estimate.cost > incumbent.estimate.cost) {
+        return false;
+    }
+    return candidate.expression_index < incumbent.expression_index;
+}
+
+class BestExtractor {
+public:
+    BestExtractor(const Memo& memo, const catalog::Catalog& catalog)
+        : memo_(memo), catalog_(catalog), winners_(memo.group_count() + 1) {}
+
+    [[nodiscard]] RelationEstimate extract(GroupId id) {
+        std::vector<GroupId> stack;
+        return best_for_group(id, stack).estimate;
+    }
+
+private:
+    [[nodiscard]] Winner best_for_group(GroupId id, std::vector<GroupId>& stack) {
+        id = memo_.representative(id);
+        if (winners_.at(static_cast<std::size_t>(id)).has_value()) {
+            return *winners_.at(static_cast<std::size_t>(id));
+        }
+        if (std::find(stack.begin(), stack.end(), id) != stack.end()) {
+            throw std::logic_error("memo best extraction encountered a cycle");
+        }
+
+        stack.push_back(id);
+        const auto& memo_group = memo_.group(id);
+        std::optional<Winner> best;
+        for (std::size_t i = 0; i < memo_group.expressions.size(); ++i) {
+            Winner candidate{estimate_expression(memo_group.expressions[i].expression, stack), i};
+            if (!best.has_value() || is_better_winner(candidate, *best)) {
+                best = std::move(candidate);
+            }
+        }
+        stack.pop_back();
+
+        if (!best.has_value()) {
+            throw std::logic_error("memo best extraction found an empty group");
+        }
+        winners_.at(static_cast<std::size_t>(id)) = *best;
+        return *best;
+    }
+
+    [[nodiscard]] RelationEstimate estimate_expression(const MemoExpression& expression, std::vector<GroupId>& stack) {
+        switch (expression.kind) {
+        case MemoExpressionKind::Scan:
+            return scan_estimate(expression.table, expression.order_permission, catalog_);
+        case MemoExpressionKind::Filter:
+            return filter_estimate(expression.predicates,
+                                   best_for_group(expression.children.at(0), stack).estimate,
+                                   expression.order_permission);
+        case MemoExpressionKind::Project:
+            return project_estimate(expression.projections,
+                                    best_for_group(expression.children.at(0), stack).estimate,
+                                    expression.order_permission);
+        case MemoExpressionKind::Join:
+            return join_estimate(expression.predicates,
+                                 best_for_group(expression.children.at(0), stack).estimate,
+                                 best_for_group(expression.children.at(1), stack).estimate,
+                                 expression.order_permission);
+        case MemoExpressionKind::GroupRef:
+            return best_for_group(expression.children.at(0), stack).estimate;
+        }
+        throw std::logic_error("unreachable memo expression kind");
+    }
+
+    const Memo& memo_;
+    const catalog::Catalog& catalog_;
+    std::vector<std::optional<Winner>> winners_;
+};
+
 } // namespace
 
 GroupId Memo::insert(const plan::LogicalPlan& logical) {
@@ -312,6 +687,12 @@ plan::LogicalPlan Memo::extract(GroupId id) const {
     assert_invariants();
     std::vector<GroupId> stack;
     return extract(id, stack);
+}
+
+plan::LogicalPlan Memo::extract_best(GroupId id, const catalog::Catalog& catalog) const {
+    assert_invariants();
+    BestExtractor extractor(*this, catalog);
+    return extractor.extract(id).plan;
 }
 
 AlternativeExtractionResult Memo::extract_alternatives(GroupId id, AlternativeExtractionOptions options) const {
@@ -854,6 +1235,11 @@ std::vector<plan::LogicalPlan> Memo::extract_alternatives_for_expression(
     }
     }
     throw std::logic_error("unreachable memo expression kind");
+}
+
+CostEstimate estimate_cost(const plan::LogicalPlan& logical, const catalog::Catalog& catalog) {
+    const auto estimate = estimate_logical_relation(logical, catalog);
+    return CostEstimate{estimate.rows, estimate.cost};
 }
 
 } // namespace optimizer

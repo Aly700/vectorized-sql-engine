@@ -1,5 +1,6 @@
 #pragma once
 
+#include "catalog/catalog.hpp"
 #include "plan/logical_plan.hpp"
 
 #include <cstdint>
@@ -45,6 +46,11 @@ struct AlternativeExtractionResult {
     bool hit_plan_bound{false};
 };
 
+struct CostEstimate {
+    double rows{0.0};
+    double cost{0.0};
+};
+
 class Memo {
 public:
     [[nodiscard]] GroupId insert(const plan::LogicalPlan& logical);
@@ -58,6 +64,7 @@ public:
     [[nodiscard]] GroupId representative(GroupId id) const;
 
     [[nodiscard]] plan::LogicalPlan extract(GroupId id) const;
+    [[nodiscard]] plan::LogicalPlan extract_best(GroupId id, const catalog::Catalog& catalog) const;
     [[nodiscard]] AlternativeExtractionResult extract_alternatives(
         GroupId id,
         AlternativeExtractionOptions options = {}) const;
@@ -102,5 +109,7 @@ private:
     std::vector<GroupId> representatives_{0};
     std::unordered_map<std::size_t, std::vector<std::pair<MemoExpression, GroupId>>> expression_index_;
 };
+
+[[nodiscard]] CostEstimate estimate_cost(const plan::LogicalPlan& logical, const catalog::Catalog& catalog);
 
 } // namespace optimizer
