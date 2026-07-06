@@ -142,6 +142,7 @@ struct JoinClause {
 };
 
 struct SelectQuery {
+    bool distinct{false};
     std::vector<SelectItem> projection;
     std::string table;
     std::size_t table_position{0};
@@ -152,6 +153,7 @@ struct SelectQuery {
     std::vector<ColumnRef> group_by;
     std::optional<HavingClause> having;
     std::vector<OrderByKey> order_by;
+    std::optional<std::size_t> limit;
 };
 
 SelectQuery parse_select(const std::string& sql);

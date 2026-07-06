@@ -68,7 +68,7 @@ bool is_reserved_keyword(std::string_view text) {
            equals_keyword(text, "ORDER") || equals_keyword(text, "BY") || equals_keyword(text, "ASC") ||
            equals_keyword(text, "DESC") || equals_keyword(text, "GROUP") || equals_keyword(text, "COUNT") ||
            equals_keyword(text, "SUM") || equals_keyword(text, "MIN") || equals_keyword(text, "MAX") ||
-           equals_keyword(text, "HAVING");
+           equals_keyword(text, "HAVING") || equals_keyword(text, "DISTINCT") || equals_keyword(text, "LIMIT");
 }
 
 class Lexer {
@@ -155,6 +155,10 @@ public:
         expect_keyword("SELECT", "expected SELECT");
 
         SelectQuery query;
+        if (is_keyword("DISTINCT")) {
+            query.distinct = true;
+            advance();
+        }
         query.projection = parse_projection();
 
         expect_keyword("FROM", "expected FROM after projection list");
@@ -179,6 +183,10 @@ public:
 
         if (is_keyword("ORDER")) {
             query.order_by = parse_order_by();
+        }
+
+        if (is_keyword("LIMIT")) {
+            query.limit = parse_limit();
         }
 
         if (current_.kind == TokenKind::Semicolon) {
@@ -300,6 +308,26 @@ private:
             keys.push_back(parse_order_by_key());
         }
         return keys;
+    }
+
+    std::size_t parse_limit() {
+        expect_keyword("LIMIT", "expected LIMIT");
+        if (current_.kind != TokenKind::Integer) {
+            throw ParseError(current_.position, "expected non-negative integer after LIMIT");
+        }
+        if (!current_.text.empty() && current_.text.front() == '-') {
+            throw ParseError(current_.position, "LIMIT must be a non-negative integer");
+        }
+
+        std::size_t value = 0;
+        const auto* begin = current_.text.data();
+        const auto* end = current_.text.data() + current_.text.size();
+        const auto [ptr, ec] = std::from_chars(begin, end, value);
+        if (ec == std::errc::result_out_of_range || ptr != end) {
+            throw ParseError(current_.position, "LIMIT literal out of range");
+        }
+        advance();
+        return value;
     }
 
     std::vector<ColumnRef> parse_group_by() {

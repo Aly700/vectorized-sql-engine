@@ -246,6 +246,23 @@ void assert_select_aliases_name_projected_aggregate_outputs() {
     assert(printed.find("Aggregate[group_keys=[col(t.a)], aggregates=[SUM(b)=col(t.b)]]") != std::string::npos);
 }
 
+void assert_distinct_and_limit_bind_above_project_below_sort() {
+    auto catalog = make_schema_catalog();
+    const auto logical =
+        sql::bind_select(sql::parse_select("SELECT DISTINCT a FROM t ORDER BY a DESC LIMIT 2"), catalog);
+
+    const auto printed = plan::to_string(logical);
+    const auto expected =
+        std::string("Limit[2]\n") +
+        "  Sort[col(a) DESC]\n"
+        "    Distinct\n"
+        "      Project[a=col(t.a)]\n"
+        "        Scan[t]";
+    if (printed != expected) {
+        throw std::logic_error("DISTINCT/LIMIT plan shape mismatch:\n" + printed);
+    }
+}
+
 void assert_ungrouped_aggregate_binds_single_global_group() {
     auto catalog = make_schema_catalog();
     const auto logical = sql::bind_select(sql::parse_select("SELECT COUNT(*), MIN(t.b), MAX(t.b) FROM t"), catalog);
@@ -417,6 +434,7 @@ int main() {
     assert_boolean_tree_predicates_bind_and_split_top_level_and();
     assert_having_boolean_tree_binds_group_keys_and_aggregate_outputs();
     assert_select_aliases_name_projected_aggregate_outputs();
+    assert_distinct_and_limit_bind_above_project_below_sort();
     assert_ungrouped_aggregate_binds_single_global_group();
     assert_non_grouped_projection_column_is_rejected();
     assert_nested_aggregate_is_rejected();

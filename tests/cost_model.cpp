@@ -291,6 +291,23 @@ void assert_aggregate_cost_uses_group_count() {
     }
 }
 
+void assert_distinct_and_limit_costs_use_output_count_without_new_semantics() {
+    const auto catalog = make_skewed_catalog();
+
+    const auto sql = "SELECT DISTINCT k FROM big LIMIT 7";
+    const auto logical = sql::bind_select(sql::parse_select(sql), catalog);
+    const auto estimate = optimizer::estimate_cost(logical, catalog);
+    if (estimate.rows != 7.0 || estimate.cost != 3000.0) {
+        std::cerr << "DISTINCT/LIMIT cost did not use group-ish rows and pass-through limit cost\n"
+                  << "sql: " << sql << "\n"
+                  << "plan:\n"
+                  << plan::to_string(logical) << "\n"
+                  << "rows: " << estimate.rows << "\n"
+                  << "cost: " << estimate.cost << "\n";
+        std::terminate();
+    }
+}
+
 void assert_group_by_does_not_block_join_transforms() {
     const auto catalog = make_skewed_catalog();
     const auto sql =
@@ -319,6 +336,47 @@ void assert_group_by_does_not_block_join_transforms() {
     if (alternatives.plans.size() <= 1 || alternatives.hit_expression_bound || alternatives.hit_plan_bound ||
         plan::to_string(best) != expected_best || plan::to_string(best) == plan::to_string(logical)) {
         std::cerr << "GROUP BY blocked join alternatives below Aggregate\n"
+                  << "sql: " << sql << "\n"
+                  << "alternative count: " << alternatives.plans.size() << "\n"
+                  << "ingested plan:\n"
+                  << plan::to_string(logical) << "\n"
+                  << "best plan:\n"
+                  << plan::to_string(best) << "\n"
+                  << "memo dump:\n"
+                  << memo.dump();
+        std::terminate();
+    }
+}
+
+void assert_distinct_limit_do_not_block_join_transforms() {
+    const auto catalog = make_skewed_catalog();
+    const auto sql =
+        "SELECT DISTINCT big.k FROM big JOIN mid ON big.k = mid.k JOIN tiny ON mid.k = tiny.k LIMIT 5";
+    const auto logical = sql::bind_select(sql::parse_select(sql), catalog);
+
+    optimizer::GroupId root = 0;
+    auto memo = explored_memo_for(logical, root);
+    const auto alternatives = memo.extract_alternatives(root, optimizer::AlternativeExtractionOptions{64, 512});
+    const auto best = memo.extract_best(root, catalog);
+
+    const auto expected_best =
+        std::string("Limit[5]\n") +
+        "  Distinct\n"
+        "    Project[big.k=col(big.k)]\n"
+        "      Join[col(big.k) = col(mid.k)]\n"
+        "        Scan[big]\n"
+        "        Join[col(mid.k) = col(tiny.k)]\n"
+        "          Scan[mid]\n"
+        "          Scan[tiny]";
+
+    std::cout << "distinct-limit multi-join alternatives verified: alternatives=" << alternatives.plans.size()
+              << " max_group_expressions=" << alternatives.max_group_expression_count
+              << " hit_expression_bound=" << (alternatives.hit_expression_bound ? "yes" : "no")
+              << " hit_plan_bound=" << (alternatives.hit_plan_bound ? "yes" : "no") << "\n";
+
+    if (alternatives.plans.size() <= 1 || alternatives.hit_expression_bound || alternatives.hit_plan_bound ||
+        plan::to_string(best) != expected_best || plan::to_string(best) == plan::to_string(logical)) {
+        std::cerr << "DISTINCT/LIMIT blocked join alternatives below result shaping\n"
                   << "sql: " << sql << "\n"
                   << "alternative count: " << alternatives.plans.size() << "\n"
                   << "ingested plan:\n"
@@ -495,7 +553,9 @@ int main() {
     assert_equal_stats_tie_is_deterministic();
     assert_aliased_self_join_costs_physical_table_stats();
     assert_aggregate_cost_uses_group_count();
+    assert_distinct_and_limit_costs_use_output_count_without_new_semantics();
     assert_group_by_does_not_block_join_transforms();
+    assert_distinct_limit_do_not_block_join_transforms();
     assert_having_costs_as_filter_over_aggregate();
     assert_or_selectivity_uses_inclusion_exclusion();
     assert_having_does_not_block_join_transforms();

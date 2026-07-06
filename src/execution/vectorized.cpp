@@ -8,6 +8,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -493,7 +494,9 @@ BatchView execute_filter(const plan::PhysicalPlan& plan, const Catalog& catalog)
 BatchView execute_join(const plan::PhysicalPlan& plan, const Catalog& catalog);
 BatchView execute_project(const plan::PhysicalPlan& plan, const Catalog& catalog);
 BatchView execute_aggregate(const plan::PhysicalPlan& plan, const Catalog& catalog);
+BatchView execute_distinct(const plan::PhysicalPlan& plan, const Catalog& catalog);
 BatchView execute_sort(const plan::PhysicalPlan& plan, const Catalog& catalog);
+BatchView execute_limit(const plan::PhysicalPlan& plan, const Catalog& catalog);
 
 BatchView execute_to_view(const plan::PhysicalPlan& plan, const Catalog& catalog) {
     switch (plan.kind) {
@@ -507,8 +510,12 @@ BatchView execute_to_view(const plan::PhysicalPlan& plan, const Catalog& catalog
         return execute_project(plan, catalog);
     case plan::PhysicalKind::Aggregate:
         return execute_aggregate(plan, catalog);
+    case plan::PhysicalKind::Distinct:
+        return execute_distinct(plan, catalog);
     case plan::PhysicalKind::Sort:
         return execute_sort(plan, catalog);
+    case plan::PhysicalKind::Limit:
+        return execute_limit(plan, catalog);
     }
     throw std::logic_error("unreachable physical plan kind");
 }
@@ -656,6 +663,15 @@ SelectionVectorPtr sort_selection(const std::vector<plan::SortKey>& sort_keys, c
     return make_selection(std::move(rows));
 }
 
+HashKey make_output_row_key(const storage::ColumnarBatch& batch, std::size_t row) {
+    HashKey key;
+    key.values.reserve(batch.column_names().size());
+    for (const auto& name : batch.column_names()) {
+        key.values.push_back(batch.column(name).at(row));
+    }
+    return key;
+}
+
 BatchView execute_project(const plan::PhysicalPlan& plan, const Catalog& catalog) {
     auto input = execute_to_view(require_input(plan), catalog);
     auto materialized = std::make_shared<const storage::ColumnarBatch>(materialize_projection(plan, input));
@@ -729,6 +745,26 @@ BatchView execute_aggregate(const plan::PhysicalPlan& plan, const Catalog& catal
     return view;
 }
 
+BatchView execute_distinct(const plan::PhysicalPlan& plan, const Catalog& catalog) {
+    auto input = execute_to_view(require_input(plan), catalog);
+    validate_view(input);
+
+    std::unordered_set<HashKey, HashKeyHash> seen;
+    SelectionVector rows;
+    rows.reserve(input.selection->size());
+    for (auto row : *input.selection) {
+        auto key = make_output_row_key(*input.batch, row);
+        const auto [_, inserted] = seen.emplace(std::move(key));
+        if (inserted) {
+            rows.push_back(row);
+        }
+    }
+
+    input.selection = make_selection(std::move(rows));
+    validate_view(input);
+    return input;
+}
+
 BatchView execute_sort(const plan::PhysicalPlan& plan, const Catalog& catalog) {
     const auto& input_plan = require_input(plan);
     if (input_plan.kind == plan::PhysicalKind::Project) {
@@ -755,6 +791,22 @@ BatchView execute_sort(const plan::PhysicalPlan& plan, const Catalog& catalog) {
 
     auto input = execute_to_view(input_plan, catalog);
     input.selection = sort_selection(plan.sort_keys, input);
+    validate_view(input);
+    return input;
+}
+
+BatchView execute_limit(const plan::PhysicalPlan& plan, const Catalog& catalog) {
+    auto input = execute_to_view(require_input(plan), catalog);
+    validate_view(input);
+
+    const auto count = std::min(plan.limit_count, input.selection->size());
+    SelectionVector rows;
+    rows.reserve(count);
+    for (std::size_t i = 0; i < count; ++i) {
+        rows.push_back(input.selection->at(i));
+    }
+
+    input.selection = make_selection(std::move(rows));
     validate_view(input);
     return input;
 }

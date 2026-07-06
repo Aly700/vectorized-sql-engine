@@ -44,8 +44,12 @@ PhysicalPlan lower_to_physical(const LogicalPlan& logical) {
         return PhysicalPlan::aggregate(logical.group_keys,
                                        logical.aggregate_expressions,
                                        lower_to_physical(require_input(logical)));
+    case LogicalKind::Distinct:
+        return PhysicalPlan::distinct(lower_to_physical(require_input(logical)));
     case LogicalKind::Sort:
         return PhysicalPlan::sort(logical.sort_keys, lower_to_physical(require_input(logical)));
+    case LogicalKind::Limit:
+        return PhysicalPlan::limit(logical.limit_count, lower_to_physical(require_input(logical)));
     }
     throw std::logic_error("unreachable logical plan kind");
 }

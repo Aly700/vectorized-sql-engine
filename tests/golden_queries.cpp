@@ -58,6 +58,19 @@ execution::Catalog make_catalog() {
     execution::Catalog catalog;
     catalog.add_table("t", batch);
 
+    storage::Int64Column dup_k;
+    for (auto value : {1, 1, 2, 1, 2}) {
+        dup_k.append(value);
+    }
+    storage::Int64Column dup_v;
+    for (auto value : {10, 10, 20, 11, 20}) {
+        dup_v.append(value);
+    }
+    storage::ColumnarBatch dup;
+    dup.add_column("k", std::move(dup_k));
+    dup.add_column("v", std::move(dup_v));
+    catalog.add_table("dup", std::move(dup));
+
     storage::Int64Column t1_a;
     for (auto value : {1, 2, 2}) {
         t1_a.append(value);
@@ -378,6 +391,71 @@ int main() {
             ExpectedResult{{"b", "COUNT(*)"}, {{10, 1}, {20, 2}}},
         },
         GoldenQuery{
+            "distinct deduplicates projected rows in first appearance order",
+            "SELECT DISTINCT k, v FROM dup",
+            ExpectedResult{{"k", "v"}, {{1, 10}, {2, 20}, {1, 11}}},
+        },
+        GoldenQuery{
+            "distinct applies to complete output row not individual columns",
+            "SELECT DISTINCT k FROM dup",
+            ExpectedResult{{"k"}, {{1}, {2}}},
+        },
+        GoldenQuery{
+            "distinct join output collapses multiplied matches",
+            "SELECT DISTINCT t1.a FROM t1 JOIN t2 ON t1.a = t2.a",
+            ExpectedResult{{"t1.a"}, {{2}}},
+        },
+        GoldenQuery{
+            "distinct may deduplicate aggregate output rows after group by",
+            "SELECT DISTINCT COUNT(*) FROM t GROUP BY b",
+            ExpectedResult{{"COUNT(*)"}, {{1}, {2}}},
+        },
+        GoldenQuery{
+            "distinct over global aggregate is legal and single row",
+            "SELECT DISTINCT COUNT(*) FROM t",
+            ExpectedResult{{"COUNT(*)"}, {{4}}},
+        },
+        GoldenQuery{
+            "distinct sorts after dedup and keeps tie order stable",
+            "SELECT DISTINCT k, v FROM dup ORDER BY k DESC",
+            ExpectedResult{{"k", "v"}, {{2, 20}, {1, 10}, {1, 11}}},
+        },
+        GoldenQuery{
+            "limit zero returns schema with no rows",
+            "SELECT a FROM t LIMIT 0",
+            ExpectedResult{{"a"}, {}},
+        },
+        GoldenQuery{
+            "limit one takes first row",
+            "SELECT a FROM t LIMIT 1",
+            ExpectedResult{{"a"}, {{1}}},
+        },
+        GoldenQuery{
+            "limit equal to count returns every row",
+            "SELECT a FROM t LIMIT 4",
+            ExpectedResult{{"a"}, {{1}, {2}, {3}, {4}}},
+        },
+        GoldenQuery{
+            "limit greater than count returns every row",
+            "SELECT a FROM t LIMIT 99",
+            ExpectedResult{{"a"}, {{1}, {2}, {3}, {4}}},
+        },
+        GoldenQuery{
+            "limit applies after order by",
+            "SELECT a FROM t ORDER BY b DESC LIMIT 2",
+            ExpectedResult{{"a"}, {{4}, {2}}},
+        },
+        GoldenQuery{
+            "limit applies after join row order",
+            "SELECT t1.b, t2.c FROM t1 JOIN t2 ON t1.a = t2.a LIMIT 3",
+            ExpectedResult{{"t1.b", "t2.c"}, {{20, 200}, {20, 201}, {30, 200}}},
+        },
+        GoldenQuery{
+            "distinct limit combination shapes after dedup and sort",
+            "SELECT DISTINCT b FROM t ORDER BY b ASC LIMIT 2",
+            ExpectedResult{{"b"}, {{10}, {20}}},
+        },
+        GoldenQuery{
             "global count over empty input returns zero",
             "SELECT COUNT(*) FROM empty",
             ExpectedResult{{"COUNT(*)"}, {{0}}},
@@ -582,6 +660,20 @@ int main() {
             ExpectedResult{},
             true,
             ExpectedError{ErrorKind::Bind, 25, "unknown column 'missing' in table 't'"},
+        },
+        GoldenQuery{
+            "negative LIMIT is rejected at literal position",
+            "SELECT a FROM t LIMIT -1",
+            ExpectedResult{},
+            true,
+            ExpectedError{ErrorKind::Parse, 22, "LIMIT must be a non-negative integer"},
+        },
+        GoldenQuery{
+            "non-integer LIMIT is rejected at token position",
+            "SELECT a FROM t LIMIT nope",
+            ExpectedResult{},
+            true,
+            ExpectedError{ErrorKind::Parse, 22, "expected non-negative integer after LIMIT"},
         },
     };
 
