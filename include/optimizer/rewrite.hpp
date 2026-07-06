@@ -1,5 +1,6 @@
 #pragma once
 
+#include "optimizer/memo.hpp"
 #include "plan/logical_plan.hpp"
 
 #include <cstddef>
@@ -23,6 +24,14 @@ public:
     [[nodiscard]] virtual std::optional<plan::LogicalPlan> apply(const plan::LogicalPlan& logical) const = 0;
 };
 
+class MemoRule {
+public:
+    virtual ~MemoRule() = default;
+
+    [[nodiscard]] virtual std::string_view name() const = 0;
+    [[nodiscard]] virtual bool apply(Memo& memo, GroupId group, const MemoExpression& expression) const = 0;
+};
+
 struct RewriteOptions {
     std::size_t max_passes{32};
 };
@@ -31,6 +40,16 @@ struct RewriteResult {
     plan::LogicalPlan plan;
     RewriteTrace trace;
     std::size_t passes{0};
+    bool reached_fixpoint{false};
+};
+
+struct MemoExploreOptions {
+    std::size_t max_iterations{32};
+};
+
+struct MemoExploreResult {
+    std::vector<std::string> fired_rules;
+    std::size_t iterations{0};
     bool reached_fixpoint{false};
 };
 
@@ -46,10 +65,11 @@ struct RewriteResult {
 // input and output ordering are preserved because the node shape and child remain unchanged.
 // Golden query: `SELECT a FROM t WHERE 2 > 1 AND a = 2` proves interpreted equality before and
 // after replacing `2 > 1` with canonical TRUE.
-class ConstantFoldComparisonRule final : public Rule {
+class ConstantFoldComparisonRule final : public Rule, public MemoRule {
 public:
     [[nodiscard]] std::string_view name() const override { return "ConstantFoldComparisonRule"; }
     [[nodiscard]] std::optional<plan::LogicalPlan> apply(const plan::LogicalPlan& logical) const override;
+    [[nodiscard]] bool apply(Memo& memo, GroupId group, const MemoExpression& expression) const override;
 };
 
 // Pattern matched: Filter whose conjunct list contains canonical TRUE (`lit(1) = lit(1)`).
@@ -64,10 +84,11 @@ public:
 // is not observable in the current slice, and surviving conjunct order is preserved.
 // Golden query: `SELECT a FROM t WHERE 2 > 1 AND a = 2` proves interpreted equality before and
 // after dropping the folded TRUE conjunct.
-class DropAlwaysTrueFilterRule final : public Rule {
+class DropAlwaysTrueFilterRule final : public Rule, public MemoRule {
 public:
     [[nodiscard]] std::string_view name() const override { return "DropAlwaysTrueFilterRule"; }
     [[nodiscard]] std::optional<plan::LogicalPlan> apply(const plan::LogicalPlan& logical) const override;
+    [[nodiscard]] bool apply(Memo& memo, GroupId group, const MemoExpression& expression) const override;
 };
 
 // Pattern matched: Filter whose conjunct list contains canonical FALSE (`lit(1) = lit(0)`).
@@ -81,10 +102,11 @@ public:
 // lost because the result has zero rows.
 // Golden query: `SELECT a FROM t WHERE a = 2 AND 2 < 1` proves interpreted equality before and
 // after replacing the filter with canonical FALSE.
-class AlwaysFalseFilterRule final : public Rule {
+class AlwaysFalseFilterRule final : public Rule, public MemoRule {
 public:
     [[nodiscard]] std::string_view name() const override { return "AlwaysFalseFilterRule"; }
     [[nodiscard]] std::optional<plan::LogicalPlan> apply(const plan::LogicalPlan& logical) const override;
+    [[nodiscard]] bool apply(Memo& memo, GroupId group, const MemoExpression& expression) const override;
 };
 
 // Pattern matched: Filter whose child is also a Filter.
@@ -99,10 +121,11 @@ public:
 // Golden query: `SELECT a FROM t WHERE a >= 2 AND b < 40` proves interpreted equality for the same
 // conjunction; the targeted ctest builds the adjacent-filter shape manually because the current
 // binder already emits a single Filter for SQL conjuncts.
-class MergeAdjacentFiltersRule final : public Rule {
+class MergeAdjacentFiltersRule final : public Rule, public MemoRule {
 public:
     [[nodiscard]] std::string_view name() const override { return "MergeAdjacentFiltersRule"; }
     [[nodiscard]] std::optional<plan::LogicalPlan> apply(const plan::LogicalPlan& logical) const override;
+    [[nodiscard]] bool apply(Memo& memo, GroupId group, const MemoExpression& expression) const override;
 };
 
 [[nodiscard]] RewriteResult rewrite_to_fixpoint(
@@ -111,5 +134,10 @@ public:
     RewriteOptions options = {});
 
 [[nodiscard]] std::vector<std::reference_wrapper<const Rule>> default_rules();
+[[nodiscard]] MemoExploreResult explore_memo_to_fixpoint(
+    Memo& memo,
+    const std::vector<std::reference_wrapper<const MemoRule>>& rules,
+    MemoExploreOptions options = {});
+[[nodiscard]] std::vector<std::reference_wrapper<const MemoRule>> default_memo_rules();
 
 } // namespace optimizer

@@ -1,5 +1,6 @@
 #include "execution/interpreter.hpp"
 #include "execution/vectorized.hpp"
+#include "optimizer/memo.hpp"
 #include "optimizer/rewrite.hpp"
 #include "plan/physical_plan.hpp"
 #include "sql/binder.hpp"
@@ -189,14 +190,14 @@ bool same_batch(const storage::ColumnarBatch& left, const storage::ColumnarBatch
     return format_batch(left) == format_batch(right);
 }
 
-std::string format_trace(const optimizer::RewriteTrace& trace) {
+std::string format_trace(const std::vector<std::string>& fired_rules) {
     std::ostringstream out;
     out << "[";
-    for (std::size_t i = 0; i < trace.fired_rules.size(); ++i) {
+    for (std::size_t i = 0; i < fired_rules.size(); ++i) {
         if (i != 0) {
             out << ",";
         }
-        out << trace.fired_rules[i];
+        out << fired_rules[i];
     }
     out << "]";
     return out.str();
@@ -205,25 +206,31 @@ std::string format_trace(const optimizer::RewriteTrace& trace) {
 bool compare_engines(const std::string& sql, const execution::Catalog& catalog, const std::string& table_text) {
     const auto parsed = sql::parse_select(sql);
     const auto logical = sql::bind_select(parsed, catalog);
-    const auto rewritten = optimizer::rewrite_to_fixpoint(logical, optimizer::default_rules());
+    optimizer::Memo memo;
+    const auto root = memo.insert(logical);
+    const auto explored = optimizer::explore_memo_to_fixpoint(memo, optimizer::default_memo_rules());
+    const auto extracted = memo.extract(root);
+
     const auto unrewritten_oracle = execution::execute_interpreted(logical, catalog);
-    const auto rewritten_oracle = execution::execute_interpreted(rewritten.plan, catalog);
-    const auto rewritten_vectorized = execution::execute_vectorized(rewritten.plan, catalog);
-    if (same_batch(unrewritten_oracle, rewritten_oracle) && same_batch(rewritten_oracle, rewritten_vectorized)) {
+    const auto memo_oracle = execution::execute_interpreted(extracted, catalog);
+    const auto memo_vectorized = execution::execute_vectorized(extracted, catalog);
+    if (same_batch(unrewritten_oracle, memo_oracle) && same_batch(unrewritten_oracle, memo_vectorized)) {
         return true;
     }
 
-    std::cerr << "rewrite/vectorized divergence\n"
+    std::cerr << "memo/vectorized divergence\n"
               << "sql: " << sql << "\n"
               << table_text << "\n"
-              << "rewrite trace: " << format_trace(rewritten.trace) << "\n"
+              << "memo trace: " << format_trace(explored.fired_rules) << "\n"
               << "before plan:\n"
               << plan::to_string(logical) << "\n"
-              << "after plan:\n"
-              << plan::to_string(rewritten.plan) << "\n"
+              << "memo dump:\n"
+              << memo.dump()
+              << "extracted plan:\n"
+              << plan::to_string(extracted) << "\n"
               << "unrewritten oracle: " << format_batch(unrewritten_oracle) << "\n"
-              << "rewritten oracle:   " << format_batch(rewritten_oracle) << "\n"
-              << "rewritten vector:   " << format_batch(rewritten_vectorized) << "\n";
+              << "memo oracle:        " << format_batch(memo_oracle) << "\n"
+              << "memo vectorized:    " << format_batch(memo_vectorized) << "\n";
     return false;
 }
 

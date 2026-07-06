@@ -29,7 +29,8 @@ int main() {
     assert(out.column("a").at(0) == 2);
 
     optimizer::Memo memo;
-    auto group = memo.insert_group(logical);
-    assert(memo.group(group).size() == 1);
+    auto group = memo.insert(logical);
+    assert(memo.group(group).expressions.size() == 1);
+    assert(plan::to_string(memo.extract(group)) == plan::to_string(logical));
     return 0;
 }
