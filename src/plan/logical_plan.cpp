@@ -68,6 +68,34 @@ std::string comparison_to_string(const BoundComparisonExpr& comparison) {
            expression_to_string(comparison.right);
 }
 
+const BoundPredicate& require_left_predicate(const BoundPredicate& predicate) {
+    if (predicate.left == nullptr) {
+        throw std::invalid_argument("bound predicate is missing its left child");
+    }
+    return *predicate.left;
+}
+
+const BoundPredicate& require_right_predicate(const BoundPredicate& predicate) {
+    if (predicate.right == nullptr) {
+        throw std::invalid_argument("bound predicate is missing its right child");
+    }
+    return *predicate.right;
+}
+
+std::string predicate_to_string(const BoundPredicate& predicate) {
+    switch (predicate.kind) {
+    case sql::PredicateKind::Comparison:
+        return comparison_to_string(predicate.comparison);
+    case sql::PredicateKind::And:
+        return "(" + predicate_to_string(require_left_predicate(predicate)) + " AND " +
+               predicate_to_string(require_right_predicate(predicate)) + ")";
+    case sql::PredicateKind::Or:
+        return "(" + predicate_to_string(require_left_predicate(predicate)) + " OR " +
+               predicate_to_string(require_right_predicate(predicate)) + ")";
+    }
+    throw std::logic_error("unreachable predicate kind");
+}
+
 std::string sort_direction_to_string(sql::SortDirection direction) {
     switch (direction) {
     case sql::SortDirection::Asc:
@@ -112,7 +140,7 @@ void append_plan(std::ostringstream& out, const LogicalPlan& logical, std::size_
             if (i != 0) {
                 out << " AND ";
             }
-            out << comparison_to_string(logical.predicates[i]);
+            out << predicate_to_string(logical.predicates[i]);
         }
         out << "]\n";
         append_plan(out, require_left(logical), depth + 1);
@@ -125,7 +153,7 @@ void append_plan(std::ostringstream& out, const LogicalPlan& logical, std::size_
             if (i != 0) {
                 out << " AND ";
             }
-            out << comparison_to_string(logical.predicates[i]);
+            out << predicate_to_string(logical.predicates[i]);
         }
         out << "]\n";
         append_plan(out, require_input(logical), depth + 1);

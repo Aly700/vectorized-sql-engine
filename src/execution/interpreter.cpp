@@ -76,19 +76,57 @@ bool evaluate_comparison(const plan::BoundComparisonExpr& comparison,
                           evaluate_scalar(comparison.right, batch, row));
 }
 
-storage::RowMask evaluate_filter(const std::vector<plan::BoundComparisonExpr>& predicates,
+const plan::BoundPredicate& require_left_predicate(const plan::BoundPredicate& predicate) {
+    if (predicate.left == nullptr) {
+        throw std::invalid_argument("bound predicate is missing its left child");
+    }
+    return *predicate.left;
+}
+
+const plan::BoundPredicate& require_right_predicate(const plan::BoundPredicate& predicate) {
+    if (predicate.right == nullptr) {
+        throw std::invalid_argument("bound predicate is missing its right child");
+    }
+    return *predicate.right;
+}
+
+bool evaluate_predicate(const plan::BoundPredicate& predicate, const storage::ColumnarBatch& batch, std::size_t row) {
+    switch (predicate.kind) {
+    case sql::PredicateKind::Comparison:
+        return evaluate_comparison(predicate.comparison, batch, row);
+    case sql::PredicateKind::And: {
+        // Predicate trees are pure in this SQL slice, but evaluation order is
+        // still fixed: left child, right child, then the boolean operator.
+        const auto left = evaluate_predicate(require_left_predicate(predicate), batch, row);
+        const auto right = evaluate_predicate(require_right_predicate(predicate), batch, row);
+        return left && right;
+    }
+    case sql::PredicateKind::Or: {
+        const auto left = evaluate_predicate(require_left_predicate(predicate), batch, row);
+        const auto right = evaluate_predicate(require_right_predicate(predicate), batch, row);
+        return left || right;
+    }
+    }
+    throw std::logic_error("unreachable predicate kind");
+}
+
+bool evaluate_predicates(const std::vector<plan::BoundPredicate>& predicates,
+                         const storage::ColumnarBatch& batch,
+                         std::size_t row) {
+    bool keep = true;
+    for (const auto& predicate : predicates) {
+        const auto predicate_result = evaluate_predicate(predicate, batch, row);
+        keep = keep && predicate_result;
+    }
+    return keep;
+}
+
+storage::RowMask evaluate_filter(const std::vector<plan::BoundPredicate>& predicates,
                                  const storage::ColumnarBatch& batch) {
     storage::RowMask mask;
     mask.keep.reserve(batch.row_count());
     for (std::size_t row = 0; row < batch.row_count(); ++row) {
-        bool keep = true;
-        for (const auto& predicate : predicates) {
-            if (!evaluate_comparison(predicate, batch, row)) {
-                keep = false;
-                break;
-            }
-        }
-        mask.keep.push_back(keep ? 1 : 0);
+        mask.keep.push_back(evaluate_predicates(predicates, batch, row) ? 1 : 0);
     }
     return mask;
 }
@@ -357,17 +395,43 @@ bool evaluate_join_comparison(const plan::BoundComparisonExpr& comparison,
                           evaluate_join_scalar(comparison.right, left, left_row, right, right_row));
 }
 
-bool evaluate_join_predicates(const std::vector<plan::BoundComparisonExpr>& predicates,
+bool evaluate_join_predicate(const plan::BoundPredicate& predicate,
+                             const storage::ColumnarBatch& left,
+                             std::size_t left_row,
+                             const storage::ColumnarBatch& right,
+                             std::size_t right_row) {
+    switch (predicate.kind) {
+    case sql::PredicateKind::Comparison:
+        return evaluate_join_comparison(predicate.comparison, left, left_row, right, right_row);
+    case sql::PredicateKind::And: {
+        const auto left_result =
+            evaluate_join_predicate(require_left_predicate(predicate), left, left_row, right, right_row);
+        const auto right_result =
+            evaluate_join_predicate(require_right_predicate(predicate), left, left_row, right, right_row);
+        return left_result && right_result;
+    }
+    case sql::PredicateKind::Or: {
+        const auto left_result =
+            evaluate_join_predicate(require_left_predicate(predicate), left, left_row, right, right_row);
+        const auto right_result =
+            evaluate_join_predicate(require_right_predicate(predicate), left, left_row, right, right_row);
+        return left_result || right_result;
+    }
+    }
+    throw std::logic_error("unreachable predicate kind");
+}
+
+bool evaluate_join_predicates(const std::vector<plan::BoundPredicate>& predicates,
                               const storage::ColumnarBatch& left,
                               std::size_t left_row,
                               const storage::ColumnarBatch& right,
                               std::size_t right_row) {
+    bool keep = true;
     for (const auto& predicate : predicates) {
-        if (!evaluate_join_comparison(predicate, left, left_row, right, right_row)) {
-            return false;
-        }
+        const auto predicate_result = evaluate_join_predicate(predicate, left, left_row, right, right_row);
+        keep = keep && predicate_result;
     }
-    return true;
+    return keep;
 }
 
 storage::ColumnarBatch execute_join(const plan::LogicalPlan& plan, const Catalog& catalog) {

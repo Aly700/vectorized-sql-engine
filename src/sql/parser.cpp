@@ -277,7 +277,7 @@ private:
 
     WhereClause parse_where() {
         WhereClause where;
-        where.conjuncts = parse_comparison_conjunction();
+        where.conjuncts = parse_predicate_conjuncts();
         return where;
     }
 
@@ -285,7 +285,7 @@ private:
         HavingClause having;
         having.position = current_.position;
         expect_keyword("HAVING", "expected HAVING");
-        having.conjuncts = parse_having_comparison_conjunction();
+        having.conjuncts = parse_having_predicate_conjuncts();
         return having;
     }
 
@@ -343,28 +343,119 @@ private:
                               "expected table name after JOIN");
 
         expect_keyword("ON", "expected ON after JOIN table");
-        join.predicates = parse_comparison_conjunction();
+        join.predicates = parse_predicate_conjuncts();
         return join;
     }
 
-    std::vector<ComparisonExpr> parse_comparison_conjunction() {
-        std::vector<ComparisonExpr> conjuncts;
-        conjuncts.push_back(parse_comparison());
-        while (is_keyword("AND")) {
-            advance();
-            conjuncts.push_back(parse_comparison());
-        }
+    std::vector<PredicateExpr> parse_predicate_conjuncts() {
+        auto expression = parse_boolean_expression();
+        std::vector<PredicateExpr> conjuncts;
+        append_top_level_conjunct(std::move(expression), conjuncts);
         return conjuncts;
     }
 
-    std::vector<HavingComparisonExpr> parse_having_comparison_conjunction() {
-        std::vector<HavingComparisonExpr> conjuncts;
-        conjuncts.push_back(parse_having_comparison());
-        while (is_keyword("AND")) {
+    PredicateExpr parse_boolean_expression() {
+        return parse_boolean_or();
+    }
+
+    PredicateExpr parse_boolean_or() {
+        auto left = parse_boolean_and();
+        while (is_keyword("OR")) {
+            const auto position = current_.position;
             advance();
-            conjuncts.push_back(parse_having_comparison());
+            left = PredicateExpr::binary(PredicateKind::Or, std::move(left), parse_boolean_and(), position);
         }
+        return left;
+    }
+
+    PredicateExpr parse_boolean_and() {
+        auto left = parse_boolean_primary();
+        while (is_keyword("AND")) {
+            const auto position = current_.position;
+            advance();
+            left = PredicateExpr::binary(PredicateKind::And, std::move(left), parse_boolean_primary(), position);
+        }
+        return left;
+    }
+
+    PredicateExpr parse_boolean_primary() {
+        if (current_.kind == TokenKind::LeftParen) {
+            advance();
+            auto expression = parse_boolean_expression();
+            expect_token(TokenKind::RightParen, "expected ')' after boolean expression");
+            expression.parenthesized = true;
+            return expression;
+        }
+        return PredicateExpr::comparison_expr(parse_comparison());
+    }
+
+    static void append_top_level_conjunct(PredicateExpr expression, std::vector<PredicateExpr>& conjuncts) {
+        if (expression.kind == PredicateKind::And && !expression.parenthesized) {
+            append_top_level_conjunct(std::move(*expression.left), conjuncts);
+            append_top_level_conjunct(std::move(*expression.right), conjuncts);
+            return;
+        }
+        expression.parenthesized = false;
+        conjuncts.push_back(std::move(expression));
+    }
+
+    std::vector<HavingPredicateExpr> parse_having_predicate_conjuncts() {
+        auto expression = parse_having_boolean_expression();
+        std::vector<HavingPredicateExpr> conjuncts;
+        append_having_top_level_conjunct(std::move(expression), conjuncts);
         return conjuncts;
+    }
+
+    HavingPredicateExpr parse_having_boolean_expression() {
+        return parse_having_boolean_or();
+    }
+
+    HavingPredicateExpr parse_having_boolean_or() {
+        auto left = parse_having_boolean_and();
+        while (is_keyword("OR")) {
+            const auto position = current_.position;
+            advance();
+            left = HavingPredicateExpr::binary(PredicateKind::Or,
+                                               std::move(left),
+                                               parse_having_boolean_and(),
+                                               position);
+        }
+        return left;
+    }
+
+    HavingPredicateExpr parse_having_boolean_and() {
+        auto left = parse_having_boolean_primary();
+        while (is_keyword("AND")) {
+            const auto position = current_.position;
+            advance();
+            left = HavingPredicateExpr::binary(PredicateKind::And,
+                                               std::move(left),
+                                               parse_having_boolean_primary(),
+                                               position);
+        }
+        return left;
+    }
+
+    HavingPredicateExpr parse_having_boolean_primary() {
+        if (current_.kind == TokenKind::LeftParen) {
+            advance();
+            auto expression = parse_having_boolean_expression();
+            expect_token(TokenKind::RightParen, "expected ')' after boolean expression");
+            expression.parenthesized = true;
+            return expression;
+        }
+        return HavingPredicateExpr::comparison_expr(parse_having_comparison());
+    }
+
+    static void append_having_top_level_conjunct(HavingPredicateExpr expression,
+                                                 std::vector<HavingPredicateExpr>& conjuncts) {
+        if (expression.kind == PredicateKind::And && !expression.parenthesized) {
+            append_having_top_level_conjunct(std::move(*expression.left), conjuncts);
+            append_having_top_level_conjunct(std::move(*expression.right), conjuncts);
+            return;
+        }
+        expression.parenthesized = false;
+        conjuncts.push_back(std::move(expression));
     }
 
     ComparisonExpr parse_comparison() {

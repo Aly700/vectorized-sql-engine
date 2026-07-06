@@ -311,6 +311,21 @@ int main() {
             ExpectedResult{{"x.a", "y.b"}, {{2, 20}, {2, 30}}},
         },
         GoldenQuery{
+            "where OR has lower precedence than AND",
+            "SELECT a, b FROM t WHERE a = 1 OR b = 20 AND c = 7",
+            ExpectedResult{{"a", "b"}, {{1, 10}, {3, 20}}},
+        },
+        GoldenQuery{
+            "parenthesized boolean group in WHERE",
+            "SELECT a FROM t WHERE (a = 1 OR b = 20) AND c >= 6",
+            ExpectedResult{{"a"}, {{2}, {3}}},
+        },
+        GoldenQuery{
+            "join ON accepts parenthesized OR tree",
+            "SELECT t1.b, t2.c FROM t1 JOIN t2 ON t1.a = t2.a AND (t2.c = 200 OR t1.b = 30)",
+            ExpectedResult{{"t1.b", "t2.c"}, {{20, 200}, {30, 200}, {30, 201}}},
+        },
+        GoldenQuery{
             "ungrouped aggregates use one global group",
             "SELECT COUNT(*), COUNT(b), SUM(a), MIN(b), MAX(b) FROM t",
             ExpectedResult{{"COUNT(*)", "COUNT(b)", "SUM(a)", "MIN(b)", "MAX(b)"}, {{4, 4, 10, 10, 40}}},
@@ -356,6 +371,11 @@ int main() {
             "grouped order by canonical aggregate output name",
             "SELECT a, SUM(b) FROM t GROUP BY a ORDER BY SUM(b) DESC",
             ExpectedResult{{"a", "SUM(b)"}, {{4, 40}, {2, 20}, {3, 20}, {1, 10}}},
+        },
+        GoldenQuery{
+            "having OR may mix grouping key and aggregate output",
+            "SELECT b, COUNT(*) FROM t GROUP BY b HAVING b = 10 OR COUNT(*) > 1",
+            ExpectedResult{{"b", "COUNT(*)"}, {{10, 1}, {20, 2}}},
         },
         GoldenQuery{
             "global count over empty input returns zero",
@@ -424,11 +444,25 @@ int main() {
             ExpectedError{ErrorKind::Bind, 38, "nested aggregate 'COUNT' is not allowed"},
         },
         GoldenQuery{
-            "unsupported OR is rejected at token position",
-            "SELECT a FROM t WHERE a = 2 OR b = 20",
+            "unterminated boolean parenthesis is rejected",
+            "SELECT a FROM t WHERE (a = 1 OR b = 20",
             ExpectedResult{},
             true,
-            ExpectedError{ErrorKind::Parse, 28, "expected end of input after query"},
+            ExpectedError{ErrorKind::Parse, 38, "expected ')' after boolean expression"},
+        },
+        GoldenQuery{
+            "OR without right predicate is rejected",
+            "SELECT a FROM t WHERE a = 1 OR",
+            ExpectedResult{},
+            true,
+            ExpectedError{ErrorKind::Parse, 30, "expected expression in comparison"},
+        },
+        GoldenQuery{
+            "parenthesized scalar expression is not in scope",
+            "SELECT a FROM t WHERE (a)",
+            ExpectedResult{},
+            true,
+            ExpectedError{ErrorKind::Parse, 24, "expected comparison operator"},
         },
         GoldenQuery{
             "trailing projection comma is rejected",

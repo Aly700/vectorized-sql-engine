@@ -55,22 +55,26 @@ bool compare_values(std::int64_t left, sql::ComparisonOp op, std::int64_t right)
     throw std::logic_error("unreachable comparison operator");
 }
 
-plan::BoundComparisonExpr canonical_true() {
-    return plan::BoundComparisonExpr{
+plan::BoundPredicate comparison_predicate(plan::BoundComparisonExpr comparison) {
+    return plan::BoundPredicate::comparison_expr(std::move(comparison));
+}
+
+plan::BoundPredicate canonical_true() {
+    return comparison_predicate(plan::BoundComparisonExpr{
         sql::IntLiteral{1, 0},
         sql::ComparisonOp::Equal,
         sql::IntLiteral{1, 0},
         0,
-    };
+    });
 }
 
-plan::BoundComparisonExpr canonical_false() {
-    return plan::BoundComparisonExpr{
+plan::BoundPredicate canonical_false() {
+    return comparison_predicate(plan::BoundComparisonExpr{
         sql::IntLiteral{1, 0},
         sql::ComparisonOp::Equal,
         sql::IntLiteral{0, 0},
         0,
-    };
+    });
 }
 
 bool is_literal_with_value(const plan::BoundScalarExpr& expression, std::int64_t expected) {
@@ -78,17 +82,25 @@ bool is_literal_with_value(const plan::BoundScalarExpr& expression, std::int64_t
     return value.has_value() && *value == expected;
 }
 
-bool is_canonical_true(const plan::BoundComparisonExpr& comparison) {
+bool is_canonical_true(const plan::BoundPredicate& predicate) {
+    if (predicate.kind != sql::PredicateKind::Comparison) {
+        return false;
+    }
+    const auto& comparison = predicate.comparison;
     return comparison.op == sql::ComparisonOp::Equal && is_literal_with_value(comparison.left, 1) &&
            is_literal_with_value(comparison.right, 1);
 }
 
-bool is_canonical_false(const plan::BoundComparisonExpr& comparison) {
+bool is_canonical_false(const plan::BoundPredicate& predicate) {
+    if (predicate.kind != sql::PredicateKind::Comparison) {
+        return false;
+    }
+    const auto& comparison = predicate.comparison;
     return comparison.op == sql::ComparisonOp::Equal && is_literal_with_value(comparison.left, 1) &&
            is_literal_with_value(comparison.right, 0);
 }
 
-MemoExpression filter_expression(std::vector<plan::BoundComparisonExpr> predicates,
+MemoExpression filter_expression(std::vector<plan::BoundPredicate> predicates,
                                  GroupId child,
                                  plan::OrderPermission order_permission) {
     MemoExpression expression;
@@ -99,7 +111,7 @@ MemoExpression filter_expression(std::vector<plan::BoundComparisonExpr> predicat
     return expression;
 }
 
-MemoExpression join_expression(std::vector<plan::BoundComparisonExpr> predicates,
+MemoExpression join_expression(std::vector<plan::BoundPredicate> predicates,
                                GroupId left,
                                GroupId right,
                                plan::OrderPermission order_permission) {
@@ -151,8 +163,22 @@ std::vector<std::string> referenced_tables(const plan::BoundScalarExpr& expressi
     return tables;
 }
 
-std::vector<std::string> referenced_tables(const plan::BoundComparisonExpr& predicate) {
-    return merge_tables(referenced_tables(predicate.left), referenced_tables(predicate.right));
+std::vector<std::string> referenced_tables(const plan::BoundComparisonExpr& comparison) {
+    return merge_tables(referenced_tables(comparison.left), referenced_tables(comparison.right));
+}
+
+std::vector<std::string> referenced_tables(const plan::BoundPredicate& predicate) {
+    switch (predicate.kind) {
+    case sql::PredicateKind::Comparison:
+        return referenced_tables(predicate.comparison);
+    case sql::PredicateKind::And:
+    case sql::PredicateKind::Or:
+        if (predicate.left == nullptr || predicate.right == nullptr) {
+            throw std::logic_error("bound predicate is missing a child");
+        }
+        return merge_tables(referenced_tables(*predicate.left), referenced_tables(*predicate.right));
+    }
+    throw std::logic_error("unreachable predicate kind");
 }
 
 std::vector<plan::BoundColumnRef> referenced_columns(const plan::BoundScalarExpr& expression) {
@@ -163,11 +189,29 @@ std::vector<plan::BoundColumnRef> referenced_columns(const plan::BoundScalarExpr
     return columns;
 }
 
-std::vector<plan::BoundColumnRef> referenced_columns(const plan::BoundComparisonExpr& predicate) {
-    auto columns = referenced_columns(predicate.left);
-    auto right_columns = referenced_columns(predicate.right);
+std::vector<plan::BoundColumnRef> referenced_columns(const plan::BoundComparisonExpr& comparison) {
+    auto columns = referenced_columns(comparison.left);
+    auto right_columns = referenced_columns(comparison.right);
     columns.insert(columns.end(), right_columns.begin(), right_columns.end());
     return columns;
+}
+
+std::vector<plan::BoundColumnRef> referenced_columns(const plan::BoundPredicate& predicate) {
+    switch (predicate.kind) {
+    case sql::PredicateKind::Comparison:
+        return referenced_columns(predicate.comparison);
+    case sql::PredicateKind::And:
+    case sql::PredicateKind::Or: {
+        if (predicate.left == nullptr || predicate.right == nullptr) {
+            throw std::logic_error("bound predicate is missing a child");
+        }
+        auto columns = referenced_columns(*predicate.left);
+        auto right_columns = referenced_columns(*predicate.right);
+        columns.insert(columns.end(), right_columns.begin(), right_columns.end());
+        return columns;
+    }
+    }
+    throw std::logic_error("unreachable predicate kind");
 }
 
 bool contains_table(const std::vector<std::string>& tables, const std::string& table) {
@@ -183,7 +227,7 @@ bool is_subset(const std::vector<std::string>& candidate, const std::vector<std:
     return true;
 }
 
-bool references_side(const plan::BoundComparisonExpr& predicate, const std::vector<std::string>& tables) {
+bool references_side(const plan::BoundPredicate& predicate, const std::vector<std::string>& tables) {
     for (const auto& table : referenced_tables(predicate)) {
         if (contains_table(tables, table)) {
             return true;
@@ -192,13 +236,13 @@ bool references_side(const plan::BoundComparisonExpr& predicate, const std::vect
     return false;
 }
 
-bool connects_children(const plan::BoundComparisonExpr& predicate,
+bool connects_children(const plan::BoundPredicate& predicate,
                        const std::vector<std::string>& left_tables,
                        const std::vector<std::string>& right_tables) {
     return references_side(predicate, left_tables) && references_side(predicate, right_tables);
 }
 
-bool has_connecting_predicate(const std::vector<plan::BoundComparisonExpr>& predicates,
+bool has_connecting_predicate(const std::vector<plan::BoundPredicate>& predicates,
                               const std::vector<std::string>& left_tables,
                               const std::vector<std::string>& right_tables) {
     for (const auto& predicate : predicates) {
@@ -222,7 +266,7 @@ bool contains_group_key(const std::vector<plan::BoundColumnRef>& group_keys, con
     return false;
 }
 
-bool references_only_group_keys(const plan::BoundComparisonExpr& predicate,
+bool references_only_group_keys(const plan::BoundPredicate& predicate,
                                 const std::vector<plan::BoundColumnRef>& group_keys) {
     const auto columns = referenced_columns(predicate);
     if (columns.empty()) {
@@ -333,6 +377,70 @@ std::optional<plan::LogicalPlan> rewrite_once(
     return std::nullopt;
 }
 
+plan::BoundPredicate fold_predicate_tree(const plan::BoundPredicate& predicate, bool& changed) {
+    switch (predicate.kind) {
+    case sql::PredicateKind::Comparison: {
+        if (is_canonical_true(predicate) || is_canonical_false(predicate)) {
+            return predicate;
+        }
+
+        const auto left = literal_value(predicate.comparison.left);
+        const auto right = literal_value(predicate.comparison.right);
+        if (!left.has_value() || !right.has_value()) {
+            return predicate;
+        }
+
+        changed = true;
+        return compare_values(*left, predicate.comparison.op, *right) ? canonical_true() : canonical_false();
+    }
+    case sql::PredicateKind::And:
+    case sql::PredicateKind::Or:
+        if (predicate.left == nullptr || predicate.right == nullptr) {
+            throw std::logic_error("bound predicate is missing a child");
+        }
+        break;
+    }
+
+    auto left = fold_predicate_tree(*predicate.left, changed);
+    auto right = fold_predicate_tree(*predicate.right, changed);
+
+    if (predicate.kind == sql::PredicateKind::And) {
+        if (is_canonical_false(left) || is_canonical_false(right)) {
+            changed = true;
+            return canonical_false();
+        }
+        if (is_canonical_true(left)) {
+            changed = true;
+            return right;
+        }
+        if (is_canonical_true(right)) {
+            changed = true;
+            return left;
+        }
+        return plan::BoundPredicate::binary(sql::PredicateKind::And,
+                                            std::move(left),
+                                            std::move(right),
+                                            predicate.operator_position);
+    }
+
+    if (is_canonical_true(left) || is_canonical_true(right)) {
+        changed = true;
+        return canonical_true();
+    }
+    if (is_canonical_false(left)) {
+        changed = true;
+        return right;
+    }
+    if (is_canonical_false(right)) {
+        changed = true;
+        return left;
+    }
+    return plan::BoundPredicate::binary(sql::PredicateKind::Or,
+                                        std::move(left),
+                                        std::move(right),
+                                        predicate.operator_position);
+}
+
 } // namespace
 
 std::optional<plan::LogicalPlan> ConstantFoldComparisonRule::apply(const plan::LogicalPlan& logical) const {
@@ -343,18 +451,7 @@ std::optional<plan::LogicalPlan> ConstantFoldComparisonRule::apply(const plan::L
     auto predicates = logical.predicates;
     bool changed = false;
     for (auto& predicate : predicates) {
-        if (is_canonical_true(predicate) || is_canonical_false(predicate)) {
-            continue;
-        }
-
-        const auto left = literal_value(predicate.left);
-        const auto right = literal_value(predicate.right);
-        if (!left.has_value() || !right.has_value()) {
-            continue;
-        }
-
-        predicate = compare_values(*left, predicate.op, *right) ? canonical_true() : canonical_false();
-        changed = true;
+        predicate = fold_predicate_tree(predicate, changed);
     }
 
     if (!changed) {
@@ -374,18 +471,7 @@ bool ConstantFoldComparisonRule::apply(Memo& memo, GroupId group, const MemoExpr
     auto predicates = expression.predicates;
     bool changed = false;
     for (auto& predicate : predicates) {
-        if (is_canonical_true(predicate) || is_canonical_false(predicate)) {
-            continue;
-        }
-
-        const auto left = literal_value(predicate.left);
-        const auto right = literal_value(predicate.right);
-        if (!left.has_value() || !right.has_value()) {
-            continue;
-        }
-
-        predicate = compare_values(*left, predicate.op, *right) ? canonical_true() : canonical_false();
-        changed = true;
+        predicate = fold_predicate_tree(predicate, changed);
     }
 
     if (!changed) {
@@ -402,7 +488,7 @@ std::optional<plan::LogicalPlan> DropAlwaysTrueFilterRule::apply(const plan::Log
         return std::nullopt;
     }
 
-    std::vector<plan::BoundComparisonExpr> predicates;
+    std::vector<plan::BoundPredicate> predicates;
     predicates.reserve(logical.predicates.size());
     bool changed = false;
     for (const auto& predicate : logical.predicates) {
@@ -431,7 +517,7 @@ bool DropAlwaysTrueFilterRule::apply(Memo& memo, GroupId group, const MemoExpres
         return false;
     }
 
-    std::vector<plan::BoundComparisonExpr> predicates;
+    std::vector<plan::BoundPredicate> predicates;
     predicates.reserve(expression.predicates.size());
     bool changed = false;
     for (const auto& predicate : expression.predicates) {
@@ -516,7 +602,7 @@ std::optional<plan::LogicalPlan> MergeAdjacentFiltersRule::apply(const plan::Log
         return std::nullopt;
     }
 
-    std::vector<plan::BoundComparisonExpr> predicates;
+    std::vector<plan::BoundPredicate> predicates;
     predicates.reserve(child.predicates.size() + logical.predicates.size());
     predicates.insert(predicates.end(), child.predicates.begin(), child.predicates.end());
     predicates.insert(predicates.end(), logical.predicates.begin(), logical.predicates.end());
@@ -539,7 +625,7 @@ bool MergeAdjacentFiltersRule::apply(Memo& memo, GroupId group, const MemoExpres
             continue;
         }
 
-        std::vector<plan::BoundComparisonExpr> predicates;
+        std::vector<plan::BoundPredicate> predicates;
         predicates.reserve(child_expression.predicates.size() + expression.predicates.size());
         predicates.insert(predicates.end(), child_expression.predicates.begin(), child_expression.predicates.end());
         predicates.insert(predicates.end(), expression.predicates.begin(), expression.predicates.end());
@@ -574,10 +660,10 @@ bool FilterIntoJoinRule::apply(Memo& memo, GroupId group, const MemoExpression& 
         const auto right_tables = output_tables_for_group(memo, right_group);
         const auto join_tables = merge_tables(left_tables, right_tables);
 
-        std::vector<plan::BoundComparisonExpr> left_predicates;
-        std::vector<plan::BoundComparisonExpr> right_predicates;
-        std::vector<plan::BoundComparisonExpr> join_predicates = child_expression.predicates;
-        std::vector<plan::BoundComparisonExpr> residual_predicates;
+        std::vector<plan::BoundPredicate> left_predicates;
+        std::vector<plan::BoundPredicate> right_predicates;
+        std::vector<plan::BoundPredicate> join_predicates = child_expression.predicates;
+        std::vector<plan::BoundPredicate> residual_predicates;
         bool moved = false;
         for (const auto& predicate : expression.predicates) {
             const auto refs = referenced_tables(predicate);
@@ -598,7 +684,8 @@ bool FilterIntoJoinRule::apply(Memo& memo, GroupId group, const MemoExpression& 
                 moved = true;
                 continue;
             }
-            if (is_subset(refs, join_tables) && connects_children(predicate, left_tables, right_tables)) {
+            if (predicate.kind == sql::PredicateKind::Comparison && is_subset(refs, join_tables) &&
+                connects_children(predicate, left_tables, right_tables)) {
                 join_predicates.push_back(predicate);
                 moved = true;
                 continue;
@@ -661,8 +748,8 @@ bool FilterThroughAggregateRule::apply(Memo& memo, GroupId group, const MemoExpr
             continue;
         }
 
-        std::vector<plan::BoundComparisonExpr> pushable_predicates;
-        std::vector<plan::BoundComparisonExpr> residual_predicates;
+        std::vector<plan::BoundPredicate> pushable_predicates;
+        std::vector<plan::BoundPredicate> residual_predicates;
         for (const auto& predicate : expression.predicates) {
             if (references_only_group_keys(predicate, child_expression.group_keys)) {
                 pushable_predicates.push_back(predicate);
@@ -738,8 +825,8 @@ bool try_left_to_right_associate(Memo& memo, GroupId group, const MemoExpression
         const auto inner_tables = merge_tables(b_tables, c_tables);
         const auto outer_tables = merge_tables(a_tables, inner_tables);
 
-        std::vector<plan::BoundComparisonExpr> inner_predicates;
-        std::vector<plan::BoundComparisonExpr> outer_predicates = left_expression.predicates;
+        std::vector<plan::BoundPredicate> inner_predicates;
+        std::vector<plan::BoundPredicate> outer_predicates = left_expression.predicates;
         bool legal = true;
         for (const auto& predicate : expression.predicates) {
             const auto refs = referenced_tables(predicate);
@@ -797,8 +884,8 @@ bool try_right_to_left_associate(Memo& memo, GroupId group, const MemoExpression
         const auto inner_tables = merge_tables(a_tables, b_tables);
         const auto outer_tables = merge_tables(inner_tables, c_tables);
 
-        std::vector<plan::BoundComparisonExpr> inner_predicates;
-        std::vector<plan::BoundComparisonExpr> residual_outer_predicates;
+        std::vector<plan::BoundPredicate> inner_predicates;
+        std::vector<plan::BoundPredicate> residual_outer_predicates;
         bool legal = true;
         for (const auto& predicate : expression.predicates) {
             const auto refs = referenced_tables(predicate);
@@ -815,7 +902,7 @@ bool try_right_to_left_associate(Memo& memo, GroupId group, const MemoExpression
             continue;
         }
 
-        std::vector<plan::BoundComparisonExpr> outer_predicates = right_expression.predicates;
+        std::vector<plan::BoundPredicate> outer_predicates = right_expression.predicates;
         outer_predicates.insert(outer_predicates.end(),
                                 residual_outer_predicates.begin(),
                                 residual_outer_predicates.end());

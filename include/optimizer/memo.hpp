@@ -27,7 +27,7 @@ struct MemoExpression {
     std::vector<plan::BoundColumnRef> group_keys;
     std::vector<plan::AggregateExpression> aggregate_expressions;
     std::vector<plan::SortKey> sort_keys;
-    std::vector<plan::BoundComparisonExpr> predicates;
+    std::vector<plan::BoundPredicate> predicates;
     std::vector<GroupId> children;
 };
 

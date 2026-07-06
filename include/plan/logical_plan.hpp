@@ -29,6 +29,33 @@ struct BoundComparisonExpr {
     std::size_t operator_position{0};
 };
 
+struct BoundPredicate {
+    sql::PredicateKind kind{sql::PredicateKind::Comparison};
+    BoundComparisonExpr comparison;
+    std::shared_ptr<BoundPredicate> left;
+    std::shared_ptr<BoundPredicate> right;
+    std::size_t operator_position{0};
+
+    static BoundPredicate comparison_expr(BoundComparisonExpr comparison) {
+        BoundPredicate predicate;
+        predicate.kind = sql::PredicateKind::Comparison;
+        predicate.comparison = std::move(comparison);
+        return predicate;
+    }
+
+    static BoundPredicate binary(sql::PredicateKind kind,
+                                 BoundPredicate left,
+                                 BoundPredicate right,
+                                 std::size_t position) {
+        BoundPredicate predicate;
+        predicate.kind = kind;
+        predicate.left = std::make_shared<BoundPredicate>(std::move(left));
+        predicate.right = std::make_shared<BoundPredicate>(std::move(right));
+        predicate.operator_position = position;
+        return predicate;
+    }
+};
+
 struct Projection {
     std::string output_name;
     BoundScalarExpr expression;
@@ -57,7 +84,7 @@ struct LogicalPlan {
     std::vector<BoundColumnRef> group_keys;
     std::vector<AggregateExpression> aggregate_expressions;
     std::vector<SortKey> sort_keys;
-    std::vector<BoundComparisonExpr> predicates;
+    std::vector<BoundPredicate> predicates;
     std::shared_ptr<LogicalPlan> input;
     std::shared_ptr<LogicalPlan> left;
     std::shared_ptr<LogicalPlan> right;
@@ -78,7 +105,7 @@ struct LogicalPlan {
     // child followed by all columns from the right child. Expressions in a
     // bound logical plan refer to those identities by binding and column name;
     // downstream layers must not re-resolve parsed SQL names.
-    static LogicalPlan join(std::vector<BoundComparisonExpr> predicates, LogicalPlan left, LogicalPlan right) {
+    static LogicalPlan join(std::vector<BoundPredicate> predicates, LogicalPlan left, LogicalPlan right) {
         LogicalPlan p;
         p.kind = LogicalKind::Join;
         p.predicates = std::move(predicates);
@@ -87,7 +114,7 @@ struct LogicalPlan {
         return p;
     }
 
-    static LogicalPlan filter(std::vector<BoundComparisonExpr> predicates, LogicalPlan child) {
+    static LogicalPlan filter(std::vector<BoundPredicate> predicates, LogicalPlan child) {
         LogicalPlan p;
         p.kind = LogicalKind::Filter;
         p.predicates = std::move(predicates);
