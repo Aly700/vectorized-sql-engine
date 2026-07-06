@@ -43,6 +43,13 @@ execution::Catalog make_equal_catalog() {
     return catalog;
 }
 
+execution::Catalog make_pushdown_catalog() {
+    execution::Catalog catalog;
+    catalog.add_table("big", make_single_key_batch(10000));
+    catalog.add_table("mid", make_single_key_batch(10000));
+    return catalog;
+}
+
 std::vector<std::string> sorted_column_names(const storage::ColumnarBatch& batch) {
     auto names = batch.column_names();
     std::sort(names.begin(), names.end());
@@ -383,6 +390,39 @@ void assert_having_does_not_block_join_transforms() {
     }
 }
 
+void assert_extract_best_prefers_pushed_join_filter() {
+    const auto catalog = make_pushdown_catalog();
+    const auto sql = "SELECT big.k, mid.k FROM big JOIN mid ON big.k = mid.k WHERE big.k = 7";
+    const auto logical = sql::bind_select(sql::parse_select(sql), catalog);
+
+    optimizer::GroupId root = 0;
+    auto memo = explored_memo_for(logical, root);
+    const auto best = memo.extract_best(root, catalog);
+    const auto ingested_cost = optimizer::estimate_cost(logical, catalog);
+    const auto best_cost = optimizer::estimate_cost(best, catalog);
+
+    const auto expected_best =
+        std::string("Project[big.k=col(big.k), mid.k=col(mid.k)]\n") +
+        "  Join[col(big.k) = col(mid.k)]\n"
+        "    Filter[col(big.k) = lit(7)]\n"
+        "      Scan[big]\n"
+        "    Scan[mid]";
+
+    if (plan::to_string(best) != expected_best || !(best_cost.cost < ingested_cost.cost)) {
+        std::cerr << "extract_best did not prefer the pushed-down join filter\n"
+                  << "sql: " << sql << "\n"
+                  << "ingested plan:\n"
+                  << plan::to_string(logical) << "\n"
+                  << "ingested cost: " << ingested_cost.cost << "\n"
+                  << "best plan:\n"
+                  << plan::to_string(best) << "\n"
+                  << "best cost: " << best_cost.cost << "\n"
+                  << "memo dump:\n"
+                  << memo.dump();
+        std::terminate();
+    }
+}
+
 } // namespace
 
 int main() {
@@ -395,5 +435,6 @@ int main() {
     assert_group_by_does_not_block_join_transforms();
     assert_having_costs_as_filter_over_aggregate();
     assert_having_does_not_block_join_transforms();
+    assert_extract_best_prefers_pushed_join_filter();
     return 0;
 }

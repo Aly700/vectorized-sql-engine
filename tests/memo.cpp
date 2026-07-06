@@ -12,6 +12,7 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace {
 
@@ -32,6 +33,32 @@ execution::Catalog make_catalog() {
 
     execution::Catalog catalog;
     catalog.add_table("t", std::move(batch));
+
+    storage::Int64Column t1_a;
+    for (auto value : {1, 2, 2}) {
+        t1_a.append(value);
+    }
+    storage::Int64Column t1_b;
+    for (auto value : {10, 20, 30}) {
+        t1_b.append(value);
+    }
+    storage::ColumnarBatch t1;
+    t1.add_column("a", std::move(t1_a));
+    t1.add_column("b", std::move(t1_b));
+    catalog.add_table("t1", std::move(t1));
+
+    storage::Int64Column t2_a;
+    for (auto value : {2, 2, 3}) {
+        t2_a.append(value);
+    }
+    storage::Int64Column t2_c;
+    for (auto value : {200, 201, 300}) {
+        t2_c.append(value);
+    }
+    storage::ColumnarBatch t2;
+    t2.add_column("a", std::move(t2_a));
+    t2.add_column("c", std::move(t2_c));
+    catalog.add_table("t2", std::move(t2));
     return catalog;
 }
 
@@ -69,6 +96,15 @@ optimizer::MemoExpression join_expression(optimizer::GroupId left, optimizer::Gr
     expression.children.push_back(left);
     expression.children.push_back(right);
     return expression;
+}
+
+bool trace_contains(const std::vector<std::string>& trace, const std::string& rule_name) {
+    for (const auto& fired : trace) {
+        if (fired == rule_name) {
+            return true;
+        }
+    }
+    return false;
 }
 
 void assert_memo_ingest_deduplicates_bound_plan_tree() {
@@ -210,6 +246,92 @@ void assert_having_filter_round_trips_through_memo() {
     memo.assert_invariants();
 }
 
+void assert_filter_into_join_adds_pushdown_alternative() {
+    const auto catalog = make_catalog();
+    const auto sql =
+        "SELECT t1.b, t2.c FROM t1 JOIN t2 ON t1.a = t2.a "
+        "WHERE t1.b = 20 AND t2.c > 200 AND t1.b < t2.c";
+    const auto logical = sql::bind_select(sql::parse_select(sql), catalog);
+
+    optimizer::Memo memo;
+    const auto root = memo.insert(logical);
+    const auto explored = optimizer::explore_memo_to_fixpoint(memo, optimizer::default_memo_rules());
+    assert(explored.reached_fixpoint);
+
+    const auto dump = memo.dump();
+    if (!trace_contains(explored.fired_rules, "FilterIntoJoinRule") ||
+        dump.find("Filter[col(t1.b) = lit(20)]") == std::string::npos ||
+        dump.find("Filter[col(t2.c) > lit(200)]") == std::string::npos ||
+        dump.find("Join[col(t1.a) = col(t2.a) AND col(t1.b) < col(t2.c)]") == std::string::npos) {
+        std::cerr << "filter-into-join pushdown alternative was not represented\n"
+                  << "sql: " << sql << "\n"
+                  << "root group: " << root << "\n"
+                  << "trace: ";
+        for (const auto& fired : explored.fired_rules) {
+            std::cerr << fired << " ";
+        }
+        std::cerr << "\nlogical plan:\n"
+                  << plan::to_string(logical) << "\n"
+                  << "memo dump:\n"
+                  << dump;
+        std::terminate();
+    }
+
+    memo.assert_invariants();
+}
+
+bool contains_plan_text(const std::vector<plan::LogicalPlan>& alternatives, const std::string& text) {
+    for (const auto& alternative : alternatives) {
+        if (plan::to_string(alternative).find(text) != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void assert_filter_through_aggregate_pushes_only_group_keys() {
+    const auto catalog = make_catalog();
+    const auto sql =
+        "SELECT t1.a, COUNT(*) FROM t1 JOIN t2 ON t1.a = t2.a "
+        "GROUP BY t1.a HAVING t1.a = 2 AND COUNT(*) > 1";
+    const auto logical = sql::bind_select(sql::parse_select(sql), catalog);
+
+    optimizer::Memo memo;
+    const auto root = memo.insert(logical);
+    const auto explored = optimizer::explore_memo_to_fixpoint(memo, optimizer::default_memo_rules());
+    assert(explored.reached_fixpoint);
+    const auto alternatives = memo.extract_alternatives(root, optimizer::AlternativeExtractionOptions{128, 1024});
+    assert(!alternatives.hit_expression_bound);
+    assert(!alternatives.hit_plan_bound);
+
+    const auto pushed_group_key =
+        std::string("Filter[col(COUNT(*)) > lit(1)]\n") +
+        "    Aggregate[group_keys=[col(t1.a)], aggregates=[COUNT(*)]]\n"
+        "      Filter[col(t1.a) = lit(2)]";
+    const auto illegal_aggregate_output_push =
+        std::string("Aggregate[group_keys=[col(t1.a)], aggregates=[COUNT(*)]]\n") +
+        "      Filter[col(COUNT(*)) > lit(1)]";
+
+    if (!trace_contains(explored.fired_rules, "FilterThroughAggregateRule") ||
+        !contains_plan_text(alternatives.plans, pushed_group_key) ||
+        contains_plan_text(alternatives.plans, illegal_aggregate_output_push)) {
+        std::cerr << "filter-through-aggregate did not push only grouping-key predicates\n"
+                  << "sql: " << sql << "\n"
+                  << "trace: ";
+        for (const auto& fired : explored.fired_rules) {
+            std::cerr << fired << " ";
+        }
+        std::cerr << "\nalternative count: " << alternatives.plans.size() << "\n"
+                  << "logical plan:\n"
+                  << plan::to_string(logical) << "\n"
+                  << "memo dump:\n"
+                  << memo.dump();
+        std::terminate();
+    }
+
+    memo.assert_invariants();
+}
+
 } // namespace
 
 int main() {
@@ -219,5 +341,7 @@ int main() {
     assert_cross_group_duplicate_expression_merges_groups();
     assert_aliased_self_join_scans_remain_distinct_groups();
     assert_having_filter_round_trips_through_memo();
+    assert_filter_into_join_adds_pushdown_alternative();
+    assert_filter_through_aggregate_pushes_only_group_keys();
     return 0;
 }

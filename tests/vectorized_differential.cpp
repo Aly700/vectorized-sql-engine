@@ -539,6 +539,8 @@ bool run_join_oracle_corpus() {
         "SELECT t1.b, t2.c FROM t1 JOIN t2 ON 1 = 1",
         "SELECT t1.b, t2.c FROM t1 JOIN t2 ON t1.a = t2.a AND t1.b < t2.c",
         "SELECT t1.b, t2.c FROM t1 JOIN t2 ON t1.a = t2.a WHERE 2 > 1 AND t2.c > 200",
+        "SELECT t1.b, t2.c FROM t1 JOIN t2 ON t1.a = t2.a "
+        "WHERE t1.b = 20 AND t2.c > 200 AND t1.b < t2.c",
         "SELECT t1.b FROM t1 JOIN t2 ON t1.a = t2.a WHERE 2 < 1",
         "SELECT t1.b, t2.c, t3.d FROM t1 JOIN t2 ON t1.a = t2.a JOIN t3 ON t2.c = t3.c WHERE t3.d >= 2",
         "SELECT t1.b, t2.c, t3.d, t4.e FROM t1 JOIN t2 ON t1.a = t2.a "
@@ -562,6 +564,8 @@ bool run_join_oracle_corpus() {
         "SELECT t1.a, COUNT(*), SUM(t2.c), MIN(t2.c), MAX(t2.c) FROM t1 JOIN t2 ON t1.a = t2.a GROUP BY t1.a",
         "SELECT t1.a, COUNT(*) FROM t1 JOIN t2 ON t1.a = t2.a GROUP BY t1.a ORDER BY t1.a DESC",
         "SELECT t1.a FROM t1 JOIN t2 ON t1.a = t2.a GROUP BY t1.a HAVING SUM(t2.c) > 500",
+        "SELECT t1.a, COUNT(*) FROM t1 JOIN t2 ON t1.a = t2.a "
+        "GROUP BY t1.a HAVING t1.a = 2 AND COUNT(*) > 1",
         "SELECT t1.a AS key, SUM(t2.c) AS total FROM t1 JOIN t2 ON t1.a = t2.a "
         "GROUP BY t1.a HAVING SUM(t2.c) > 500 ORDER BY total DESC",
         "SELECT t1.a, t3.d, COUNT(*) FROM t1 JOIN t2 ON t1.a = t2.a "
@@ -581,6 +585,17 @@ bool run_join_oracle_corpus() {
                       << " hit_plan_bound=" << (stats.hit_plan_bound ? "yes" : "no") << "\n";
         }
     }
+
+    const auto stress_sql =
+        "SELECT t1.a, t3.d, COUNT(*) FROM t1 JOIN t2 ON t1.a = t2.a "
+        "JOIN t3 ON t2.c = t3.c WHERE t1.b >= 20 AND t3.d >= 2 "
+        "GROUP BY t1.a, t3.d HAVING t1.a = 2 AND COUNT(*) > 0";
+    ComparisonStats stress_stats;
+    ok = compare_engines(stress_sql, catalog, table_text, &stress_stats) && ok;
+    std::cout << "pushdown stress alternatives verified: sql=\"" << stress_sql << "\" alternatives="
+              << stress_stats.alternative_count << " max_group_expressions=" << stress_stats.max_group_expression_count
+              << " hit_expression_bound=" << (stress_stats.hit_expression_bound ? "yes" : "no")
+              << " hit_plan_bound=" << (stress_stats.hit_plan_bound ? "yes" : "no") << "\n";
     return ok;
 }
 
