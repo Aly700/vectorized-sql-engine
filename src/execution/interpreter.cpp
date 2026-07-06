@@ -71,6 +71,20 @@ void Catalog::add_table(std::string name, storage::ColumnarBatch batch) {
     }
 }
 
+std::optional<catalog::TableSchema> Catalog::find_table_schema(const std::string& name) const {
+    auto it = tables_.find(name);
+    if (it == tables_.end()) {
+        return std::nullopt;
+    }
+
+    catalog::TableSchema schema;
+    schema.name = it->first;
+    for (const auto& column_name : it->second.column_names()) {
+        schema.columns.push_back(catalog::ColumnSchema{column_name, catalog::ColumnType::Int64});
+    }
+    return schema;
+}
+
 const storage::ColumnarBatch& Catalog::table(const std::string& name) const {
     auto it = tables_.find(name);
     if (it == tables_.end()) {
