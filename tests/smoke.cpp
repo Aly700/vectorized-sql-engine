@@ -29,10 +29,33 @@ void assert_column_copy_reuses_storage_until_mutation() {
     assert(mutated.at(3) == 40);
 }
 
+void assert_column_reserve_detaches_shared_storage_without_changing_values() {
+    storage::Int64Column column;
+    column.reserve(3);
+    assert(column.size() == 0);
+    assert(column.values().capacity() >= 3);
+    column.append(10);
+    column.append(20);
+    column.append(30);
+
+    const auto& shared_values = column.values();
+    auto reserved = column;
+    reserved.reserve(8);
+
+    assert(&reserved.values() != &shared_values);
+    assert(reserved.size() == 3);
+    assert(reserved.values().capacity() >= 8);
+    assert(reserved.at(0) == 10);
+    assert(reserved.at(1) == 20);
+    assert(reserved.at(2) == 30);
+    assert(column.size() == 3);
+}
+
 } // namespace
 
 int main() {
     assert_column_copy_reuses_storage_until_mutation();
+    assert_column_reserve_detaches_shared_storage_without_changing_values();
 
     auto query = sql::parse_select("SELECT a FROM t WHERE a = 2");
     assert(query.projection.size() == 1);

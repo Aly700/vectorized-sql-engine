@@ -18,6 +18,11 @@ public:
         values_->push_back(value);
     }
 
+    void reserve(std::size_t count) {
+        detach_for_append();
+        values_->reserve(count);
+    }
+
     [[nodiscard]] std::size_t size() const { return values().size(); }
     [[nodiscard]] std::int64_t at(std::size_t row) const { return values().at(row); }
     [[nodiscard]] const std::vector<std::int64_t>& values() const {
