@@ -94,6 +94,50 @@ execution::Catalog make_golden_catalog() {
     t2.add_column("c", std::move(t2_c));
     catalog.add_table("t2", std::move(t2));
 
+    storage::Int64Column t3_c;
+    for (auto value : {200, 201, 201}) {
+        t3_c.append(value);
+    }
+    storage::Int64Column t3_d;
+    for (auto value : {1, 2, 3}) {
+        t3_d.append(value);
+    }
+    storage::ColumnarBatch t3;
+    t3.add_column("c", std::move(t3_c));
+    t3.add_column("d", std::move(t3_d));
+    catalog.add_table("t3", std::move(t3));
+
+    const std::vector<std::int64_t> extreme_left_values{
+        std::numeric_limits<std::int64_t>::min(),
+        -1,
+        std::numeric_limits<std::int64_t>::max(),
+    };
+    storage::Int64Column extreme_left_a;
+    for (auto value : extreme_left_values) {
+        extreme_left_a.append(value);
+    }
+    storage::Int64Column extreme_left_b;
+    for (auto value : {10, 11, 12}) {
+        extreme_left_b.append(value);
+    }
+    storage::ColumnarBatch extreme_left;
+    extreme_left.add_column("a", std::move(extreme_left_a));
+    extreme_left.add_column("b", std::move(extreme_left_b));
+    catalog.add_table("extreme_left", std::move(extreme_left));
+
+    storage::Int64Column extreme_right_a;
+    for (auto value : {std::numeric_limits<std::int64_t>::max(), std::numeric_limits<std::int64_t>::min()}) {
+        extreme_right_a.append(value);
+    }
+    storage::Int64Column extreme_right_b;
+    for (auto value : {20, 21}) {
+        extreme_right_b.append(value);
+    }
+    storage::ColumnarBatch extreme_right;
+    extreme_right.add_column("a", std::move(extreme_right_a));
+    extreme_right.add_column("b", std::move(extreme_right_b));
+    catalog.add_table("extreme_right", std::move(extreme_right));
+
     storage::ColumnarBatch empty;
     empty.add_column("a", storage::Int64Column{});
     catalog.add_table("empty", std::move(empty));
@@ -183,40 +227,6 @@ bool compare_engines(const std::string& sql, const execution::Catalog& catalog, 
     return false;
 }
 
-bool compare_oracle_paths_vectorized_unsupported(const std::string& sql,
-                                                 const execution::Catalog& catalog,
-                                                 const std::string& table_text) {
-    const auto parsed = sql::parse_select(sql);
-    const auto logical = sql::bind_select(parsed, catalog);
-    const auto rewritten = optimizer::rewrite_to_fixpoint(logical, optimizer::default_rules());
-    const auto unrewritten_oracle = execution::execute_interpreted(logical, catalog);
-    const auto rewritten_oracle = execution::execute_interpreted(rewritten.plan, catalog);
-    if (!same_batch(unrewritten_oracle, rewritten_oracle)) {
-        std::cerr << "join oracle rewrite divergence\n"
-                  << "sql: " << sql << "\n"
-                  << table_text << "\n"
-                  << "rewrite trace: " << format_trace(rewritten.trace) << "\n"
-                  << "before plan:\n"
-                  << plan::to_string(logical) << "\n"
-                  << "after plan:\n"
-                  << plan::to_string(rewritten.plan) << "\n"
-                  << "unrewritten oracle: " << format_batch(unrewritten_oracle) << "\n"
-                  << "rewritten oracle:   " << format_batch(rewritten_oracle) << "\n";
-        return false;
-    }
-
-    try {
-        (void)execution::execute_vectorized(rewritten.plan, catalog);
-    } catch (const std::logic_error& error) {
-        return std::string(error.what()) == "vectorized inner join is not supported yet";
-    }
-
-    std::cerr << "join query unexpectedly executed in vectorized engine\n"
-              << "sql: " << sql << "\n"
-              << table_text << "\n";
-    return false;
-}
-
 bool run_result_golden_queries() {
     const auto catalog = make_golden_catalog();
     const std::vector<std::string> result_sqls{
@@ -229,7 +239,10 @@ bool run_result_golden_queries() {
 
     bool ok = true;
     for (const auto& sql : result_sqls) {
-        ok = compare_engines(sql, catalog, "golden table t: columns=[a,b,c] rows=[[1,10,5],[2,20,6],[3,20,7],[4,40,8]]") && ok;
+        ok = compare_engines(sql,
+                             catalog,
+                             "golden table t: columns=[a,b,c] rows=[[1,10,5],[2,20,6],[3,20,7],[4,40,8]]") &&
+             ok;
     }
     return ok;
 }
@@ -237,17 +250,26 @@ bool run_result_golden_queries() {
 bool run_join_oracle_corpus() {
     const auto catalog = make_golden_catalog();
     const auto table_text =
-        "join tables: t1 rows=[[1,10],[2,20],[2,30]], t2 rows=[[2,200],[2,201],[3,300]], empty rows=[]";
+        "join tables: t1 rows=[[1,10],[2,20],[2,30]], t2 rows=[[2,200],[2,201],[3,300]], "
+        "t3 rows=[[200,1],[201,2],[201,3]], extreme_left rows=[[min,10],[-1,11],[max,12]], "
+        "extreme_right rows=[[max,20],[min,21]], empty rows=[]";
     const std::vector<std::string> join_sqls{
         "SELECT t1.a, t1.b, t2.c FROM t1 JOIN t2 ON t1.a = t2.a",
-        "SELECT t1.b, t2.c FROM t1 JOIN t2 ON t1.a = t2.a WHERE 2 > 1 AND t2.c > 200",
+        "SELECT empty.a, t1.b FROM empty JOIN t1 ON empty.a = t1.a",
         "SELECT t1.a FROM t1 JOIN empty ON t1.a = empty.a",
+        "SELECT t1.a, t2.c FROM t1 JOIN t2 ON t1.a = t2.c",
+        "SELECT t1.b, t2.c FROM t1 JOIN t2 ON 1 = 1",
+        "SELECT t1.b, t2.c FROM t1 JOIN t2 ON t1.a = t2.a AND t1.b < t2.c",
+        "SELECT t1.b, t2.c FROM t1 JOIN t2 ON t1.a = t2.a WHERE 2 > 1 AND t2.c > 200",
         "SELECT t1.b FROM t1 JOIN t2 ON t1.a = t2.a WHERE 2 < 1",
+        "SELECT t1.b, t2.c, t3.d FROM t1 JOIN t2 ON t1.a = t2.a JOIN t3 ON t2.c = t3.c WHERE t3.d >= 2",
+        "SELECT extreme_left.a, extreme_left.b, extreme_right.b FROM extreme_left JOIN extreme_right "
+        "ON extreme_left.a = extreme_right.a",
     };
 
     bool ok = true;
     for (const auto& sql : join_sqls) {
-        ok = compare_oracle_paths_vectorized_unsupported(sql, catalog, table_text) && ok;
+        ok = compare_engines(sql, catalog, table_text) && ok;
     }
     return ok;
 }

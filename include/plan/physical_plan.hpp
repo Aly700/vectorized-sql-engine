@@ -9,7 +9,7 @@
 
 namespace plan {
 
-enum class PhysicalKind { Scan, Filter, Project };
+enum class PhysicalKind { Scan, Join, Filter, Project };
 
 struct PhysicalPlan {
     PhysicalKind kind{PhysicalKind::Scan};
@@ -17,6 +17,8 @@ struct PhysicalPlan {
     std::vector<Projection> projections;
     std::vector<BoundComparisonExpr> predicates;
     std::shared_ptr<PhysicalPlan> input;
+    std::shared_ptr<PhysicalPlan> left;
+    std::shared_ptr<PhysicalPlan> right;
 
     static PhysicalPlan scan(std::string table) {
         PhysicalPlan p;
@@ -30,6 +32,17 @@ struct PhysicalPlan {
         p.kind = PhysicalKind::Filter;
         p.predicates = std::move(predicates);
         p.input = std::make_shared<PhysicalPlan>(std::move(child));
+        return p;
+    }
+
+    static PhysicalPlan join(std::vector<BoundComparisonExpr> predicates,
+                             PhysicalPlan left,
+                             PhysicalPlan right) {
+        PhysicalPlan p;
+        p.kind = PhysicalKind::Join;
+        p.predicates = std::move(predicates);
+        p.left = std::make_shared<PhysicalPlan>(std::move(left));
+        p.right = std::make_shared<PhysicalPlan>(std::move(right));
         return p;
     }
 

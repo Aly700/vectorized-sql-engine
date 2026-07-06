@@ -15,7 +15,7 @@ SQL text -> parser -> binder/type checker -> logical plan -> optimizer memo -> p
 - `optimizer::rewrite_to_fixpoint` applies a deterministic ordered list of pure `LogicalPlan -> optional<LogicalPlan>` rewrite rules before physical lowering.
 - `plan::PhysicalPlan` is a structure-preserving lowering of the logical tree. It does not optimize, cost, or reorder.
 - `execution::execute_interpreted` is the correctness oracle, including inner join semantics.
-- `execution::execute_vectorized` lowers to the physical tree and runs scan/filter/project with immutable selection vectors until final materialization. Inner join is intentionally unsupported in the vectorized engine until the later vectorized join phase; attempts to run a join there fail with a clear not-yet-supported error.
+- `execution::execute_vectorized` lowers to the physical tree and runs scan/filter/join/project with immutable selection vectors until final materialization. Inner join materializes a deterministic joined batch boundary before downstream filters or projections run.
 - `storage::ColumnarBatch` enforces equal-length column vectors.
 - `optimizer::Memo` is the shell for Cascades groups.
 - `execution::Catalog` implements `catalog::Catalog` for binding and separately owns table batches for execution.
@@ -26,9 +26,7 @@ Rules live beside, but not inside, `optimizer::Memo` so they can later be re-hos
 
 The driver traverses child-first, tries rules in vector order, applies at most one rewrite per pass, records the fired rule name, and repeats to a fixpoint with a hard max-pass bound. For the shipped default rules, termination is monotonic: constant folding removes non-canonical literal comparisons by replacing them with canonical booleans; adjacent-filter merge removes a filter node while preserving predicate order; the always-false rule collapses a predicate list to one canonical false predicate; and the always-true rule removes predicates or an entire filter. No default rule reintroduces a non-canonical literal comparison, adjacent filter pair, canonical true predicate, or larger predicate list after simplification, so the bounded fixpoint is a guard against future cyclic rules rather than part of the proof.
 
-Rewrite equivalence is tested by running each corpus query three ways: unrewritten logical plan through the interpreted oracle, rewritten logical plan through the interpreted oracle, and rewritten logical plan through the vectorized engine. This protects the invariants that rewrites preserve bag semantics and that vectorized execution matches the oracle for the same logical plan.
-
-Join queries are included in the rewrite corpus through the oracle paths only until vectorized join exists. For these marked cases, the corpus still compares unrewritten and rewritten interpreted results, then verifies that vectorized execution reports inner join as not yet supported rather than pretending to implement it.
+Rewrite equivalence is tested by running each corpus query three ways: unrewritten logical plan through the interpreted oracle, rewritten logical plan through the interpreted oracle, and rewritten logical plan through the vectorized engine. Join queries use the same full three-way check. This protects the invariants that rewrites preserve bag semantics and that vectorized execution matches the oracle for the same logical plan.
 
 ## Inner joins
 
@@ -45,11 +43,13 @@ Join chains bind as left-deep logical plans. `Join` predicates live on the `Join
 
 Qualified projected columns use their qualified spelling as the output name, so `SELECT t1.a, t2.a ...` produces output columns `t1.a` and `t2.a`. Unqualified projected columns use the bare column name, so duplicate output names are still rejected by name.
 
-The interpreted oracle implements nested-loop inner join with bag semantics. The row order is part of the SQL engine contract: for each left row in input order, visit each right row in input order, emitting every pair whose `ON` conjuncts are true. Duplicate matches multiply, and an empty side yields zero output rows with the deterministic joined column order. Future vectorized join work must reproduce this left-row-major order exactly.
+The interpreted oracle implements nested-loop inner join with bag semantics. The row order is part of the SQL engine contract: for each left row in input order, visit each right row in input order, emitting every pair whose `ON` conjuncts are true. Duplicate matches multiply, and an empty side yields zero output rows with the deterministic joined column order.
+
+The vectorized join implements the same contract. It extracts usable equi-key conjuncts where `BoundColumnRef = BoundColumnRef` has exactly one side in each input. When such keys exist, it builds a hash table on the right input and stores selected right row ids in per-key vectors in right-input order. The unordered hash table is lookup-only: output is produced only by probing selected left rows in left-input order, then walking the matched right-row vector in insertion order. Hash bucket or table iteration must never influence result order. Non-equi, literal, same-side, or otherwise complex conjuncts remain residual predicates evaluated after a key match. If no usable equi conjunct exists, vectorized execution falls back to a nested-loop join with the oracle's left-row-major visitation order.
 
 ## Vectorized execution
 
-Scan creates an identity selection vector in table row order. Filter evaluates predicates over the current selection vector and returns a newly allocated `shared_ptr<const vector<size_t>>`; downstream operators cannot mutate a handed-off selection. Project is the materialization boundary for the supported slice: it walks the selected row ids in order, evaluates scalar expressions, and builds output columns through `ColumnarBatch::add_column`, preserving equal row counts and SELECT-list order.
+Scan creates an identity selection vector in table row order. Filter evaluates predicates over the current selection vector and returns a newly allocated `shared_ptr<const vector<size_t>>`; downstream operators cannot mutate a handed-off selection. Join validates both child views, materializes a joined `ColumnarBatch`, then returns a fresh identity selection over that batch so downstream filters and projections cannot mutate child state. Project walks the selected row ids in order, evaluates scalar expressions, and builds output columns through `ColumnarBatch::add_column`, preserving equal row counts and SELECT-list order.
 
 ## Design bias
 
