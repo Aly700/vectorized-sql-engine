@@ -11,6 +11,7 @@
 namespace plan {
 
 enum class LogicalKind { Scan, Join, Filter, Project };
+enum class OrderPermission { Deterministic, Arbitrary };
 
 struct BoundColumnRef {
     std::string table;
@@ -34,6 +35,7 @@ struct Projection {
 
 struct LogicalPlan {
     LogicalKind kind{LogicalKind::Scan};
+    OrderPermission order_permission{OrderPermission::Deterministic};
     std::string table;
     std::vector<Projection> projections;
     std::vector<BoundComparisonExpr> predicates;

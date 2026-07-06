@@ -129,6 +129,19 @@ std::vector<plan::BoundComparisonExpr> bind_comparisons(const std::vector<Compar
     return bound;
 }
 
+void mark_arbitrary_order(plan::LogicalPlan& logical) {
+    logical.order_permission = plan::OrderPermission::Arbitrary;
+    if (logical.input != nullptr) {
+        mark_arbitrary_order(*logical.input);
+    }
+    if (logical.left != nullptr) {
+        mark_arbitrary_order(*logical.left);
+    }
+    if (logical.right != nullptr) {
+        mark_arbitrary_order(*logical.right);
+    }
+}
+
 } // namespace
 
 plan::LogicalPlan bind_select(const SelectQuery& query, const catalog::Catalog& catalog) {
@@ -161,7 +174,9 @@ plan::LogicalPlan bind_select(const SelectQuery& query, const catalog::Catalog& 
     if (query.predicate.has_value()) {
         plan = plan::LogicalPlan::filter(bind_comparisons(query.predicate->conjuncts, scopes), std::move(plan));
     }
-    return plan::LogicalPlan::project(std::move(projections), std::move(plan));
+    auto bound = plan::LogicalPlan::project(std::move(projections), std::move(plan));
+    mark_arbitrary_order(bound);
+    return bound;
 }
 
 } // namespace sql

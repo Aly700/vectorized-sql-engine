@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <iostream>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <utility>
 
@@ -60,6 +61,14 @@ std::string format_batch(const storage::ColumnarBatch& batch) {
     }
     out << "]";
     return out.str();
+}
+
+optimizer::MemoExpression join_expression(optimizer::GroupId left, optimizer::GroupId right) {
+    optimizer::MemoExpression expression;
+    expression.kind = optimizer::MemoExpressionKind::Join;
+    expression.children.push_back(left);
+    expression.children.push_back(right);
+    return expression;
 }
 
 void assert_memo_ingest_deduplicates_bound_plan_tree() {
@@ -124,11 +133,43 @@ void assert_memo_extracted_plan_matches_both_engines() {
     std::terminate();
 }
 
+void assert_cross_group_duplicate_expression_merges_groups() {
+    optimizer::Memo memo;
+    const auto left = memo.insert(plan::LogicalPlan::scan("left_t"));
+    const auto right = memo.insert(plan::LogicalPlan::scan("right_t"));
+
+    const auto left_right = memo.insert_expression(join_expression(left, right));
+    const auto right_left = memo.insert_expression(join_expression(right, left));
+    assert(left_right != right_left);
+
+    try {
+        assert(memo.insert_equivalent(left_right, join_expression(right, left)));
+    } catch (const std::logic_error& error) {
+        std::cerr << "cross-group duplicate did not merge\n"
+                  << "error: " << error.what() << "\n"
+                  << "memo dump:\n"
+                  << memo.dump();
+        std::terminate();
+    }
+
+    memo.assert_invariants();
+    const auto dump = memo.dump();
+    const auto expected = "group " + std::to_string(right_left) + " -> representative " + std::to_string(left_right);
+    if (dump.find(expected) == std::string::npos) {
+        std::cerr << "merged group representative was not observable\n"
+                  << "expected: " << expected << "\n"
+                  << "memo dump:\n"
+                  << dump;
+        std::terminate();
+    }
+}
+
 } // namespace
 
 int main() {
     assert_memo_ingest_deduplicates_bound_plan_tree();
     assert_memo_exploration_adds_equivalent_expressions();
     assert_memo_extracted_plan_matches_both_engines();
+    assert_cross_group_duplicate_expression_merges_groups();
     return 0;
 }

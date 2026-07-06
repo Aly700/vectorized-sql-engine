@@ -1,5 +1,6 @@
 #include "optimizer/rewrite.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <stdexcept>
 #include <utility>
@@ -87,12 +88,141 @@ bool is_canonical_false(const plan::BoundComparisonExpr& comparison) {
            is_literal_with_value(comparison.right, 0);
 }
 
-MemoExpression filter_expression(std::vector<plan::BoundComparisonExpr> predicates, GroupId child) {
+MemoExpression filter_expression(std::vector<plan::BoundComparisonExpr> predicates,
+                                 GroupId child,
+                                 plan::OrderPermission order_permission) {
     MemoExpression expression;
     expression.kind = MemoExpressionKind::Filter;
+    expression.order_permission = order_permission;
     expression.predicates = std::move(predicates);
     expression.children.push_back(child);
     return expression;
+}
+
+MemoExpression join_expression(std::vector<plan::BoundComparisonExpr> predicates,
+                               GroupId left,
+                               GroupId right,
+                               plan::OrderPermission order_permission) {
+    MemoExpression expression;
+    expression.kind = MemoExpressionKind::Join;
+    expression.order_permission = order_permission;
+    expression.predicates = std::move(predicates);
+    expression.children.push_back(left);
+    expression.children.push_back(right);
+    return expression;
+}
+
+void add_unique_table(std::vector<std::string>& tables, const std::string& table) {
+    if (std::find(tables.begin(), tables.end(), table) == tables.end()) {
+        tables.push_back(table);
+        std::sort(tables.begin(), tables.end());
+    }
+}
+
+std::vector<std::string> merge_tables(std::vector<std::string> left, const std::vector<std::string>& right) {
+    for (const auto& table : right) {
+        add_unique_table(left, table);
+    }
+    return left;
+}
+
+std::vector<std::string> referenced_tables(const plan::BoundScalarExpr& expression) {
+    std::vector<std::string> tables;
+    if (const auto* column = std::get_if<plan::BoundColumnRef>(&expression)) {
+        add_unique_table(tables, column->table);
+    }
+    return tables;
+}
+
+std::vector<std::string> referenced_tables(const plan::BoundComparisonExpr& predicate) {
+    return merge_tables(referenced_tables(predicate.left), referenced_tables(predicate.right));
+}
+
+bool contains_table(const std::vector<std::string>& tables, const std::string& table) {
+    return std::find(tables.begin(), tables.end(), table) != tables.end();
+}
+
+bool is_subset(const std::vector<std::string>& candidate, const std::vector<std::string>& allowed) {
+    for (const auto& table : candidate) {
+        if (!contains_table(allowed, table)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool references_side(const plan::BoundComparisonExpr& predicate, const std::vector<std::string>& tables) {
+    for (const auto& table : referenced_tables(predicate)) {
+        if (contains_table(tables, table)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool connects_children(const plan::BoundComparisonExpr& predicate,
+                       const std::vector<std::string>& left_tables,
+                       const std::vector<std::string>& right_tables) {
+    return references_side(predicate, left_tables) && references_side(predicate, right_tables);
+}
+
+bool has_connecting_predicate(const std::vector<plan::BoundComparisonExpr>& predicates,
+                              const std::vector<std::string>& left_tables,
+                              const std::vector<std::string>& right_tables) {
+    for (const auto& predicate : predicates) {
+        if (connects_children(predicate, left_tables, right_tables)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::vector<std::string> output_tables_for_group(const Memo& memo, GroupId group, std::vector<GroupId>& stack);
+
+std::vector<std::string> output_tables_for_expression(const Memo& memo,
+                                                      const MemoExpression& expression,
+                                                      std::vector<GroupId>& stack) {
+    switch (expression.kind) {
+    case MemoExpressionKind::Scan:
+        return {expression.table};
+    case MemoExpressionKind::Filter:
+    case MemoExpressionKind::Project:
+    case MemoExpressionKind::GroupRef:
+        return output_tables_for_group(memo, expression.children.at(0), stack);
+    case MemoExpressionKind::Join:
+        return merge_tables(output_tables_for_group(memo, expression.children.at(0), stack),
+                            output_tables_for_group(memo, expression.children.at(1), stack));
+    }
+    throw std::logic_error("unreachable memo expression kind");
+}
+
+std::vector<std::string> output_tables_for_group(const Memo& memo, GroupId group, std::vector<GroupId>& stack) {
+    group = memo.representative(group);
+    if (std::find(stack.begin(), stack.end(), group) != stack.end()) {
+        throw std::logic_error("memo table-set derivation encountered a cycle");
+    }
+
+    stack.push_back(group);
+    const auto& memo_group = memo.group(group);
+    auto tables = output_tables_for_expression(memo, memo_group.expressions.front().expression, stack);
+    for (std::size_t i = 1; i < memo_group.expressions.size(); ++i) {
+        const auto alternative_tables = output_tables_for_expression(memo, memo_group.expressions[i].expression, stack);
+        if (alternative_tables != tables) {
+            throw std::logic_error("memo group alternatives expose different table identity sets");
+        }
+    }
+    stack.pop_back();
+    return tables;
+}
+
+std::vector<std::string> output_tables_for_group(const Memo& memo, GroupId group) {
+    std::vector<GroupId> stack;
+    return output_tables_for_group(memo, group, stack);
+}
+
+bool can_apply_join_transform(const MemoExpression& expression) {
+    return expression.kind == MemoExpressionKind::Join &&
+           expression.order_permission == plan::OrderPermission::Arbitrary;
 }
 
 std::optional<plan::LogicalPlan> rewrite_once(
@@ -199,7 +329,9 @@ bool ConstantFoldComparisonRule::apply(Memo& memo, GroupId group, const MemoExpr
         return false;
     }
 
-    return memo.insert_equivalent(group, filter_expression(std::move(predicates), expression.children.at(0)));
+    return memo.insert_equivalent(
+        group,
+        filter_expression(std::move(predicates), expression.children.at(0), expression.order_permission));
 }
 
 std::optional<plan::LogicalPlan> DropAlwaysTrueFilterRule::apply(const plan::LogicalPlan& logical) const {
@@ -226,7 +358,9 @@ std::optional<plan::LogicalPlan> DropAlwaysTrueFilterRule::apply(const plan::Log
         return require_input(logical);
     }
 
-    return plan::LogicalPlan::filter(std::move(predicates), require_input(logical));
+    auto rewritten = plan::LogicalPlan::filter(std::move(predicates), require_input(logical));
+    rewritten.order_permission = logical.order_permission;
+    return rewritten;
 }
 
 bool DropAlwaysTrueFilterRule::apply(Memo& memo, GroupId group, const MemoExpression& expression) const {
@@ -253,7 +387,9 @@ bool DropAlwaysTrueFilterRule::apply(Memo& memo, GroupId group, const MemoExpres
         return memo.insert_group_ref_equivalent(group, expression.children.at(0));
     }
 
-    return memo.insert_equivalent(group, filter_expression(std::move(predicates), expression.children.at(0)));
+    return memo.insert_equivalent(
+        group,
+        filter_expression(std::move(predicates), expression.children.at(0), expression.order_permission));
 }
 
 std::optional<plan::LogicalPlan> AlwaysFalseFilterRule::apply(const plan::LogicalPlan& logical) const {
@@ -276,7 +412,9 @@ std::optional<plan::LogicalPlan> AlwaysFalseFilterRule::apply(const plan::Logica
         return std::nullopt;
     }
 
-    return plan::LogicalPlan::filter({canonical_false()}, require_input(logical));
+    auto rewritten = plan::LogicalPlan::filter({canonical_false()}, require_input(logical));
+    rewritten.order_permission = logical.order_permission;
+    return rewritten;
 }
 
 bool AlwaysFalseFilterRule::apply(Memo& memo, GroupId group, const MemoExpression& expression) const {
@@ -299,7 +437,10 @@ bool AlwaysFalseFilterRule::apply(Memo& memo, GroupId group, const MemoExpressio
         return false;
     }
 
-    return memo.insert_equivalent(group, filter_expression({canonical_false()}, expression.children.at(0)));
+    return memo.insert_equivalent(group,
+                                  filter_expression({canonical_false()},
+                                                    expression.children.at(0),
+                                                    expression.order_permission));
 }
 
 std::optional<plan::LogicalPlan> MergeAdjacentFiltersRule::apply(const plan::LogicalPlan& logical) const {
@@ -316,7 +457,9 @@ std::optional<plan::LogicalPlan> MergeAdjacentFiltersRule::apply(const plan::Log
     predicates.reserve(child.predicates.size() + logical.predicates.size());
     predicates.insert(predicates.end(), child.predicates.begin(), child.predicates.end());
     predicates.insert(predicates.end(), logical.predicates.begin(), logical.predicates.end());
-    return plan::LogicalPlan::filter(std::move(predicates), require_input(child));
+    auto rewritten = plan::LogicalPlan::filter(std::move(predicates), require_input(child));
+    rewritten.order_permission = logical.order_permission;
+    return rewritten;
 }
 
 bool MergeAdjacentFiltersRule::apply(Memo& memo, GroupId group, const MemoExpression& expression) const {
@@ -337,12 +480,165 @@ bool MergeAdjacentFiltersRule::apply(Memo& memo, GroupId group, const MemoExpres
         predicates.reserve(child_expression.predicates.size() + expression.predicates.size());
         predicates.insert(predicates.end(), child_expression.predicates.begin(), child_expression.predicates.end());
         predicates.insert(predicates.end(), expression.predicates.begin(), expression.predicates.end());
-        changed = memo.insert_equivalent(group,
-                                         filter_expression(std::move(predicates), child_expression.children.at(0))) ||
+        changed = memo.insert_equivalent(
+                      group,
+                      filter_expression(std::move(predicates),
+                                        child_expression.children.at(0),
+                                        expression.order_permission)) ||
                   changed;
     }
 
     return changed;
+}
+
+bool JoinCommuteRule::apply(Memo& memo, GroupId group, const MemoExpression& expression) const {
+    if (!can_apply_join_transform(expression)) {
+        return false;
+    }
+
+    return memo.insert_equivalent(
+        group,
+        join_expression(expression.predicates,
+                        expression.children.at(1),
+                        expression.children.at(0),
+                        expression.order_permission));
+}
+
+namespace {
+
+bool try_left_to_right_associate(Memo& memo, GroupId group, const MemoExpression& expression) {
+    const auto left_group = expression.children.at(0);
+    const auto right_group = expression.children.at(1);
+    bool changed = false;
+
+    const auto left_expression_count = memo.group(left_group).expressions.size();
+    for (std::size_t i = 0; i < left_expression_count; ++i) {
+        const auto left_expression = memo.group(left_group).expressions.at(i).expression;
+        if (left_expression.kind != MemoExpressionKind::Join ||
+            left_expression.order_permission != plan::OrderPermission::Arbitrary) {
+            continue;
+        }
+
+        const auto a_group = left_expression.children.at(0);
+        const auto b_group = left_expression.children.at(1);
+        const auto a_tables = output_tables_for_group(memo, a_group);
+        const auto b_tables = output_tables_for_group(memo, b_group);
+        const auto c_tables = output_tables_for_group(memo, right_group);
+        const auto inner_tables = merge_tables(b_tables, c_tables);
+        const auto outer_tables = merge_tables(a_tables, inner_tables);
+
+        std::vector<plan::BoundComparisonExpr> inner_predicates;
+        std::vector<plan::BoundComparisonExpr> outer_predicates = left_expression.predicates;
+        bool legal = true;
+        for (const auto& predicate : expression.predicates) {
+            const auto refs = referenced_tables(predicate);
+            if (is_subset(refs, inner_tables)) {
+                inner_predicates.push_back(predicate);
+            } else if (is_subset(refs, outer_tables)) {
+                outer_predicates.push_back(predicate);
+            } else {
+                legal = false;
+                break;
+            }
+        }
+        if (!legal || !has_connecting_predicate(inner_predicates, b_tables, c_tables)) {
+            continue;
+        }
+
+        const auto before_group_count = memo.group_count();
+        const auto inner_group = memo.insert_expression(join_expression(std::move(inner_predicates),
+                                                                        b_group,
+                                                                        right_group,
+                                                                        expression.order_permission));
+        if (memo.representative(inner_group) == memo.representative(group)) {
+            continue;
+        }
+
+        const auto inserted = memo.insert_equivalent(group,
+                                                     join_expression(std::move(outer_predicates),
+                                                                     a_group,
+                                                                     inner_group,
+                                                                     expression.order_permission));
+        changed = inserted || memo.group_count() != before_group_count || changed;
+    }
+
+    return changed;
+}
+
+bool try_right_to_left_associate(Memo& memo, GroupId group, const MemoExpression& expression) {
+    const auto left_group = expression.children.at(0);
+    const auto right_group = expression.children.at(1);
+    bool changed = false;
+
+    const auto right_expression_count = memo.group(right_group).expressions.size();
+    for (std::size_t i = 0; i < right_expression_count; ++i) {
+        const auto right_expression = memo.group(right_group).expressions.at(i).expression;
+        if (right_expression.kind != MemoExpressionKind::Join ||
+            right_expression.order_permission != plan::OrderPermission::Arbitrary) {
+            continue;
+        }
+
+        const auto b_group = right_expression.children.at(0);
+        const auto c_group = right_expression.children.at(1);
+        const auto a_tables = output_tables_for_group(memo, left_group);
+        const auto b_tables = output_tables_for_group(memo, b_group);
+        const auto c_tables = output_tables_for_group(memo, c_group);
+        const auto inner_tables = merge_tables(a_tables, b_tables);
+        const auto outer_tables = merge_tables(inner_tables, c_tables);
+
+        std::vector<plan::BoundComparisonExpr> inner_predicates;
+        std::vector<plan::BoundComparisonExpr> residual_outer_predicates;
+        bool legal = true;
+        for (const auto& predicate : expression.predicates) {
+            const auto refs = referenced_tables(predicate);
+            if (is_subset(refs, inner_tables)) {
+                inner_predicates.push_back(predicate);
+            } else if (is_subset(refs, outer_tables)) {
+                residual_outer_predicates.push_back(predicate);
+            } else {
+                legal = false;
+                break;
+            }
+        }
+        if (!legal || !has_connecting_predicate(inner_predicates, a_tables, b_tables)) {
+            continue;
+        }
+
+        std::vector<plan::BoundComparisonExpr> outer_predicates = right_expression.predicates;
+        outer_predicates.insert(outer_predicates.end(),
+                                residual_outer_predicates.begin(),
+                                residual_outer_predicates.end());
+
+        const auto before_group_count = memo.group_count();
+        const auto inner_group = memo.insert_expression(join_expression(std::move(inner_predicates),
+                                                                        left_group,
+                                                                        b_group,
+                                                                        expression.order_permission));
+        if (memo.representative(inner_group) == memo.representative(group)) {
+            continue;
+        }
+
+        const auto inserted = memo.insert_equivalent(group,
+                                                     join_expression(std::move(outer_predicates),
+                                                                     inner_group,
+                                                                     c_group,
+                                                                     expression.order_permission));
+        changed = inserted || memo.group_count() != before_group_count || changed;
+    }
+
+    return changed;
+}
+
+} // namespace
+
+bool JoinAssociateRule::apply(Memo& memo, GroupId group, const MemoExpression& expression) const {
+    if (!can_apply_join_transform(expression)) {
+        return false;
+    }
+
+    const auto left_changed = try_left_to_right_associate(memo, group, expression);
+    const auto right_changed = try_right_to_left_associate(memo, group, expression);
+    return left_changed || right_changed;
 }
 
 RewriteResult rewrite_to_fixpoint(const plan::LogicalPlan& logical,
@@ -408,10 +704,14 @@ std::vector<std::reference_wrapper<const MemoRule>> default_memo_rules() {
     static const MergeAdjacentFiltersRule merge_filters;
     static const AlwaysFalseFilterRule always_false;
     static const DropAlwaysTrueFilterRule drop_true;
+    static const JoinCommuteRule join_commute;
+    static const JoinAssociateRule join_associate;
     return {std::cref(static_cast<const MemoRule&>(constant_fold)),
             std::cref(static_cast<const MemoRule&>(merge_filters)),
             std::cref(static_cast<const MemoRule&>(always_false)),
-            std::cref(static_cast<const MemoRule&>(drop_true))};
+            std::cref(static_cast<const MemoRule&>(drop_true)),
+            std::cref(join_commute),
+            std::cref(join_associate)};
 }
 
 } // namespace optimizer

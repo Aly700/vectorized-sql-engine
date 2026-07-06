@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <functional>
+#include <iterator>
 #include <sstream>
 #include <stdexcept>
 #include <utility>
@@ -44,6 +45,7 @@ void hash_projection(std::size_t& seed, const plan::Projection& projection) {
 std::size_t structural_hash(const MemoExpression& expression) {
     std::size_t seed = 0;
     hash_combine(seed, static_cast<std::size_t>(expression.kind));
+    hash_combine(seed, static_cast<std::size_t>(expression.order_permission));
     hash_string(seed, expression.table);
 
     hash_combine(seed, expression.projections.size());
@@ -97,7 +99,7 @@ bool vector_equal(const std::vector<T>& left, const std::vector<T>& right, Equal
 }
 
 bool structural_equal(const MemoExpression& left, const MemoExpression& right) {
-    return left.kind == right.kind && left.table == right.table &&
+    return left.kind == right.kind && left.order_permission == right.order_permission && left.table == right.table &&
            vector_equal(left.projections, right.projections, projection_equal) &&
            vector_equal(left.predicates, right.predicates, comparison_equal) && left.children == right.children;
 }
@@ -210,10 +212,20 @@ std::string memo_expression_to_string(const MemoExpression& expression) {
     throw std::logic_error("unreachable memo expression kind");
 }
 
+MemoExpression group_ref_expression(GroupId representative,
+                                    plan::OrderPermission order_permission = plan::OrderPermission::Deterministic) {
+    MemoExpression expression;
+    expression.kind = MemoExpressionKind::GroupRef;
+    expression.order_permission = order_permission;
+    expression.children.push_back(representative);
+    return expression;
+}
+
 } // namespace
 
 GroupId Memo::insert(const plan::LogicalPlan& logical) {
     MemoExpression expression;
+    expression.order_permission = logical.order_permission;
     switch (logical.kind) {
     case plan::LogicalKind::Scan:
         expression.kind = MemoExpressionKind::Scan;
@@ -240,12 +252,14 @@ GroupId Memo::insert(const plan::LogicalPlan& logical) {
 }
 
 GroupId Memo::insert_expression(MemoExpression expression) {
+    canonicalize_expression_references(expression);
     validate_expression(expression);
     if (const auto existing = find_existing(expression); existing != 0) {
         return existing;
     }
 
     const auto id = static_cast<GroupId>(groups_.size() + 1);
+    representatives_.push_back(id);
     groups_.push_back(MemoGroup{id, {GroupExpression{std::move(expression)}}});
     index_expression(groups_.back().expressions.front().expression, id);
     assert_invariants();
@@ -256,14 +270,18 @@ bool Memo::insert_equivalent(GroupId group_id, MemoExpression expression) {
     if (!has_group(group_id)) {
         throw std::out_of_range("unknown memo group");
     }
+    group_id = representative(group_id);
+    canonicalize_expression_references(expression);
     validate_expression(expression);
     validate_no_cycle_from(group_id, expression);
 
     if (const auto existing = find_existing(expression); existing != 0) {
-        if (existing == group_id) {
+        const auto existing_representative = representative(existing);
+        if (existing_representative == group_id) {
             return false;
         }
-        throw std::logic_error("memo expression already belongs to a different group; use GroupRef for equivalence");
+        merge_groups(group_id, existing_representative);
+        return true;
     }
 
     auto& target = groups_.at(index_for(group_id));
@@ -281,14 +299,13 @@ bool Memo::insert_group_ref_equivalent(GroupId group_id, GroupId equivalent_grou
         return false;
     }
 
-    MemoExpression reference;
-    reference.kind = MemoExpressionKind::GroupRef;
-    reference.children.push_back(equivalent_group);
+    const auto order_permission = group(group_id).expressions.front().expression.order_permission;
+    auto reference = group_ref_expression(representative(equivalent_group), order_permission);
     return insert_equivalent(group_id, std::move(reference));
 }
 
 const MemoGroup& Memo::group(GroupId id) const {
-    return groups_.at(index_for(id));
+    return groups_.at(index_for(representative(id)));
 }
 
 plan::LogicalPlan Memo::extract(GroupId id) const {
@@ -297,11 +314,32 @@ plan::LogicalPlan Memo::extract(GroupId id) const {
     return extract(id, stack);
 }
 
+AlternativeExtractionResult Memo::extract_alternatives(GroupId id, AlternativeExtractionOptions options) const {
+    assert_invariants();
+    if (options.max_expressions_per_group == 0 || options.max_plans == 0) {
+        throw std::invalid_argument("memo alternative extraction bounds must be non-zero");
+    }
+
+    AlternativeExtractionResult result;
+    std::vector<GroupId> stack;
+    result.plans = extract_alternatives_for_group(id, options, result, stack);
+    if (result.plans.size() > options.max_plans) {
+        result.plans.resize(options.max_plans);
+        result.hit_plan_bound = true;
+    }
+    return result;
+}
+
 std::string Memo::dump() const {
     assert_invariants();
     std::ostringstream out;
     for (const auto& memo_group : groups_) {
-        out << "group " << memo_group.id << ":\n";
+        const auto rep = representative(memo_group.id);
+        if (rep != memo_group.id) {
+            out << "group " << memo_group.id << " -> representative " << rep << ":\n";
+        } else {
+            out << "group " << memo_group.id << ":\n";
+        }
         for (std::size_t i = 0; i < memo_group.expressions.size(); ++i) {
             out << "  expr " << i << ": " << memo_expression_to_string(memo_group.expressions[i].expression) << "\n";
         }
@@ -310,6 +348,23 @@ std::string Memo::dump() const {
 }
 
 void Memo::assert_invariants() const {
+    if (representatives_.size() != groups_.size() + 1 || representatives_.front() != 0) {
+        throw std::logic_error("memo representative table cardinality is inconsistent");
+    }
+    for (GroupId id = 1; id <= groups_.size(); ++id) {
+        const auto parent = representatives_.at(static_cast<std::size_t>(id));
+        if (!has_group(parent)) {
+            throw std::logic_error("memo representative points at an unknown group");
+        }
+        const auto rep = representative(id);
+        if (!has_group(rep) || representative(rep) != rep) {
+            throw std::logic_error("memo representative chain is not rooted");
+        }
+        if (rep > id) {
+            throw std::logic_error("memo representative winner is not deterministic");
+        }
+    }
+
     std::size_t expression_count = 0;
     for (std::size_t i = 0; i < groups_.size(); ++i) {
         const auto expected_id = static_cast<GroupId>(i + 1);
@@ -320,9 +375,28 @@ void Memo::assert_invariants() const {
             throw std::logic_error("memo group has no expressions");
         }
 
+        if (!is_representative(groups_[i].id)) {
+            if (groups_[i].expressions.size() != 1) {
+                throw std::logic_error("memo non-representative group must contain one alias expression");
+            }
+            const auto& alias = groups_[i].expressions.front().expression;
+            if (alias.kind != MemoExpressionKind::GroupRef || alias.children.size() != 1 ||
+                alias.children.front() != representative(groups_[i].id)) {
+                throw std::logic_error("memo non-representative group does not point at its representative");
+            }
+            validate_expression(alias);
+            validate_no_cycle_from(groups_[i].id, alias);
+            continue;
+        }
+
         for (const auto& expression : groups_[i].expressions) {
             validate_expression(expression.expression);
             validate_no_cycle_from(groups_[i].id, expression.expression);
+            for (const auto child : expression.expression.children) {
+                if (child != representative(child)) {
+                    throw std::logic_error("memo representative expression has a non-canonical child reference");
+                }
+            }
             const auto owner = find_existing(expression.expression);
             if (owner != groups_[i].id) {
                 throw std::logic_error("memo structural index does not point back to expression owner");
@@ -336,6 +410,9 @@ void Memo::assert_invariants() const {
         for (const auto& indexed : bucket.second) {
             if (structural_hash(indexed.first) != bucket.first) {
                 throw std::logic_error("memo structural index bucket hash is inconsistent");
+            }
+            if (!is_representative(indexed.second)) {
+                throw std::logic_error("memo structural index owner is not a representative group");
             }
             const auto& owner = group(indexed.second);
             const auto found = std::find_if(owner.expressions.begin(), owner.expressions.end(), [&](const auto& item) {
@@ -364,15 +441,40 @@ std::size_t Memo::index_for(GroupId id) const {
     return static_cast<std::size_t>(id - 1);
 }
 
+GroupId Memo::representative(GroupId id) const {
+    if (!has_group(id)) {
+        throw std::out_of_range("unknown memo group");
+    }
+    auto current = id;
+    std::vector<GroupId> seen;
+    while (representatives_.at(static_cast<std::size_t>(current)) != current) {
+        if (std::find(seen.begin(), seen.end(), current) != seen.end()) {
+            throw std::logic_error("memo representative cycle detected");
+        }
+        seen.push_back(current);
+        current = representatives_.at(static_cast<std::size_t>(current));
+        if (!has_group(current)) {
+            throw std::logic_error("memo representative points at an unknown group");
+        }
+    }
+    return current;
+}
+
+bool Memo::is_representative(GroupId id) const {
+    return representative(id) == id;
+}
+
 GroupId Memo::find_existing(const MemoExpression& expression) const {
-    const auto hash = structural_hash(expression);
+    auto canonical = expression;
+    canonicalize_expression_references(canonical);
+    const auto hash = structural_hash(canonical);
     const auto it = expression_index_.find(hash);
     if (it == expression_index_.end()) {
         return 0;
     }
     for (const auto& candidate : it->second) {
-        if (structural_equal(candidate.first, expression)) {
-            return candidate.second;
+        if (structural_equal(candidate.first, canonical)) {
+            return representative(candidate.second);
         }
     }
     return 0;
@@ -408,6 +510,7 @@ bool Memo::reaches(GroupId from, GroupId target, std::vector<GroupId>& stack) co
 }
 
 plan::LogicalPlan Memo::extract(GroupId id, std::vector<GroupId>& stack) const {
+    id = representative(id);
     const auto& memo_group = group(id);
     if (std::find(stack.begin(), stack.end(), id) != stack.end()) {
         throw std::logic_error("memo extraction encountered a cycle");
@@ -415,33 +518,37 @@ plan::LogicalPlan Memo::extract(GroupId id, std::vector<GroupId>& stack) const {
 
     stack.push_back(id);
     const auto& expression = memo_group.expressions.front().expression;
+    auto result = extract_expression(expression, stack);
+    stack.pop_back();
+    return result;
+}
+
+plan::LogicalPlan Memo::extract_expression(const MemoExpression& expression, std::vector<GroupId>& stack) const {
     switch (expression.kind) {
     case MemoExpressionKind::Scan: {
         auto result = plan::LogicalPlan::scan(expression.table);
-        stack.pop_back();
+        result.order_permission = expression.order_permission;
         return result;
     }
     case MemoExpressionKind::Filter: {
         auto result = plan::LogicalPlan::filter(expression.predicates, extract(expression.children.at(0), stack));
-        stack.pop_back();
+        result.order_permission = expression.order_permission;
         return result;
     }
     case MemoExpressionKind::Project: {
         auto result = plan::LogicalPlan::project(expression.projections, extract(expression.children.at(0), stack));
-        stack.pop_back();
+        result.order_permission = expression.order_permission;
         return result;
     }
     case MemoExpressionKind::Join: {
         auto result = plan::LogicalPlan::join(expression.predicates,
                                              extract(expression.children.at(0), stack),
                                              extract(expression.children.at(1), stack));
-        stack.pop_back();
+        result.order_permission = expression.order_permission;
         return result;
     }
     case MemoExpressionKind::GroupRef: {
-        auto result = extract(expression.children.at(0), stack);
-        stack.pop_back();
-        return result;
+        return extract(expression.children.at(0), stack);
     }
     }
     throw std::logic_error("unreachable memo expression kind");
@@ -497,7 +604,256 @@ void Memo::validate_no_cycle_from(GroupId group_id, const MemoExpression& expres
 }
 
 void Memo::index_expression(const MemoExpression& expression, GroupId owner) {
-    expression_index_[structural_hash(expression)].push_back({expression, owner});
+    expression_index_[structural_hash(expression)].push_back({expression, representative(owner)});
+}
+
+void Memo::canonicalize_expression_references(MemoExpression& expression) const {
+    for (auto& child : expression.children) {
+        child = representative(child);
+    }
+}
+
+void Memo::canonicalize_child_references() {
+    for (auto& memo_group : groups_) {
+        for (auto& expression : memo_group.expressions) {
+            canonicalize_expression_references(expression.expression);
+        }
+    }
+}
+
+void Memo::deduplicate_group_expressions(GroupId group_id) {
+    group_id = representative(group_id);
+    auto& expressions = groups_.at(index_for(group_id)).expressions;
+    std::vector<GroupExpression> unique;
+    unique.reserve(expressions.size());
+    for (auto& candidate : expressions) {
+        const auto already_present =
+            std::find_if(unique.begin(), unique.end(), [&](const auto& existing) {
+                return structural_equal(existing.expression, candidate.expression);
+            }) != unique.end();
+        if (!already_present) {
+            unique.push_back(std::move(candidate));
+        }
+    }
+    if (unique.empty()) {
+        throw std::logic_error("memo representative group cannot become empty");
+    }
+    expressions = std::move(unique);
+}
+
+void Memo::mark_non_representative_groups() {
+    for (auto& memo_group : groups_) {
+        const auto rep = representative(memo_group.id);
+        if (rep == memo_group.id) {
+            continue;
+        }
+        const auto order_permission = group(rep).expressions.front().expression.order_permission;
+        memo_group.expressions = {GroupExpression{group_ref_expression(rep, order_permission)}};
+    }
+}
+
+void Memo::rebuild_expression_index() {
+    expression_index_.clear();
+    for (const auto& memo_group : groups_) {
+        if (!is_representative(memo_group.id)) {
+            continue;
+        }
+        for (const auto& expression : memo_group.expressions) {
+            const auto hash = structural_hash(expression.expression);
+            auto& bucket = expression_index_[hash];
+            for (const auto& candidate : bucket) {
+                if (structural_equal(candidate.first, expression.expression) &&
+                    representative(candidate.second) != memo_group.id) {
+                    throw std::logic_error("memo structural duplicate remains across representative groups");
+                }
+            }
+            bucket.push_back({expression.expression, memo_group.id});
+        }
+    }
+}
+
+bool Memo::merge_representatives_once(GroupId first, GroupId second) {
+    first = representative(first);
+    second = representative(second);
+    if (first == second) {
+        return false;
+    }
+
+    const auto winner = std::min(first, second);
+    const auto loser = std::max(first, second);
+    if (reaches(winner, loser) || reaches(loser, winner)) {
+        throw std::logic_error("memo group merge would create a cycle");
+    }
+
+    auto& winner_group = groups_.at(index_for(winner));
+    auto& loser_group = groups_.at(index_for(loser));
+    winner_group.expressions.insert(winner_group.expressions.end(),
+                                    std::make_move_iterator(loser_group.expressions.begin()),
+                                    std::make_move_iterator(loser_group.expressions.end()));
+    loser_group.expressions.clear();
+    representatives_.at(static_cast<std::size_t>(loser)) = winner;
+    return true;
+}
+
+void Memo::merge_groups(GroupId first, GroupId second) {
+    if (!merge_representatives_once(first, second)) {
+        return;
+    }
+    normalize_after_merge();
+    assert_invariants();
+}
+
+void Memo::normalize_after_merge() {
+    bool changed = false;
+    do {
+        changed = false;
+        mark_non_representative_groups();
+        canonicalize_child_references();
+        for (const auto& memo_group : groups_) {
+            if (is_representative(memo_group.id)) {
+                deduplicate_group_expressions(memo_group.id);
+            }
+        }
+
+        expression_index_.clear();
+        for (const auto& memo_group : groups_) {
+            if (!is_representative(memo_group.id)) {
+                continue;
+            }
+            for (const auto& expression : memo_group.expressions) {
+                validate_expression(expression.expression);
+                validate_no_cycle_from(memo_group.id, expression.expression);
+                const auto hash = structural_hash(expression.expression);
+                auto& bucket = expression_index_[hash];
+                for (const auto& candidate : bucket) {
+                    const auto owner = representative(candidate.second);
+                    if (owner != memo_group.id && structural_equal(candidate.first, expression.expression)) {
+                        merge_representatives_once(owner, memo_group.id);
+                        changed = true;
+                        break;
+                    }
+                }
+                if (changed) {
+                    break;
+                }
+                bucket.push_back({expression.expression, memo_group.id});
+            }
+            if (changed) {
+                break;
+            }
+        }
+    } while (changed);
+
+    mark_non_representative_groups();
+    canonicalize_child_references();
+    for (const auto& memo_group : groups_) {
+        if (is_representative(memo_group.id)) {
+            deduplicate_group_expressions(memo_group.id);
+        }
+    }
+    rebuild_expression_index();
+}
+
+std::vector<plan::LogicalPlan> Memo::extract_alternatives_for_group(
+    GroupId id,
+    const AlternativeExtractionOptions& options,
+    AlternativeExtractionResult& result,
+    std::vector<GroupId>& stack) const {
+    id = representative(id);
+    if (std::find(stack.begin(), stack.end(), id) != stack.end()) {
+        throw std::logic_error("memo alternative extraction encountered a cycle");
+    }
+
+    const auto& memo_group = group(id);
+    result.max_group_expression_count = std::max(result.max_group_expression_count, memo_group.expressions.size());
+    const auto expression_count = std::min(options.max_expressions_per_group, memo_group.expressions.size());
+    if (expression_count < memo_group.expressions.size()) {
+        result.hit_expression_bound = true;
+    }
+
+    std::vector<plan::LogicalPlan> alternatives;
+    stack.push_back(id);
+    for (std::size_t i = 0; i < expression_count; ++i) {
+        auto expression_alternatives =
+            extract_alternatives_for_expression(memo_group.expressions[i].expression, options, result, stack);
+        for (auto& alternative : expression_alternatives) {
+            if (alternatives.size() >= options.max_plans) {
+                result.hit_plan_bound = true;
+                break;
+            }
+            alternatives.push_back(std::move(alternative));
+        }
+        if (alternatives.size() >= options.max_plans) {
+            result.hit_plan_bound = true;
+            break;
+        }
+    }
+    stack.pop_back();
+    return alternatives;
+}
+
+std::vector<plan::LogicalPlan> Memo::extract_alternatives_for_expression(
+    const MemoExpression& expression,
+    const AlternativeExtractionOptions& options,
+    AlternativeExtractionResult& result,
+    std::vector<GroupId>& stack) const {
+    switch (expression.kind) {
+    case MemoExpressionKind::Scan: {
+        auto scan = plan::LogicalPlan::scan(expression.table);
+        scan.order_permission = expression.order_permission;
+        return {std::move(scan)};
+    }
+    case MemoExpressionKind::GroupRef:
+        return extract_alternatives_for_group(expression.children.at(0), options, result, stack);
+    case MemoExpressionKind::Filter: {
+        auto children = extract_alternatives_for_group(expression.children.at(0), options, result, stack);
+        std::vector<plan::LogicalPlan> alternatives;
+        alternatives.reserve(children.size());
+        for (auto& child : children) {
+            if (alternatives.size() >= options.max_plans) {
+                result.hit_plan_bound = true;
+                break;
+            }
+            auto filter = plan::LogicalPlan::filter(expression.predicates, std::move(child));
+            filter.order_permission = expression.order_permission;
+            alternatives.push_back(std::move(filter));
+        }
+        return alternatives;
+    }
+    case MemoExpressionKind::Project: {
+        auto children = extract_alternatives_for_group(expression.children.at(0), options, result, stack);
+        std::vector<plan::LogicalPlan> alternatives;
+        alternatives.reserve(children.size());
+        for (auto& child : children) {
+            if (alternatives.size() >= options.max_plans) {
+                result.hit_plan_bound = true;
+                break;
+            }
+            auto project = plan::LogicalPlan::project(expression.projections, std::move(child));
+            project.order_permission = expression.order_permission;
+            alternatives.push_back(std::move(project));
+        }
+        return alternatives;
+    }
+    case MemoExpressionKind::Join: {
+        auto left_plans = extract_alternatives_for_group(expression.children.at(0), options, result, stack);
+        auto right_plans = extract_alternatives_for_group(expression.children.at(1), options, result, stack);
+        std::vector<plan::LogicalPlan> alternatives;
+        for (const auto& left : left_plans) {
+            for (const auto& right : right_plans) {
+                if (alternatives.size() >= options.max_plans) {
+                    result.hit_plan_bound = true;
+                    return alternatives;
+                }
+                auto join = plan::LogicalPlan::join(expression.predicates, left, right);
+                join.order_permission = expression.order_permission;
+                alternatives.push_back(std::move(join));
+            }
+        }
+        return alternatives;
+    }
+    }
+    throw std::logic_error("unreachable memo expression kind");
 }
 
 } // namespace optimizer
