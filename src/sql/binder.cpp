@@ -321,6 +321,7 @@ std::vector<plan::SortKey> bind_order_by_keys(const std::vector<OrderByKey>& key
                                               const std::vector<TableScope>& scopes,
                                               const std::vector<plan::BoundColumnRef>& group_keys,
                                               bool aggregate_query,
+                                              bool distinct_query,
                                               const std::vector<std::string>& output_names) {
     std::vector<plan::SortKey> bound;
     bound.reserve(keys.size());
@@ -339,6 +340,11 @@ std::vector<plan::SortKey> bind_order_by_keys(const std::vector<OrderByKey>& key
 
         const auto& column = std::get<ColumnRef>(key.expression);
         auto sort_key = plan::SortKey{bind_column_ref(column, scopes), key.direction};
+        if (distinct_query) {
+            throw BindError(column.position,
+                            "ORDER BY column '" + output_name(column) +
+                                "' must appear in SELECT list for SELECT DISTINCT");
+        }
         if (aggregate_query && !contains_group_key(group_keys, sort_key.column)) {
             throw BindError(column.position,
                             "ORDER BY column '" + output_name(column) +
@@ -415,7 +421,7 @@ plan::LogicalPlan bind_select(const SelectQuery& query, const catalog::Catalog& 
     }
 
     auto sort_keys =
-        bind_order_by_keys(query.order_by, scopes, group_keys, aggregate_query, output_name_order);
+        bind_order_by_keys(query.order_by, scopes, group_keys, aggregate_query, query.distinct, output_name_order);
 
     auto plan = plan::LogicalPlan::scan(query.table, binding_name(query));
     std::vector<TableScope> visible_scopes;
@@ -437,9 +443,17 @@ plan::LogicalPlan bind_select(const SelectQuery& query, const catalog::Catalog& 
         plan = plan::LogicalPlan::filter(std::move(having_predicates), std::move(plan));
     }
     auto bound = plan::LogicalPlan::project(std::move(projections), std::move(plan));
+    if (query.distinct) {
+        bound = plan::LogicalPlan::distinct(std::move(bound));
+    }
     mark_arbitrary_order(bound);
     if (!sort_keys.empty()) {
-        return plan::LogicalPlan::sort(std::move(sort_keys), std::move(bound));
+        bound = plan::LogicalPlan::sort(std::move(sort_keys), std::move(bound));
+    }
+    if (query.limit.has_value()) {
+        auto limited = plan::LogicalPlan::limit(*query.limit, std::move(bound));
+        limited.order_permission = limited.input->order_permission;
+        return limited;
     }
     return bound;
 }

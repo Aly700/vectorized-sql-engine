@@ -185,6 +185,15 @@ storage::ColumnarBatch materialize_rows(const storage::ColumnarBatch& batch, con
     return out;
 }
 
+std::vector<std::int64_t> row_values(const storage::ColumnarBatch& batch, std::size_t row) {
+    std::vector<std::int64_t> values;
+    values.reserve(batch.column_names().size());
+    for (const auto& name : batch.column_names()) {
+        values.push_back(batch.column(name).at(row));
+    }
+    return values;
+}
+
 storage::ColumnarBatch materialize_project_rows(const plan::LogicalPlan& project,
                                                 const storage::ColumnarBatch& batch,
                                                 const std::vector<std::size_t>& rows) {
@@ -531,6 +540,32 @@ storage::ColumnarBatch execute_sort(const plan::LogicalPlan& plan, const Catalog
     return materialize_rows(input, rows);
 }
 
+storage::ColumnarBatch execute_distinct(const plan::LogicalPlan& plan, const Catalog& catalog) {
+    const auto input = execute_interpreted(require_input(plan), catalog);
+    std::map<std::vector<std::int64_t>, bool> seen;
+    std::vector<std::size_t> rows;
+    rows.reserve(input.row_count());
+    for (std::size_t row = 0; row < input.row_count(); ++row) {
+        auto key = row_values(input, row);
+        const auto [_, inserted] = seen.emplace(std::move(key), true);
+        if (inserted) {
+            rows.push_back(row);
+        }
+    }
+    return materialize_rows(input, rows);
+}
+
+storage::ColumnarBatch execute_limit(const plan::LogicalPlan& plan, const Catalog& catalog) {
+    const auto input = execute_interpreted(require_input(plan), catalog);
+    const auto count = std::min(plan.limit_count, input.row_count());
+    std::vector<std::size_t> rows;
+    rows.reserve(count);
+    for (std::size_t row = 0; row < count; ++row) {
+        rows.push_back(row);
+    }
+    return materialize_rows(input, rows);
+}
+
 } // namespace
 
 void Catalog::add_table(std::string name, storage::ColumnarBatch batch) {
@@ -583,8 +618,12 @@ storage::ColumnarBatch execute_interpreted(const plan::LogicalPlan& plan, const 
     }
     case plan::LogicalKind::Aggregate:
         return execute_aggregate(plan, catalog);
+    case plan::LogicalKind::Distinct:
+        return execute_distinct(plan, catalog);
     case plan::LogicalKind::Sort:
         return execute_sort(plan, catalog);
+    case plan::LogicalKind::Limit:
+        return execute_limit(plan, catalog);
     }
     throw std::logic_error("unreachable logical plan kind");
 }

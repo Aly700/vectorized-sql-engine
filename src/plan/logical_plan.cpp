@@ -187,6 +187,10 @@ void append_plan(std::ostringstream& out, const LogicalPlan& logical, std::size_
         out << "]]\n";
         append_plan(out, require_input(logical), depth + 1);
         return;
+    case LogicalKind::Distinct:
+        out << "Distinct\n";
+        append_plan(out, require_input(logical), depth + 1);
+        return;
     case LogicalKind::Sort:
         out << "Sort[";
         for (std::size_t i = 0; i < logical.sort_keys.size(); ++i) {
@@ -196,6 +200,10 @@ void append_plan(std::ostringstream& out, const LogicalPlan& logical, std::size_
             out << sort_key_to_string(logical.sort_keys[i]);
         }
         out << "]\n";
+        append_plan(out, require_input(logical), depth + 1);
+        return;
+    case LogicalKind::Limit:
+        out << "Limit[" << logical.limit_count << "]\n";
         append_plan(out, require_input(logical), depth + 1);
         return;
     }

@@ -2,6 +2,7 @@
 
 #include "sql/ast.hpp"
 
+#include <cstddef>
 #include <memory>
 #include <optional>
 #include <string>
@@ -11,7 +12,7 @@
 
 namespace plan {
 
-enum class LogicalKind { Scan, Join, Filter, Project, Aggregate, Sort };
+enum class LogicalKind { Scan, Join, Filter, Project, Aggregate, Distinct, Sort, Limit };
 enum class OrderPermission { Deterministic, Arbitrary };
 
 struct BoundColumnRef {
@@ -85,6 +86,7 @@ struct LogicalPlan {
     std::vector<AggregateExpression> aggregate_expressions;
     std::vector<SortKey> sort_keys;
     std::vector<BoundPredicate> predicates;
+    std::size_t limit_count{0};
     std::shared_ptr<LogicalPlan> input;
     std::shared_ptr<LogicalPlan> left;
     std::shared_ptr<LogicalPlan> right;
@@ -141,10 +143,25 @@ struct LogicalPlan {
         return p;
     }
 
+    static LogicalPlan distinct(LogicalPlan child) {
+        LogicalPlan p;
+        p.kind = LogicalKind::Distinct;
+        p.input = std::make_shared<LogicalPlan>(std::move(child));
+        return p;
+    }
+
     static LogicalPlan sort(std::vector<SortKey> sort_keys, LogicalPlan child) {
         LogicalPlan p;
         p.kind = LogicalKind::Sort;
         p.sort_keys = std::move(sort_keys);
+        p.input = std::make_shared<LogicalPlan>(std::move(child));
+        return p;
+    }
+
+    static LogicalPlan limit(std::size_t count, LogicalPlan child) {
+        LogicalPlan p;
+        p.kind = LogicalKind::Limit;
+        p.limit_count = count;
         p.input = std::make_shared<LogicalPlan>(std::move(child));
         return p;
     }

@@ -2,6 +2,7 @@
 
 #include "plan/logical_plan.hpp"
 
+#include <cstddef>
 #include <memory>
 #include <string>
 #include <utility>
@@ -9,7 +10,7 @@
 
 namespace plan {
 
-enum class PhysicalKind { Scan, Join, Filter, Project, Aggregate, Sort };
+enum class PhysicalKind { Scan, Join, Filter, Project, Aggregate, Distinct, Sort, Limit };
 
 struct PhysicalPlan {
     PhysicalKind kind{PhysicalKind::Scan};
@@ -22,6 +23,7 @@ struct PhysicalPlan {
     std::vector<AggregateExpression> aggregate_expressions;
     std::vector<SortKey> sort_keys;
     std::vector<BoundPredicate> predicates;
+    std::size_t limit_count{0};
     std::shared_ptr<PhysicalPlan> input;
     std::shared_ptr<PhysicalPlan> left;
     std::shared_ptr<PhysicalPlan> right;
@@ -76,10 +78,25 @@ struct PhysicalPlan {
         return p;
     }
 
+    static PhysicalPlan distinct(PhysicalPlan child) {
+        PhysicalPlan p;
+        p.kind = PhysicalKind::Distinct;
+        p.input = std::make_shared<PhysicalPlan>(std::move(child));
+        return p;
+    }
+
     static PhysicalPlan sort(std::vector<SortKey> sort_keys, PhysicalPlan child) {
         PhysicalPlan p;
         p.kind = PhysicalKind::Sort;
         p.sort_keys = std::move(sort_keys);
+        p.input = std::make_shared<PhysicalPlan>(std::move(child));
+        return p;
+    }
+
+    static PhysicalPlan limit(std::size_t count, PhysicalPlan child) {
+        PhysicalPlan p;
+        p.kind = PhysicalKind::Limit;
+        p.limit_count = count;
         p.input = std::make_shared<PhysicalPlan>(std::move(child));
         return p;
     }

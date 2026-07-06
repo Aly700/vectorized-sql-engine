@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
@@ -311,10 +312,129 @@ bool is_sorted_by_keys(const storage::ColumnarBatch& batch, const std::vector<pl
 }
 
 const std::vector<plan::SortKey>* root_sort_keys(const plan::LogicalPlan& logical) {
+    if (logical.kind == plan::LogicalKind::Limit) {
+        if (logical.input == nullptr) {
+            throw std::logic_error("Limit missing input");
+        }
+        return root_sort_keys(*logical.input);
+    }
     if (logical.kind == plan::LogicalKind::Sort) {
         return &logical.sort_keys;
     }
     return nullptr;
+}
+
+std::optional<std::size_t> root_limit_count(const plan::LogicalPlan& logical) {
+    if (logical.kind == plan::LogicalKind::Limit) {
+        return logical.limit_count;
+    }
+    return std::nullopt;
+}
+
+const plan::LogicalPlan& without_root_limit(const plan::LogicalPlan& logical) {
+    if (logical.kind != plan::LogicalKind::Limit) {
+        return logical;
+    }
+    if (logical.input == nullptr) {
+        throw std::logic_error("Limit missing input");
+    }
+    return *logical.input;
+}
+
+bool root_order_boundary_is_valid(const plan::LogicalPlan& logical) {
+    const auto& boundary = without_root_limit(logical);
+    if (boundary.kind != plan::LogicalKind::Sort || boundary.input == nullptr) {
+        return false;
+    }
+    return logical.order_permission == plan::OrderPermission::Deterministic &&
+           boundary.order_permission == plan::OrderPermission::Deterministic &&
+           boundary.input->order_permission == plan::OrderPermission::Arbitrary;
+}
+
+std::vector<std::int64_t> row_by_output_order(const storage::ColumnarBatch& batch, std::size_t row) {
+    std::vector<std::int64_t> values;
+    values.reserve(batch.column_names().size());
+    for (const auto& name : batch.column_names()) {
+        values.push_back(batch.column(name).at(row));
+    }
+    return values;
+}
+
+std::map<std::vector<std::int64_t>, std::size_t> row_multiset_by_output_order(const storage::ColumnarBatch& batch) {
+    std::map<std::vector<std::int64_t>, std::size_t> counts;
+    for (std::size_t row = 0; row < batch.row_count(); ++row) {
+        ++counts[row_by_output_order(batch, row)];
+    }
+    return counts;
+}
+
+bool multiset_contains_rows(const storage::ColumnarBatch& superset, const storage::ColumnarBatch& subset) {
+    auto counts = row_multiset_by_output_order(superset);
+    for (std::size_t row = 0; row < subset.row_count(); ++row) {
+        const auto key = row_by_output_order(subset, row);
+        const auto it = counts.find(key);
+        if (it == counts.end() || it->second == 0) {
+            return false;
+        }
+        --it->second;
+    }
+    return true;
+}
+
+std::optional<std::vector<std::int64_t>> key_tuple_for_row(const storage::ColumnarBatch& batch,
+                                                           const std::vector<plan::SortKey>& keys,
+                                                           std::size_t row) {
+    std::vector<std::int64_t> tuple;
+    tuple.reserve(keys.size());
+    for (const auto& key : keys) {
+        const auto column_name = output_column_for_sort_key(key, batch);
+        if (!column_name.has_value()) {
+            return std::nullopt;
+        }
+        tuple.push_back(batch.column(*column_name).at(row));
+    }
+    return tuple;
+}
+
+std::optional<std::map<std::vector<std::int64_t>, std::size_t>>
+key_tuple_multiset_prefix(const storage::ColumnarBatch& batch,
+                          const std::vector<plan::SortKey>& keys,
+                          std::size_t row_count) {
+    std::map<std::vector<std::int64_t>, std::size_t> counts;
+    for (std::size_t row = 0; row < row_count; ++row) {
+        const auto tuple = key_tuple_for_row(batch, keys, row);
+        if (!tuple.has_value()) {
+            return std::nullopt;
+        }
+        ++counts[*tuple];
+    }
+    return counts;
+}
+
+bool valid_limit_answer(const storage::ColumnarBatch& candidate,
+                        const storage::ColumnarBatch& full_unlimited_oracle,
+                        std::size_t limit_count,
+                        const std::vector<plan::SortKey>* order_keys) {
+    if (!same_column_order(candidate, full_unlimited_oracle)) {
+        return false;
+    }
+    const auto expected_count = std::min(limit_count, full_unlimited_oracle.row_count());
+    if (candidate.row_count() != expected_count) {
+        return false;
+    }
+    if (!multiset_contains_rows(full_unlimited_oracle, candidate)) {
+        return false;
+    }
+    if (order_keys == nullptr) {
+        return true;
+    }
+    if (!is_sorted_by_keys(candidate, *order_keys) || !is_sorted_by_keys(full_unlimited_oracle, *order_keys)) {
+        return false;
+    }
+    const auto expected_key_counts = key_tuple_multiset_prefix(full_unlimited_oracle, *order_keys, expected_count);
+    const auto actual_key_counts = key_tuple_multiset_prefix(candidate, *order_keys, candidate.row_count());
+    return expected_key_counts.has_value() && actual_key_counts.has_value() &&
+           *expected_key_counts == *actual_key_counts;
 }
 
 std::string format_trace(const std::vector<std::string>& fired_rules) {
@@ -340,6 +460,8 @@ bool contains_join(const plan::LogicalPlan& logical) {
     case plan::LogicalKind::Project:
     case plan::LogicalKind::Aggregate:
     case plan::LogicalKind::Sort:
+    case plan::LogicalKind::Distinct:
+    case plan::LogicalKind::Limit:
         return logical.input != nullptr && contains_join(*logical.input);
     }
     throw std::logic_error("unreachable logical plan kind");
@@ -370,6 +492,7 @@ bool compare_engines(const std::string& sql,
     const auto logical = sql::bind_select(parsed, catalog);
     const auto is_join_query = contains_join(logical);
     const auto* order_keys = root_sort_keys(logical);
+    const auto limit_count = root_limit_count(logical);
     const auto is_ordered_query = order_keys != nullptr;
     if (is_join_query && !is_ordered_query && logical.order_permission != plan::OrderPermission::Arbitrary) {
         std::cerr << "join query did not carry arbitrary-order permission\n"
@@ -378,9 +501,7 @@ bool compare_engines(const std::string& sql,
                   << plan::to_string(logical) << "\n";
         return false;
     }
-    if (is_ordered_query &&
-        (logical.order_permission != plan::OrderPermission::Deterministic || logical.input == nullptr ||
-         logical.input->order_permission != plan::OrderPermission::Arbitrary)) {
+    if (is_ordered_query && !root_order_boundary_is_valid(logical)) {
         std::cerr << "ordered query did not keep a required root above arbitrary-order input\n"
                   << "sql: " << sql << "\n"
                   << "plan:\n"
@@ -400,6 +521,9 @@ bool compare_engines(const std::string& sql,
     }
 
     const auto unrewritten_oracle = execution::execute_interpreted(logical, catalog);
+    const auto full_unlimited_oracle =
+        limit_count.has_value() ? execution::execute_interpreted(without_root_limit(logical), catalog)
+                                : unrewritten_oracle;
     if (alternatives.plans.empty()) {
         std::cerr << "memo alternative extraction returned no plans\n"
                   << "sql: " << sql << "\n"
@@ -419,9 +543,11 @@ bool compare_engines(const std::string& sql,
             !is_ordered_query ||
             (extracted_order_keys != nullptr && is_sorted_by_keys(unrewritten_oracle, *order_keys) &&
              is_sorted_by_keys(memo_oracle, *extracted_order_keys));
-        const auto cross_plan_equal = is_ordered_query || is_join_query
-                                          ? same_sorted_bag(unrewritten_oracle, memo_oracle)
-                                          : same_batch(unrewritten_oracle, memo_oracle);
+        const auto cross_plan_equal =
+            limit_count.has_value()
+                ? valid_limit_answer(memo_oracle, full_unlimited_oracle, *limit_count, order_keys)
+                : is_ordered_query || is_join_query ? same_sorted_bag(unrewritten_oracle, memo_oracle)
+                                                    : same_batch(unrewritten_oracle, memo_oracle);
         const auto vectorized_equal = same_batch(memo_oracle, memo_vectorized);
         const auto column_sets_match = same_column_identity_set(unrewritten_oracle, memo_oracle) &&
                                        same_column_identity_set(memo_oracle, memo_vectorized);
@@ -446,6 +572,7 @@ bool compare_engines(const std::string& sql,
                   << "extracted plan:\n"
                   << plan::to_string(extracted) << "\n"
                   << "unrewritten oracle:     " << format_batch(unrewritten_oracle) << "\n"
+                  << "full unlimited oracle:  " << format_batch(full_unlimited_oracle) << "\n"
                   << "unrewritten bag:        " << format_sorted_bag(unrewritten_oracle) << "\n"
                   << "alternative oracle:     " << format_batch(memo_oracle) << "\n"
                   << "alternative oracle bag: " << format_sorted_bag(memo_oracle) << "\n"
@@ -462,9 +589,11 @@ bool compare_engines(const std::string& sql,
         !is_ordered_query ||
         (best_order_keys != nullptr && is_sorted_by_keys(unrewritten_oracle, *order_keys) &&
          is_sorted_by_keys(best_oracle, *best_order_keys));
-    const auto best_cross_plan_equal = is_ordered_query || is_join_query
-                                           ? same_sorted_bag(unrewritten_oracle, best_oracle)
-                                           : same_batch(unrewritten_oracle, best_oracle);
+    const auto best_cross_plan_equal =
+        limit_count.has_value()
+            ? valid_limit_answer(best_oracle, full_unlimited_oracle, *limit_count, order_keys)
+            : is_ordered_query || is_join_query ? same_sorted_bag(unrewritten_oracle, best_oracle)
+                                                : same_batch(unrewritten_oracle, best_oracle);
     const auto best_vectorized_equal = same_batch(best_oracle, best_vectorized);
     const auto best_column_sets_match = same_column_identity_set(unrewritten_oracle, best_oracle) &&
                                         same_column_identity_set(best_oracle, best_vectorized);
@@ -483,6 +612,7 @@ bool compare_engines(const std::string& sql,
                   << "best plan:\n"
                   << plan::to_string(best) << "\n"
                   << "unrewritten oracle: " << format_batch(unrewritten_oracle) << "\n"
+                  << "full unlimited oracle: " << format_batch(full_unlimited_oracle) << "\n"
                   << "best oracle:        " << format_batch(best_oracle) << "\n"
                   << "best vectorized:    " << format_batch(best_vectorized) << "\n"
                   << "ordered outputs sorted: " << (best_ordered_outputs_are_sorted ? "yes" : "no") << "\n";
@@ -517,6 +647,15 @@ bool run_result_golden_queries() {
         "SELECT b, COUNT(*) FROM t GROUP BY b HAVING b = 10 OR COUNT(*) > 1",
         "SELECT a, SUM(b) AS total FROM t GROUP BY a HAVING SUM(b) >= 20 ORDER BY total DESC",
         "SELECT a, SUM(b) FROM t GROUP BY a ORDER BY SUM(b) DESC",
+        "SELECT DISTINCT b FROM t",
+        "SELECT DISTINCT b FROM t ORDER BY b DESC",
+        "SELECT a FROM t LIMIT 0",
+        "SELECT a FROM t LIMIT 1",
+        "SELECT a FROM t LIMIT 2",
+        "SELECT a FROM t LIMIT 4",
+        "SELECT a FROM t LIMIT 99",
+        "SELECT a, b FROM t ORDER BY b DESC LIMIT 2",
+        "SELECT DISTINCT b FROM t ORDER BY b ASC LIMIT 2",
     };
 
     bool ok = true;
@@ -588,6 +727,10 @@ bool run_join_oracle_corpus() {
         "JOIN t3 ON t2.c = t3.c GROUP BY t1.a, t3.d ORDER BY t3.d DESC, t1.a ASC",
         "SELECT t1.a AS key, SUM(t3.d) AS total FROM t1 JOIN t2 ON t1.a = t2.a "
         "JOIN t3 ON t2.c = t3.c GROUP BY t1.a HAVING SUM(t3.d) > 4 ORDER BY total DESC",
+        "SELECT t1.b, t2.c, t3.d FROM t1 JOIN t2 ON t1.a = t2.a JOIN t3 ON t2.c = t3.c LIMIT 3",
+        "SELECT t1.b, t2.c, t3.d FROM t1 JOIN t2 ON t1.a = t2.a "
+        "JOIN t3 ON t2.c = t3.c ORDER BY t3.d DESC LIMIT 3",
+        "SELECT DISTINCT t1.a FROM t1 JOIN t2 ON t1.a = t2.a JOIN t3 ON t2.c = t3.c LIMIT 1",
     };
 
     bool ok = true;
@@ -702,6 +845,11 @@ bool run_generated_corpus() {
                              catalog,
                              table_text) &&
              ok;
+        ok = compare_engines("SELECT DISTINCT a FROM t", catalog, table_text) && ok;
+        ok = compare_engines("SELECT DISTINCT a, b FROM t ORDER BY a ASC LIMIT 2", catalog, table_text) && ok;
+        ok = compare_engines("SELECT a FROM t LIMIT 0", catalog, table_text) && ok;
+        ok = compare_engines("SELECT a FROM t LIMIT 1", catalog, table_text) && ok;
+        ok = compare_engines("SELECT a FROM t LIMIT 3", catalog, table_text) && ok;
 
         for (const auto op : ops) {
             for (const auto literal : literals) {
