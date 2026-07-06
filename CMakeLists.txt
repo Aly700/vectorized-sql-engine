@@ -28,6 +28,9 @@ target_link_libraries(sql_golden PRIVATE sql_engine)
 add_executable(sql_vectorized_differential tests/vectorized_differential.cpp)
 target_link_libraries(sql_vectorized_differential PRIVATE sql_engine)
 
+add_executable(sql_fuzz_differential tests/sql_fuzz_differential.cpp)
+target_link_libraries(sql_fuzz_differential PRIVATE sql_engine)
+
 add_executable(sql_catalog_binder tests/catalog_binder.cpp)
 target_link_libraries(sql_catalog_binder PRIVATE sql_engine)
 
@@ -44,6 +47,7 @@ include(CTest)
 add_test(NAME sql_smoke COMMAND sql_smoke)
 add_test(NAME sql_golden COMMAND sql_golden)
 add_test(NAME sql_vectorized_differential COMMAND sql_vectorized_differential)
+add_test(NAME sql_fuzz_differential COMMAND sql_fuzz_differential)
 add_test(NAME sql_catalog_binder COMMAND sql_catalog_binder)
 add_test(NAME sql_rewrite_rules COMMAND sql_rewrite_rules)
 add_test(NAME sql_optimizer_memo COMMAND sql_optimizer_memo)
