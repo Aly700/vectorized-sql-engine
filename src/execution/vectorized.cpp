@@ -526,6 +526,54 @@ storage::ColumnarBatch materialize_projection(const plan::PhysicalPlan& plan, co
     return out;
 }
 
+storage::Int64Column materialize_selected_column(const BatchView& input, const std::string& name) {
+    storage::Int64Column column;
+    const auto& input_column = input.batch->column(name);
+    for (auto row : *input.selection) {
+        column.append(input_column.at(row));
+    }
+    return column;
+}
+
+void add_missing_sort_key_columns(storage::ColumnarBatch& sort_input,
+                                  const BatchView& source,
+                                  const std::vector<plan::SortKey>& sort_keys) {
+    validate_view(source);
+    for (const auto& key : sort_keys) {
+        const auto name = column_identity_name(key.column);
+        if (sort_input.has_column(name)) {
+            continue;
+        }
+        if (!source.batch->has_column(name)) {
+            throw std::logic_error("sort key column is not available before or after Project: " + name);
+        }
+        sort_input.add_column(name, materialize_selected_column(source, name));
+    }
+}
+
+storage::ColumnarBatch materialize_project_sort_input(const plan::PhysicalPlan& project,
+                                                      const BatchView& source,
+                                                      const std::vector<plan::SortKey>& sort_keys) {
+    auto sort_input = materialize_projection(project, source);
+    add_missing_sort_key_columns(sort_input, source, sort_keys);
+    return sort_input;
+}
+
+storage::ColumnarBatch materialize_project_output_columns(const plan::PhysicalPlan& project,
+                                                          const storage::ColumnarBatch& batch,
+                                                          const SelectionVector& rows) {
+    storage::ColumnarBatch out;
+    for (const auto& projection : project.projections) {
+        storage::Int64Column column;
+        const auto& input_column = batch.column(projection.output_name);
+        for (auto row : rows) {
+            column.append(input_column.at(row));
+        }
+        out.add_column(projection.output_name, std::move(column));
+    }
+    return out;
+}
+
 SelectionVectorPtr sort_selection(const std::vector<plan::SortKey>& sort_keys, const BatchView& input) {
     validate_view(input);
 
@@ -622,8 +670,17 @@ BatchView execute_sort(const plan::PhysicalPlan& plan, const Catalog& catalog) {
     const auto& input_plan = require_input(plan);
     if (input_plan.kind == plan::PhysicalKind::Project) {
         auto source = execute_to_view(require_input(input_plan), catalog);
-        source.selection = sort_selection(plan.sort_keys, source);
-        auto materialized = std::make_shared<const storage::ColumnarBatch>(materialize_projection(input_plan, source));
+        auto sort_input =
+            std::make_shared<const storage::ColumnarBatch>(materialize_project_sort_input(input_plan, source, plan.sort_keys));
+
+        BatchView sort_view;
+        sort_view.owned_batch = sort_input;
+        sort_view.batch = sort_input.get();
+        sort_view.selection = identity_selection(sort_input->row_count());
+        sort_view.selection = sort_selection(plan.sort_keys, sort_view);
+
+        auto materialized = std::make_shared<const storage::ColumnarBatch>(
+            materialize_project_output_columns(input_plan, *sort_view.batch, *sort_view.selection));
 
         BatchView view;
         view.owned_batch = materialized;

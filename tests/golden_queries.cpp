@@ -226,6 +226,11 @@ int main() {
             ExpectedResult{{"b", "a"}, {{20, 2}}},
         },
         GoldenQuery{
+            "select item aliases become output names",
+            "SELECT a AS x, b AS y FROM t WHERE a = 2",
+            ExpectedResult{{"x", "y"}, {{2, 20}}},
+        },
+        GoldenQuery{
             "less equal and literal left comparison",
             "SELECT b FROM t WHERE a <= 3 AND 10 < b",
             ExpectedResult{{"b"}, {{20}, {20}}},
@@ -269,6 +274,16 @@ int main() {
             "order by multiple keys with mixed directions",
             "SELECT a, b FROM t ORDER BY b ASC, a DESC",
             ExpectedResult{{"a", "b"}, {{1, 10}, {3, 20}, {2, 20}, {4, 40}}},
+        },
+        GoldenQuery{
+            "order by output alias in ungrouped query",
+            "SELECT a AS x, b FROM t ORDER BY x DESC",
+            ExpectedResult{{"x", "b"}, {{4, 40}, {3, 20}, {2, 20}, {1, 10}}},
+        },
+        GoldenQuery{
+            "order by output name wins over FROM scope",
+            "SELECT b AS a, a AS original FROM t ORDER BY a DESC",
+            ExpectedResult{{"a", "original"}, {{40, 4}, {20, 2}, {20, 3}, {10, 1}}},
         },
         GoldenQuery{
             "order by binds unprojected qualified join column from FROM scope",
@@ -318,6 +333,31 @@ int main() {
             ExpectedResult{{"t1.a", "COUNT(*)"}, {{2, 2}, {1, 1}}},
         },
         GoldenQuery{
+            "having filters grouped rows using projected aggregate",
+            "SELECT a, SUM(b) FROM t GROUP BY a HAVING SUM(b) > 20 ORDER BY a ASC",
+            ExpectedResult{{"a", "SUM(b)"}, {{4, 40}}},
+        },
+        GoldenQuery{
+            "having computes unprojected aggregate then final project drops it",
+            "SELECT a FROM t GROUP BY a HAVING SUM(b) > 20",
+            ExpectedResult{{"a"}, {{4}}},
+        },
+        GoldenQuery{
+            "having can eliminate every group",
+            "SELECT a, COUNT(*) FROM t GROUP BY a HAVING SUM(b) > 1000",
+            ExpectedResult{{"a", "COUNT(*)"}, {}},
+        },
+        GoldenQuery{
+            "grouped order by aggregate output alias after having",
+            "SELECT a, SUM(b) AS total FROM t GROUP BY a HAVING SUM(b) >= 20 ORDER BY total DESC",
+            ExpectedResult{{"a", "total"}, {{4, 40}, {2, 20}, {3, 20}}},
+        },
+        GoldenQuery{
+            "grouped order by canonical aggregate output name",
+            "SELECT a, SUM(b) FROM t GROUP BY a ORDER BY SUM(b) DESC",
+            ExpectedResult{{"a", "SUM(b)"}, {{4, 40}, {2, 20}, {3, 20}, {1, 10}}},
+        },
+        GoldenQuery{
             "global count over empty input returns zero",
             "SELECT COUNT(*) FROM empty",
             ExpectedResult{{"COUNT(*)"}, {{0}}},
@@ -356,11 +396,32 @@ int main() {
             ExpectedError{ErrorKind::Bind, 11, "nested aggregate 'COUNT' is not allowed"},
         },
         GoldenQuery{
-            "grouped ORDER BY must use grouping columns",
+            "grouped ORDER BY unknown name must use grouping columns or output names",
             "SELECT a, COUNT(*) FROM t GROUP BY a ORDER BY b",
             ExpectedResult{},
             true,
-            ExpectedError{ErrorKind::Bind, 46, "ORDER BY column 'b' must be a GROUP BY column in aggregate queries"},
+            ExpectedError{ErrorKind::Bind, 46, "ORDER BY column 'b' must be a GROUP BY column or SELECT output name in aggregate queries"},
+        },
+        GoldenQuery{
+            "having without group by is a bind error",
+            "SELECT COUNT(*) FROM t HAVING COUNT(*) > 0",
+            ExpectedResult{},
+            true,
+            ExpectedError{ErrorKind::Bind, 23, "HAVING requires GROUP BY in this SQL slice"},
+        },
+        GoldenQuery{
+            "non grouped having column is a bind error",
+            "SELECT a, COUNT(*) FROM t GROUP BY a HAVING b = 20",
+            ExpectedResult{},
+            true,
+            ExpectedError{ErrorKind::Bind, 44, "HAVING column 'b' must be a GROUP BY column or aggregate expression"},
+        },
+        GoldenQuery{
+            "nested aggregate in having is a bind error",
+            "SELECT a FROM t GROUP BY a HAVING SUM(COUNT(*)) > 0",
+            ExpectedResult{},
+            true,
+            ExpectedError{ErrorKind::Bind, 38, "nested aggregate 'COUNT' is not allowed"},
         },
         GoldenQuery{
             "unsupported OR is rejected at token position",
@@ -447,11 +508,18 @@ int main() {
             ExpectedError{ErrorKind::Bind, 7, "unknown column 'missing' in table 't1'"},
         },
         GoldenQuery{
-            "projection aliases are outside the slice",
-            "SELECT a AS x FROM t",
+            "duplicate output aliases are bind errors",
+            "SELECT a AS x, b AS x FROM t",
             ExpectedResult{},
             true,
-            ExpectedError{ErrorKind::Parse, 9, "expected ',' or FROM after projection expression"},
+            ExpectedError{ErrorKind::Bind, 20, "duplicate output name 'x'"},
+        },
+        GoldenQuery{
+            "reserved keyword after AS is rejected as select item alias",
+            "SELECT a AS FROM t",
+            ExpectedResult{},
+            true,
+            ExpectedError{ErrorKind::Parse, 12, "expected select item alias after AS"},
         },
         GoldenQuery{
             "reserved keyword after AS is rejected as table alias",

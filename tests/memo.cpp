@@ -187,6 +187,29 @@ void assert_aliased_self_join_scans_remain_distinct_groups() {
     memo.assert_invariants();
 }
 
+void assert_having_filter_round_trips_through_memo() {
+    const auto catalog = make_catalog();
+    const auto logical =
+        sql::bind_select(sql::parse_select("SELECT a FROM t GROUP BY a HAVING SUM(b) > 20"), catalog);
+
+    optimizer::Memo memo;
+    const auto root = memo.insert(logical);
+    const auto dump = memo.dump();
+    if (dump.find("Filter[col(SUM(b)) > lit(20)]") == std::string::npos ||
+        dump.find("Aggregate[group_keys=[col(t.a)], aggregates=[SUM(b)=col(t.b)]]") == std::string::npos) {
+        std::cerr << "HAVING filter was not represented as a memo filter over aggregate output\n"
+                  << "plan:\n"
+                  << plan::to_string(logical) << "\n"
+                  << "memo dump:\n"
+                  << dump;
+        std::terminate();
+    }
+
+    const auto extracted = memo.extract(root);
+    assert(plan::to_string(extracted) == plan::to_string(logical));
+    memo.assert_invariants();
+}
+
 } // namespace
 
 int main() {
@@ -195,5 +218,6 @@ int main() {
     assert_memo_extracted_plan_matches_both_engines();
     assert_cross_group_duplicate_expression_merges_groups();
     assert_aliased_self_join_scans_remain_distinct_groups();
+    assert_having_filter_round_trips_through_memo();
     return 0;
 }

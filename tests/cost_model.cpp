@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cmath>
 #include <cstdint>
 #include <iostream>
 #include <string>
@@ -323,6 +324,65 @@ void assert_group_by_does_not_block_join_transforms() {
     }
 }
 
+void assert_having_costs_as_filter_over_aggregate() {
+    const auto catalog = make_skewed_catalog();
+    const auto sql = "SELECT k FROM big GROUP BY k HAVING COUNT(*) > 0";
+    const auto logical = sql::bind_select(sql::parse_select(sql), catalog);
+    const auto estimate = optimizer::estimate_cost(logical, catalog);
+
+    if (std::abs(estimate.rows - (1000.0 / 3.0)) > 1e-9 || estimate.cost != 4000.0) {
+        std::cerr << "HAVING did not cost as a filter over aggregate output\n"
+                  << "sql: " << sql << "\n"
+                  << "plan:\n"
+                  << plan::to_string(logical) << "\n"
+                  << "rows: " << estimate.rows << "\n"
+                  << "cost: " << estimate.cost << "\n";
+        std::terminate();
+    }
+}
+
+void assert_having_does_not_block_join_transforms() {
+    const auto catalog = make_skewed_catalog();
+    const auto sql =
+        "SELECT big.k FROM big JOIN mid ON big.k = mid.k JOIN tiny ON mid.k = tiny.k "
+        "GROUP BY big.k HAVING COUNT(*) > 0";
+    const auto logical = sql::bind_select(sql::parse_select(sql), catalog);
+
+    optimizer::GroupId root = 0;
+    auto memo = explored_memo_for(logical, root);
+    const auto alternatives = memo.extract_alternatives(root, optimizer::AlternativeExtractionOptions{64, 512});
+    const auto best = memo.extract_best(root, catalog);
+
+    const auto expected_best =
+        std::string("Project[big.k=col(big.k)]\n") +
+        "  Filter[col(COUNT(*)) > lit(0)]\n"
+        "    Aggregate[group_keys=[col(big.k)], aggregates=[COUNT(*)]]\n"
+        "      Join[col(big.k) = col(mid.k)]\n"
+        "        Scan[big]\n"
+        "        Join[col(mid.k) = col(tiny.k)]\n"
+        "          Scan[mid]\n"
+        "          Scan[tiny]";
+
+    std::cout << "having multi-join alternatives verified: alternatives=" << alternatives.plans.size()
+              << " max_group_expressions=" << alternatives.max_group_expression_count
+              << " hit_expression_bound=" << (alternatives.hit_expression_bound ? "yes" : "no")
+              << " hit_plan_bound=" << (alternatives.hit_plan_bound ? "yes" : "no") << "\n";
+
+    if (alternatives.plans.size() <= 1 || alternatives.hit_expression_bound || alternatives.hit_plan_bound ||
+        plan::to_string(best) != expected_best || plan::to_string(best) == plan::to_string(logical)) {
+        std::cerr << "HAVING blocked join alternatives below Aggregate\n"
+                  << "sql: " << sql << "\n"
+                  << "alternative count: " << alternatives.plans.size() << "\n"
+                  << "ingested plan:\n"
+                  << plan::to_string(logical) << "\n"
+                  << "best plan:\n"
+                  << plan::to_string(best) << "\n"
+                  << "memo dump:\n"
+                  << memo.dump();
+        std::terminate();
+    }
+}
+
 } // namespace
 
 int main() {
@@ -333,5 +393,7 @@ int main() {
     assert_aliased_self_join_costs_physical_table_stats();
     assert_aggregate_cost_uses_group_count();
     assert_group_by_does_not_block_join_transforms();
+    assert_having_costs_as_filter_over_aggregate();
+    assert_having_does_not_block_join_transforms();
     return 0;
 }

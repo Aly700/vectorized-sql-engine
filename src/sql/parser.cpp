@@ -67,7 +67,8 @@ bool is_reserved_keyword(std::string_view text) {
            equals_keyword(text, "JOIN") || equals_keyword(text, "INNER") || equals_keyword(text, "ON") ||
            equals_keyword(text, "ORDER") || equals_keyword(text, "BY") || equals_keyword(text, "ASC") ||
            equals_keyword(text, "DESC") || equals_keyword(text, "GROUP") || equals_keyword(text, "COUNT") ||
-           equals_keyword(text, "SUM") || equals_keyword(text, "MIN") || equals_keyword(text, "MAX");
+           equals_keyword(text, "SUM") || equals_keyword(text, "MIN") || equals_keyword(text, "MAX") ||
+           equals_keyword(text, "HAVING");
 }
 
 class Lexer {
@@ -172,6 +173,10 @@ public:
             query.group_by = parse_group_by();
         }
 
+        if (is_keyword("HAVING")) {
+            query.having = parse_having();
+        }
+
         if (is_keyword("ORDER")) {
             query.order_by = parse_order_by();
         }
@@ -255,13 +260,33 @@ private:
 
     SelectItem parse_select_item() {
         auto expression = parse_select_expr("expected projection expression");
-        return SelectItem{expression, expression_position(expression)};
+        SelectItem item;
+        item.expression = expression;
+        item.position = expression_position(expression);
+        if (is_keyword("AS")) {
+            advance();
+            if (current_.kind != TokenKind::Identifier || is_reserved_keyword(current_.text)) {
+                throw ParseError(current_.position, "expected select item alias after AS");
+            }
+            item.alias = current_.text;
+            item.alias_position = current_.position;
+            advance();
+        }
+        return item;
     }
 
     WhereClause parse_where() {
         WhereClause where;
         where.conjuncts = parse_comparison_conjunction();
         return where;
+    }
+
+    HavingClause parse_having() {
+        HavingClause having;
+        having.position = current_.position;
+        expect_keyword("HAVING", "expected HAVING");
+        having.conjuncts = parse_having_comparison_conjunction();
+        return having;
     }
 
     std::vector<OrderByKey> parse_order_by() {
@@ -291,7 +316,7 @@ private:
     }
 
     OrderByKey parse_order_by_key() {
-        auto column = parse_column_ref("expected ORDER BY column name");
+        auto expression = parse_order_by_expr();
         auto direction = SortDirection::Asc;
         if (is_keyword("ASC")) {
             advance();
@@ -299,7 +324,7 @@ private:
             direction = SortDirection::Desc;
             advance();
         }
-        return OrderByKey{std::move(column), direction};
+        return OrderByKey{std::move(expression), direction};
     }
 
     JoinClause parse_join() {
@@ -332,12 +357,30 @@ private:
         return conjuncts;
     }
 
+    std::vector<HavingComparisonExpr> parse_having_comparison_conjunction() {
+        std::vector<HavingComparisonExpr> conjuncts;
+        conjuncts.push_back(parse_having_comparison());
+        while (is_keyword("AND")) {
+            advance();
+            conjuncts.push_back(parse_having_comparison());
+        }
+        return conjuncts;
+    }
+
     ComparisonExpr parse_comparison() {
         auto left = parse_scalar_expr("expected expression in comparison");
         const auto op_position = current_.position;
         const auto op = parse_comparison_op();
         auto right = parse_scalar_expr("expected expression in comparison");
         return ComparisonExpr{std::move(left), op, std::move(right), op_position};
+    }
+
+    HavingComparisonExpr parse_having_comparison() {
+        auto left = parse_having_expr("expected expression in HAVING comparison");
+        const auto op_position = current_.position;
+        const auto op = parse_comparison_op();
+        auto right = parse_having_expr("expected expression in HAVING comparison");
+        return HavingComparisonExpr{std::move(left), op, std::move(right), op_position};
     }
 
     ComparisonOp parse_comparison_op() {
@@ -404,6 +447,35 @@ private:
         }
 
         throw ParseError(current_.position, message);
+    }
+
+    HavingExpr parse_having_expr(const std::string& message) {
+        if (is_aggregate_function()) {
+            return parse_aggregate_call();
+        }
+        if (current_.kind == TokenKind::Identifier && !is_reserved_keyword(current_.text)) {
+            return parse_column_ref(message);
+        }
+        if (current_.kind == TokenKind::Integer) {
+            std::int64_t value = 0;
+            const auto* begin = current_.text.data();
+            const auto* end = current_.text.data() + current_.text.size();
+            const auto [ptr, ec] = std::from_chars(begin, end, value);
+            if (ec == std::errc::result_out_of_range || ptr != end) {
+                throw ParseError(current_.position, "integer literal out of range");
+            }
+            auto literal = IntLiteral{value, current_.position};
+            advance();
+            return literal;
+        }
+        throw ParseError(current_.position, message);
+    }
+
+    OrderByExpr parse_order_by_expr() {
+        if (is_aggregate_function()) {
+            return parse_aggregate_call();
+        }
+        return parse_column_ref("expected ORDER BY column name");
     }
 
     SelectExpr parse_select_expr(const std::string& message) {

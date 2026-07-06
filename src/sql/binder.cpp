@@ -2,6 +2,7 @@
 
 #include "sql/errors.hpp"
 
+#include <algorithm>
 #include <optional>
 #include <set>
 #include <sstream>
@@ -139,10 +140,6 @@ std::vector<plan::BoundComparisonExpr> bind_comparisons(const std::vector<Compar
     return bound;
 }
 
-plan::SortKey bind_order_by_key(const OrderByKey& key, const std::vector<TableScope>& scopes) {
-    return plan::SortKey{bind_column_ref(key.column, scopes), key.direction};
-}
-
 bool bound_column_equal(const plan::BoundColumnRef& left, const plan::BoundColumnRef& right) {
     return left.binding == right.binding && left.column == right.column;
 }
@@ -201,18 +198,107 @@ plan::AggregateExpression bind_aggregate_call(const AggregateCall& aggregate,
     return plan::AggregateExpression{output_name(aggregate), aggregate.function, std::move(argument), aggregate.position};
 }
 
+plan::BoundColumnRef aggregate_output_ref(const plan::AggregateExpression& aggregate, std::size_t position) {
+    return plan::BoundColumnRef{"", aggregate.output_name, position};
+}
+
+plan::BoundColumnRef ensure_aggregate_expression(const AggregateCall& aggregate,
+                                                 const std::vector<TableScope>& scopes,
+                                                 std::vector<plan::AggregateExpression>& aggregate_expressions) {
+    auto bound = bind_aggregate_call(aggregate, scopes);
+    for (const auto& existing : aggregate_expressions) {
+        if (existing.output_name == bound.output_name) {
+            return aggregate_output_ref(existing, aggregate.position);
+        }
+    }
+
+    const auto ref = aggregate_output_ref(bound, aggregate.position);
+    aggregate_expressions.push_back(std::move(bound));
+    return ref;
+}
+
+std::string select_item_output_name(const SelectItem& item) {
+    return item.alias.has_value() ? *item.alias : output_name(item.expression);
+}
+
+std::size_t select_item_output_position(const SelectItem& item) {
+    return item.alias.has_value() ? item.alias_position : item.position;
+}
+
+bool has_output_name(const std::vector<std::string>& output_names, const std::string& name) {
+    return std::find(output_names.begin(), output_names.end(), name) != output_names.end();
+}
+
+plan::BoundScalarExpr bind_having_expression(const HavingExpr& expression,
+                                             const std::vector<TableScope>& scopes,
+                                             const std::vector<plan::BoundColumnRef>& group_keys,
+                                             std::vector<plan::AggregateExpression>& aggregate_expressions) {
+    if (const auto* column = std::get_if<ColumnRef>(&expression)) {
+        auto bound = bind_column_ref(*column, scopes);
+        if (!contains_group_key(group_keys, bound)) {
+            throw BindError(column->position,
+                            "HAVING column '" + output_name(*column) +
+                                "' must be a GROUP BY column or aggregate expression");
+        }
+        return bound;
+    }
+    if (const auto* literal = std::get_if<IntLiteral>(&expression)) {
+        return *literal;
+    }
+    return ensure_aggregate_expression(std::get<AggregateCall>(expression), scopes, aggregate_expressions);
+}
+
+plan::BoundComparisonExpr bind_having_comparison(const HavingComparisonExpr& comparison,
+                                                 const std::vector<TableScope>& scopes,
+                                                 const std::vector<plan::BoundColumnRef>& group_keys,
+                                                 std::vector<plan::AggregateExpression>& aggregate_expressions) {
+    return plan::BoundComparisonExpr{
+        bind_having_expression(comparison.left, scopes, group_keys, aggregate_expressions),
+        comparison.op,
+        bind_having_expression(comparison.right, scopes, group_keys, aggregate_expressions),
+        comparison.operator_position,
+    };
+}
+
+std::vector<plan::BoundComparisonExpr> bind_having_comparisons(
+    const std::vector<HavingComparisonExpr>& comparisons,
+    const std::vector<TableScope>& scopes,
+    const std::vector<plan::BoundColumnRef>& group_keys,
+    std::vector<plan::AggregateExpression>& aggregate_expressions) {
+    std::vector<plan::BoundComparisonExpr> bound;
+    bound.reserve(comparisons.size());
+    for (const auto& comparison : comparisons) {
+        bound.push_back(bind_having_comparison(comparison, scopes, group_keys, aggregate_expressions));
+    }
+    return bound;
+}
+
 std::vector<plan::SortKey> bind_order_by_keys(const std::vector<OrderByKey>& keys,
                                               const std::vector<TableScope>& scopes,
                                               const std::vector<plan::BoundColumnRef>& group_keys,
-                                              bool aggregate_query) {
+                                              bool aggregate_query,
+                                              const std::vector<std::string>& output_names) {
     std::vector<plan::SortKey> bound;
     bound.reserve(keys.size());
     for (const auto& key : keys) {
-        auto sort_key = bind_order_by_key(key, scopes);
+        const auto name = output_name(key.expression);
+        if (has_output_name(output_names, name)) {
+            bound.push_back(plan::SortKey{plan::BoundColumnRef{"", name, expression_position(key.expression)},
+                                          key.direction});
+            continue;
+        }
+
+        if (const auto* aggregate = std::get_if<AggregateCall>(&key.expression)) {
+            (void)bind_aggregate_call(*aggregate, scopes);
+            throw BindError(aggregate->position, "ORDER BY output '" + name + "' must appear in SELECT list");
+        }
+
+        const auto& column = std::get<ColumnRef>(key.expression);
+        auto sort_key = plan::SortKey{bind_column_ref(column, scopes), key.direction};
         if (aggregate_query && !contains_group_key(group_keys, sort_key.column)) {
-            throw BindError(key.column.position,
-                            "ORDER BY column '" + output_name(key.column) +
-                                "' must be a GROUP BY column in aggregate queries");
+            throw BindError(column.position,
+                            "ORDER BY column '" + output_name(column) +
+                                "' must be a GROUP BY column or SELECT output name in aggregate queries");
         }
         bound.push_back(std::move(sort_key));
     }
@@ -237,24 +323,30 @@ void mark_arbitrary_order(plan::LogicalPlan& logical) {
 plan::LogicalPlan bind_select(const SelectQuery& query, const catalog::Catalog& catalog) {
     const auto scopes = build_scopes(query, catalog);
     auto group_keys = bind_group_by_keys(query.group_by, scopes);
+    if (query.having.has_value() && group_keys.empty()) {
+        throw BindError(query.having->position, "HAVING requires GROUP BY in this SQL slice");
+    }
     const auto aggregate_query = !group_keys.empty() || query_has_aggregate(query);
 
     std::set<std::string> output_names;
+    std::vector<std::string> output_name_order;
     std::vector<plan::Projection> projections;
     std::vector<plan::AggregateExpression> aggregate_expressions;
     projections.reserve(query.projection.size());
+    output_name_order.reserve(query.projection.size());
     for (const auto& item : query.projection) {
-        auto name = output_name(item.expression);
+        auto name = select_item_output_name(item);
         const auto [_, inserted] = output_names.insert(name);
         if (!inserted) {
-            throw BindError(item.position, "duplicate output name '" + name + "'");
+            throw BindError(select_item_output_position(item), "duplicate output name '" + name + "'");
         }
+        output_name_order.push_back(name);
 
         if (const auto* aggregate = std::get_if<AggregateCall>(&item.expression)) {
-            aggregate_expressions.push_back(bind_aggregate_call(*aggregate, scopes));
+            const auto aggregate_ref = ensure_aggregate_expression(*aggregate, scopes, aggregate_expressions);
             projections.push_back(plan::Projection{
                 name,
-                plan::BoundColumnRef{"", name, item.position},
+                aggregate_ref,
             });
             continue;
         }
@@ -273,6 +365,14 @@ plan::LogicalPlan bind_select(const SelectQuery& query, const catalog::Catalog& 
         projections.push_back(plan::Projection{std::move(name), std::move(expression)});
     }
 
+    std::vector<plan::BoundComparisonExpr> having_predicates;
+    if (query.having.has_value()) {
+        having_predicates = bind_having_comparisons(query.having->conjuncts, scopes, group_keys, aggregate_expressions);
+    }
+
+    auto sort_keys =
+        bind_order_by_keys(query.order_by, scopes, group_keys, aggregate_query, output_name_order);
+
     auto plan = plan::LogicalPlan::scan(query.table, binding_name(query));
     std::vector<TableScope> visible_scopes;
     visible_scopes.push_back(scopes.front());
@@ -289,14 +389,13 @@ plan::LogicalPlan bind_select(const SelectQuery& query, const catalog::Catalog& 
     if (aggregate_query) {
         plan = plan::LogicalPlan::aggregate(std::move(group_keys), std::move(aggregate_expressions), std::move(plan));
     }
+    if (!having_predicates.empty()) {
+        plan = plan::LogicalPlan::filter(std::move(having_predicates), std::move(plan));
+    }
     auto bound = plan::LogicalPlan::project(std::move(projections), std::move(plan));
     mark_arbitrary_order(bound);
-    if (!query.order_by.empty()) {
-        // Non-aggregate queries deliberately bind ORDER BY against FROM scopes,
-        // not projection output aliases. Aggregate queries keep the same stable
-        // FROM-scope identities but restrict ORDER BY to grouping columns.
-        return plan::LogicalPlan::sort(bind_order_by_keys(query.order_by, scopes, bound.input->group_keys, aggregate_query),
-                                       std::move(bound));
+    if (!sort_keys.empty()) {
+        return plan::LogicalPlan::sort(std::move(sort_keys), std::move(bound));
     }
     return bound;
 }

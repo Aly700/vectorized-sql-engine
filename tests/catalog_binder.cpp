@@ -136,6 +136,17 @@ void assert_order_by_uses_from_scope_not_projection_outputs() {
     assert(printed.find("Join[col(t1.a) = col(t2.a)]") != std::string::npos);
 }
 
+void assert_order_by_output_name_takes_precedence_over_from_scope() {
+    auto catalog = make_schema_catalog();
+    const auto logical =
+        sql::bind_select(sql::parse_select("SELECT b AS a, a AS original FROM t ORDER BY a DESC"), catalog);
+
+    assert(logical.kind == plan::LogicalKind::Sort);
+    const auto printed = plan::to_string(logical);
+    assert(printed.find("Sort[col(a) DESC]") != std::string::npos);
+    assert(printed.find("Project[a=col(t.b), original=col(t.a)]") != std::string::npos);
+}
+
 void assert_alias_order_by_uses_binding_scope() {
     auto catalog = make_schema_catalog();
     const auto logical =
@@ -182,6 +193,34 @@ void assert_group_by_binds_aggregate_between_filter_and_project() {
     assert(printed.find("Filter[col(t.b) >= lit(20)]") != std::string::npos);
 }
 
+void assert_having_binds_between_aggregate_and_project() {
+    auto catalog = make_schema_catalog();
+    const auto logical = sql::bind_select(sql::parse_select("SELECT a FROM t GROUP BY a HAVING SUM(b) > 20"), catalog);
+
+    assert(logical.kind == plan::LogicalKind::Project);
+    assert(logical.input != nullptr);
+    assert(logical.input->kind == plan::LogicalKind::Filter);
+    assert(logical.input->input != nullptr);
+    assert(logical.input->input->kind == plan::LogicalKind::Aggregate);
+
+    const auto printed = plan::to_string(logical);
+    assert(printed.find("Project[a=col(t.a)]") != std::string::npos);
+    assert(printed.find("Filter[col(SUM(b)) > lit(20)]") != std::string::npos);
+    assert(printed.find("Aggregate[group_keys=[col(t.a)], aggregates=[SUM(b)=col(t.b)]]") != std::string::npos);
+}
+
+void assert_select_aliases_name_projected_aggregate_outputs() {
+    auto catalog = make_schema_catalog();
+    const auto logical = sql::bind_select(
+        sql::parse_select("SELECT a AS key, SUM(b) AS total FROM t GROUP BY a ORDER BY total DESC"),
+        catalog);
+
+    const auto printed = plan::to_string(logical);
+    assert(printed.find("Sort[col(total) DESC]") != std::string::npos);
+    assert(printed.find("Project[key=col(t.a), total=col(SUM(b))]") != std::string::npos);
+    assert(printed.find("Aggregate[group_keys=[col(t.a)], aggregates=[SUM(b)=col(t.b)]]") != std::string::npos);
+}
+
 void assert_ungrouped_aggregate_binds_single_global_group() {
     auto catalog = make_schema_catalog();
     const auto logical = sql::bind_select(sql::parse_select("SELECT COUNT(*), MIN(t.b), MAX(t.b) FROM t"), catalog);
@@ -223,10 +262,34 @@ void assert_grouped_order_by_must_use_grouping_column() {
         (void)sql::bind_select(sql::parse_select("SELECT a, COUNT(*) FROM t GROUP BY a ORDER BY b"), catalog);
     } catch (const sql::BindError& error) {
         assert(error.position() == 46);
-        assert(error.message() == "ORDER BY column 'b' must be a GROUP BY column in aggregate queries");
+        assert(error.message() == "ORDER BY column 'b' must be a GROUP BY column or SELECT output name in aggregate queries");
         return;
     }
     throw std::logic_error("expected grouped ORDER BY bind error");
+}
+
+void assert_having_without_group_by_is_rejected() {
+    auto catalog = make_schema_catalog();
+    try {
+        (void)sql::bind_select(sql::parse_select("SELECT COUNT(*) FROM t HAVING COUNT(*) > 0"), catalog);
+    } catch (const sql::BindError& error) {
+        assert(error.position() == 23);
+        assert(error.message() == "HAVING requires GROUP BY in this SQL slice");
+        return;
+    }
+    throw std::logic_error("expected HAVING without GROUP BY bind error");
+}
+
+void assert_having_non_grouped_column_is_rejected() {
+    auto catalog = make_schema_catalog();
+    try {
+        (void)sql::bind_select(sql::parse_select("SELECT a, COUNT(*) FROM t GROUP BY a HAVING b = 20"), catalog);
+    } catch (const sql::BindError& error) {
+        assert(error.position() == 44);
+        assert(error.message() == "HAVING column 'b' must be a GROUP BY column or aggregate expression");
+        return;
+    }
+    throw std::logic_error("expected non-grouped HAVING column bind error");
 }
 
 void assert_grouped_order_by_accepts_grouping_column() {
@@ -236,7 +299,7 @@ void assert_grouped_order_by_accepts_grouping_column() {
 
     assert(logical.kind == plan::LogicalKind::Sort);
     const auto printed = plan::to_string(logical);
-    assert(printed.find("Sort[col(t.a) DESC]") != std::string::npos);
+    assert(printed.find("Sort[col(a) DESC]") != std::string::npos);
     assert(printed.find("Aggregate[group_keys=[col(t.a)], aggregates=[COUNT(*)]]") != std::string::npos);
 }
 
@@ -321,13 +384,18 @@ int main() {
     assert_alias_binding_replaces_physical_qualifier();
     assert_unaliased_scan_keeps_existing_identity_text();
     assert_order_by_uses_from_scope_not_projection_outputs();
+    assert_order_by_output_name_takes_precedence_over_from_scope();
     assert_alias_order_by_uses_binding_scope();
     assert_order_by_ambiguous_unqualified_column_reports_candidates();
     assert_group_by_binds_aggregate_between_filter_and_project();
+    assert_having_binds_between_aggregate_and_project();
+    assert_select_aliases_name_projected_aggregate_outputs();
     assert_ungrouped_aggregate_binds_single_global_group();
     assert_non_grouped_projection_column_is_rejected();
     assert_nested_aggregate_is_rejected();
     assert_grouped_order_by_must_use_grouping_column();
+    assert_having_without_group_by_is_rejected();
+    assert_having_non_grouped_column_is_rejected();
     assert_grouped_order_by_accepts_grouping_column();
     assert_physical_table_qualifier_is_unknown_when_alias_exists();
     assert_duplicate_binding_reports_alias_scope();

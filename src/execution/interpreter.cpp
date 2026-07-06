@@ -157,6 +157,50 @@ storage::ColumnarBatch materialize_project_rows(const plan::LogicalPlan& project
     return out;
 }
 
+storage::ColumnarBatch materialize_project_output_rows(const plan::LogicalPlan& project,
+                                                       const storage::ColumnarBatch& batch,
+                                                       const std::vector<std::size_t>& rows) {
+    storage::ColumnarBatch out;
+    for (const auto& projection : project.projections) {
+        storage::Int64Column column;
+        const auto& input_column = batch.column(projection.output_name);
+        for (auto row : rows) {
+            column.append(input_column.at(row));
+        }
+        out.add_column(projection.output_name, std::move(column));
+    }
+    return out;
+}
+
+void add_missing_sort_key_columns(storage::ColumnarBatch& sort_input,
+                                  const storage::ColumnarBatch& source,
+                                  const std::vector<plan::SortKey>& sort_keys) {
+    for (const auto& key : sort_keys) {
+        const auto name = column_identity_name(key.column);
+        if (sort_input.has_column(name)) {
+            continue;
+        }
+        if (!source.has_column(name)) {
+            throw std::logic_error("sort key column is not available before or after Project: " + name);
+        }
+        sort_input.add_column(name, source.column(name));
+    }
+}
+
+storage::ColumnarBatch materialize_project_sort_input(const plan::LogicalPlan& project,
+                                                      const storage::ColumnarBatch& source,
+                                                      const std::vector<plan::SortKey>& sort_keys) {
+    std::vector<std::size_t> rows;
+    rows.reserve(source.row_count());
+    for (std::size_t row = 0; row < source.row_count(); ++row) {
+        rows.push_back(row);
+    }
+
+    auto sort_input = materialize_project_rows(project, source, rows);
+    add_missing_sort_key_columns(sort_input, source, sort_keys);
+    return sort_input;
+}
+
 struct AggregateValue {
     std::int64_t count{0};
     std::int64_t sum{0};
@@ -413,8 +457,9 @@ storage::ColumnarBatch execute_sort(const plan::LogicalPlan& plan, const Catalog
     const auto& input_plan = require_input(plan);
     if (input_plan.kind == plan::LogicalKind::Project) {
         const auto source = execute_interpreted(require_input(input_plan), catalog);
-        const auto rows = stable_sorted_rows(plan.sort_keys, source);
-        return materialize_project_rows(input_plan, source, rows);
+        const auto sort_input = materialize_project_sort_input(input_plan, source, plan.sort_keys);
+        const auto rows = stable_sorted_rows(plan.sort_keys, sort_input);
+        return materialize_project_output_rows(input_plan, sort_input, rows);
     }
 
     auto input = execute_interpreted(input_plan, catalog);

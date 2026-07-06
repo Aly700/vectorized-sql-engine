@@ -503,9 +503,15 @@ bool run_result_golden_queries() {
         "SELECT a, b FROM t ORDER BY b DESC",
         "SELECT a, b FROM t ORDER BY b ASC, a DESC",
         "SELECT b FROM t ORDER BY b ASC",
+        "SELECT a AS x, b AS y FROM t ORDER BY x DESC",
+        "SELECT b AS a, a AS original FROM t ORDER BY a DESC",
         "SELECT COUNT(*), COUNT(b), SUM(a), MIN(b), MAX(b) FROM t",
         "SELECT b, COUNT(*), SUM(a), MIN(a), MAX(a) FROM t GROUP BY b",
         "SELECT b, COUNT(*) FROM t GROUP BY b ORDER BY b DESC",
+        "SELECT a FROM t GROUP BY a HAVING SUM(b) > 20",
+        "SELECT a, COUNT(*) FROM t GROUP BY a HAVING SUM(b) > 1000",
+        "SELECT a, SUM(b) AS total FROM t GROUP BY a HAVING SUM(b) >= 20 ORDER BY total DESC",
+        "SELECT a, SUM(b) FROM t GROUP BY a ORDER BY SUM(b) DESC",
     };
 
     bool ok = true;
@@ -555,8 +561,13 @@ bool run_join_oracle_corpus() {
         "JOIN t3 AS z ON y.c = z.c ORDER BY z.d DESC, x.b ASC",
         "SELECT t1.a, COUNT(*), SUM(t2.c), MIN(t2.c), MAX(t2.c) FROM t1 JOIN t2 ON t1.a = t2.a GROUP BY t1.a",
         "SELECT t1.a, COUNT(*) FROM t1 JOIN t2 ON t1.a = t2.a GROUP BY t1.a ORDER BY t1.a DESC",
+        "SELECT t1.a FROM t1 JOIN t2 ON t1.a = t2.a GROUP BY t1.a HAVING SUM(t2.c) > 500",
+        "SELECT t1.a AS key, SUM(t2.c) AS total FROM t1 JOIN t2 ON t1.a = t2.a "
+        "GROUP BY t1.a HAVING SUM(t2.c) > 500 ORDER BY total DESC",
         "SELECT t1.a, t3.d, COUNT(*) FROM t1 JOIN t2 ON t1.a = t2.a "
         "JOIN t3 ON t2.c = t3.c GROUP BY t1.a, t3.d ORDER BY t3.d DESC, t1.a ASC",
+        "SELECT t1.a AS key, SUM(t3.d) AS total FROM t1 JOIN t2 ON t1.a = t2.a "
+        "JOIN t3 ON t2.c = t3.c GROUP BY t1.a HAVING SUM(t3.d) > 4 ORDER BY total DESC",
     };
 
     bool ok = true;
@@ -642,6 +653,8 @@ bool run_generated_corpus() {
         }
         ok = compare_engines("SELECT a FROM t ORDER BY a ASC", catalog, table_text) && ok;
         ok = compare_engines("SELECT b, a FROM t ORDER BY b DESC, a ASC", catalog, table_text) && ok;
+        ok = compare_engines("SELECT a AS key FROM t ORDER BY key DESC", catalog, table_text) && ok;
+        ok = compare_engines("SELECT b AS a, a AS original FROM t ORDER BY a DESC", catalog, table_text) && ok;
         ok = compare_engines("SELECT COUNT(*) FROM t", catalog, table_text) && ok;
         ok = compare_engines("SELECT a, COUNT(*) FROM t GROUP BY a", catalog, table_text) && ok;
         ok = compare_engines("SELECT a, b, COUNT(*) FROM t GROUP BY a, b", catalog, table_text) && ok;
@@ -650,6 +663,14 @@ bool run_generated_corpus() {
                              table_text) &&
              ok;
         ok = compare_engines("SELECT a, COUNT(*) FROM t GROUP BY a ORDER BY a DESC", catalog, table_text) && ok;
+        ok = compare_engines("SELECT a AS key FROM t GROUP BY a HAVING COUNT(*) > 0 ORDER BY key ASC",
+                             catalog,
+                             table_text) &&
+             ok;
+        ok = compare_engines("SELECT a, SUM(b) AS total FROM t GROUP BY a HAVING COUNT(*) > 0 ORDER BY total DESC",
+                             catalog,
+                             table_text) &&
+             ok;
 
         for (const auto op : ops) {
             for (const auto literal : literals) {
