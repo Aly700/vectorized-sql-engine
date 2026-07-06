@@ -47,4 +47,6 @@ struct LogicalPlan {
     }
 };
 
+[[nodiscard]] std::string to_string(const LogicalPlan& logical);
+
 } // namespace plan

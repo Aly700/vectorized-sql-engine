@@ -1,11 +1,11 @@
 #pragma once
 
-#include "execution/interpreter.hpp"
+#include "catalog/catalog.hpp"
 #include "plan/logical_plan.hpp"
 #include "sql/ast.hpp"
 
 namespace sql {
 
-plan::LogicalPlan bind_select(const SelectQuery& query, const execution::Catalog& catalog);
+plan::LogicalPlan bind_select(const SelectQuery& query, const catalog::Catalog& catalog);
 
 } // namespace sql

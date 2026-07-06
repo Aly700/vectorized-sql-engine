@@ -1,5 +1,6 @@
 #include "execution/interpreter.hpp"
 #include "execution/vectorized.hpp"
+#include "optimizer/rewrite.hpp"
 #include "plan/physical_plan.hpp"
 #include "sql/binder.hpp"
 
@@ -114,20 +115,41 @@ bool same_batch(const storage::ColumnarBatch& left, const storage::ColumnarBatch
     return format_batch(left) == format_batch(right);
 }
 
+std::string format_trace(const optimizer::RewriteTrace& trace) {
+    std::ostringstream out;
+    out << "[";
+    for (std::size_t i = 0; i < trace.fired_rules.size(); ++i) {
+        if (i != 0) {
+            out << ",";
+        }
+        out << trace.fired_rules[i];
+    }
+    out << "]";
+    return out.str();
+}
+
 bool compare_engines(const std::string& sql, const execution::Catalog& catalog, const std::string& table_text) {
     const auto parsed = sql::parse_select(sql);
     const auto logical = sql::bind_select(parsed, catalog);
-    const auto interpreted = execution::execute_interpreted(logical, catalog);
-    const auto vectorized = execution::execute_vectorized(logical, catalog);
-    if (same_batch(interpreted, vectorized)) {
+    const auto rewritten = optimizer::rewrite_to_fixpoint(logical, optimizer::default_rules());
+    const auto unrewritten_oracle = execution::execute_interpreted(logical, catalog);
+    const auto rewritten_oracle = execution::execute_interpreted(rewritten.plan, catalog);
+    const auto rewritten_vectorized = execution::execute_vectorized(rewritten.plan, catalog);
+    if (same_batch(unrewritten_oracle, rewritten_oracle) && same_batch(rewritten_oracle, rewritten_vectorized)) {
         return true;
     }
 
-    std::cerr << "vectorized divergence\n"
+    std::cerr << "rewrite/vectorized divergence\n"
               << "sql: " << sql << "\n"
               << table_text << "\n"
-              << "interpreted: " << format_batch(interpreted) << "\n"
-              << "vectorized:   " << format_batch(vectorized) << "\n";
+              << "rewrite trace: " << format_trace(rewritten.trace) << "\n"
+              << "before plan:\n"
+              << plan::to_string(logical) << "\n"
+              << "after plan:\n"
+              << plan::to_string(rewritten.plan) << "\n"
+              << "unrewritten oracle: " << format_batch(unrewritten_oracle) << "\n"
+              << "rewritten oracle:   " << format_batch(rewritten_oracle) << "\n"
+              << "rewritten vector:   " << format_batch(rewritten_vectorized) << "\n";
     return false;
 }
 
@@ -225,6 +247,13 @@ bool run_generated_corpus() {
                     }
                 }
             }
+        }
+
+        for (const auto& projection : projections) {
+            ok = compare_engines("SELECT " + projection + " FROM t WHERE 2 > 1", catalog, table_text) && ok;
+            ok = compare_engines("SELECT " + projection + " FROM t WHERE 2 < 1", catalog, table_text) && ok;
+            ok = compare_engines("SELECT " + projection + " FROM t WHERE 2 > 1 AND a = 7", catalog, table_text) && ok;
+            ok = compare_engines("SELECT " + projection + " FROM t WHERE a = 7 AND 2 < 1", catalog, table_text) && ok;
         }
     }
 

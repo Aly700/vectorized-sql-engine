@@ -2,6 +2,7 @@
 
 #include "sql/errors.hpp"
 
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -10,35 +11,35 @@
 namespace sql {
 namespace {
 
-const storage::ColumnarBatch& require_table(const SelectQuery& query, const execution::Catalog& catalog) {
-    try {
-        return catalog.table(query.table);
-    } catch (const std::out_of_range&) {
+catalog::TableSchema require_table(const SelectQuery& query, const catalog::Catalog& catalog) {
+    auto table = catalog.find_table_schema(query.table);
+    if (!table.has_value()) {
         throw BindError(query.table_position, "unknown table '" + query.table + "'");
     }
+    return std::move(*table);
 }
 
-void require_column(const ColumnRef& column, const SelectQuery& query, const storage::ColumnarBatch& table) {
+void require_column(const ColumnRef& column, const SelectQuery& query, const catalog::TableSchema& table) {
     if (!table.has_column(column.name)) {
         throw BindError(column.position, "unknown column '" + column.name + "' in table '" + query.table + "'");
     }
 }
 
-void bind_expression(const ScalarExpr& expression, const SelectQuery& query, const storage::ColumnarBatch& table) {
+void bind_expression(const ScalarExpr& expression, const SelectQuery& query, const catalog::TableSchema& table) {
     if (const auto* column = std::get_if<ColumnRef>(&expression)) {
         require_column(*column, query, table);
     }
 }
 
-void bind_comparison(const ComparisonExpr& comparison, const SelectQuery& query, const storage::ColumnarBatch& table) {
+void bind_comparison(const ComparisonExpr& comparison, const SelectQuery& query, const catalog::TableSchema& table) {
     bind_expression(comparison.left, query, table);
     bind_expression(comparison.right, query, table);
 }
 
 } // namespace
 
-plan::LogicalPlan bind_select(const SelectQuery& query, const execution::Catalog& catalog) {
-    const auto& table = require_table(query, catalog);
+plan::LogicalPlan bind_select(const SelectQuery& query, const catalog::Catalog& catalog) {
+    const auto table = require_table(query, catalog);
 
     std::set<std::string> output_names;
     std::vector<plan::Projection> projections;

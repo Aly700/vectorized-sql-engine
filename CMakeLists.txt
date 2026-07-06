@@ -8,11 +8,13 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 add_library(sql_engine
     src/sql/parser.cpp
     src/sql/binder.cpp
+    src/plan/logical_plan.cpp
     src/plan/physical_plan.cpp
     src/storage/columnar_batch.cpp
     src/execution/interpreter.cpp
     src/execution/vectorized.cpp
     src/optimizer/memo.cpp
+    src/optimizer/rewrite.cpp
 )
 target_include_directories(sql_engine PUBLIC include)
 target_compile_options(sql_engine PRIVATE -Wall -Wextra -Wpedantic)
@@ -26,7 +28,15 @@ target_link_libraries(sql_golden PRIVATE sql_engine)
 add_executable(sql_vectorized_differential tests/vectorized_differential.cpp)
 target_link_libraries(sql_vectorized_differential PRIVATE sql_engine)
 
+add_executable(sql_catalog_binder tests/catalog_binder.cpp)
+target_link_libraries(sql_catalog_binder PRIVATE sql_engine)
+
+add_executable(sql_rewrite_rules tests/rewrite_rules.cpp)
+target_link_libraries(sql_rewrite_rules PRIVATE sql_engine)
+
 include(CTest)
 add_test(NAME sql_smoke COMMAND sql_smoke)
 add_test(NAME sql_golden COMMAND sql_golden)
 add_test(NAME sql_vectorized_differential COMMAND sql_vectorized_differential)
+add_test(NAME sql_catalog_binder COMMAND sql_catalog_binder)
+add_test(NAME sql_rewrite_rules COMMAND sql_rewrite_rules)
