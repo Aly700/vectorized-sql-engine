@@ -85,3 +85,49 @@ but the after run was slower than the baseline run for that workload
 remain slightly slower than the oracle in these measurements. No benchmark
 story is massaged: scan qualification improved the targeted scan/filter wart,
 but not every vectorized operator wins yet.
+
+## Phase 15 Batch Kernels Before/After
+
+The before table below is a fresh Release run on branch `phase15-kernels`
+before expression pre-resolution and tight vectorized kernels were implemented.
+
+### Before Expression Pre-Resolution
+
+| workload | rows | correctness | interpreted min ms | interpreted median ms | vectorized min ms | vectorized median ms | median speedup |
+|---|---:|---|---:|---:|---:|---:|---:|
+| scan_filter_1pct | fact=200000 | match rows=2000 checksum=0xbed96a798e222bcd | 11.868 | 11.876 | 15.038 | 15.242 | 0.779x |
+| scan_filter_10pct | fact=200000 | match rows=20000 checksum=0x45a16c604fed9716 | 13.127 | 13.160 | 16.388 | 16.570 | 0.794x |
+| scan_filter_50pct | fact=200000 | match rows=100000 checksum=0xcebbf422ce3b4b37 | 18.182 | 18.402 | 22.600 | 22.659 | 0.812x |
+| multi_key_hash_join | left=100000,right=256 | match rows=100000 checksum=0x8c117d14db53b4f5 | 4250.389 | 4272.688 | 28.805 | 29.016 | 147.253x |
+| aggregate_few_groups | fact=200000,groups=8 | match rows=8 checksum=0xbca846a1d8d0e49c | 22.565 | 22.718 | 24.674 | 24.801 | 0.916x |
+| aggregate_many_groups | fact=200000,groups=50000 | match rows=50000 checksum=0xede4362884d0d436 | 64.072 | 64.749 | 38.739 | 39.354 | 1.645x |
+| sort | fact=200000 | match rows=1000 checksum=0x3fffff63abea6d61 | 148.910 | 150.770 | 159.343 | 159.526 | 0.945x |
+| join_group_sort_limit | left=120000,right=256 | match rows=20 checksum=0xace3431b834cd54f | 3071.000 | 3097.848 | 43.980 | 44.778 | 69.183x |
+
+### After Expression Pre-Resolution
+
+| workload | rows | correctness | interpreted min ms | interpreted median ms | vectorized min ms | vectorized median ms | median speedup |
+|---|---:|---|---:|---:|---:|---:|---:|
+| scan_filter_1pct | fact=200000 | match rows=2000 checksum=0xbed96a798e222bcd | 11.966 | 12.153 | 8.324 | 8.525 | 1.426x |
+| scan_filter_10pct | fact=200000 | match rows=20000 checksum=0x45a16c604fed9716 | 13.258 | 13.470 | 9.462 | 9.671 | 1.393x |
+| scan_filter_50pct | fact=200000 | match rows=100000 checksum=0xcebbf422ce3b4b37 | 18.241 | 18.375 | 14.138 | 14.233 | 1.291x |
+| multi_key_hash_join | left=100000,right=256 | match rows=100000 checksum=0x8c117d14db53b4f5 | 4281.207 | 4301.099 | 10.848 | 11.477 | 374.769x |
+| aggregate_few_groups | fact=200000,groups=8 | match rows=8 checksum=0xbca846a1d8d0e49c | 22.243 | 22.622 | 11.857 | 11.873 | 1.905x |
+| aggregate_many_groups | fact=200000,groups=50000 | match rows=50000 checksum=0xede4362884d0d436 | 65.198 | 65.713 | 20.292 | 21.126 | 3.111x |
+| sort | fact=200000 | match rows=1000 checksum=0x3fffff63abea6d61 | 149.147 | 151.055 | 37.289 | 37.380 | 4.041x |
+| join_group_sort_limit | left=120000,right=256 | match rows=20 checksum=0xace3431b834cd54f | 3107.523 | 3129.509 | 23.770 | 23.878 | 131.061x |
+
+### Phase 15 Readout
+
+Expression pre-resolution and exact output reservation moved the scan/filter
+path from slower-than-oracle to faster-than-oracle: 1 percent selectivity
+improved from 0.779x to 1.426x, 10 percent from 0.794x to 1.393x, and 50
+percent from 0.812x to 1.291x median speedup. This directly addresses the
+Phase 14 finding that vectorized scan/filter lost because scalar evaluation and
+materialization were doing per-row column-name map lookups.
+
+The same pre-resolution benefited the other measured vectorized paths. Hash
+join median speedup rose from 147.253x to 374.769x; few-group aggregation moved
+from 0.916x to 1.905x; many-group aggregation from 1.645x to 3.111x; sort from
+0.945x to 4.041x; and the joined/grouped/sorted/limited workload from 69.183x
+to 131.061x. No measured workload regressed materially in this run.
