@@ -1,5 +1,7 @@
 #include "execution/interpreter.hpp"
 
+#include "optimizer/explain.hpp"
+
 #include <algorithm>
 #include <cstdint>
 #include <limits>
@@ -814,6 +816,8 @@ storage::ColumnarBatch execute_interpreted(const plan::LogicalPlan& plan, const 
         return execute_sort(plan, catalog);
     case plan::LogicalKind::Limit:
         return execute_limit(plan, catalog);
+    case plan::LogicalKind::Explain:
+        return optimizer::explain(require_input(plan), catalog);
     }
     throw std::logic_error("unreachable logical plan kind");
 }

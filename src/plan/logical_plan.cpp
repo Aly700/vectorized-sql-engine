@@ -134,7 +134,22 @@ void append_indent(std::ostringstream& out, std::size_t depth) {
     }
 }
 
-void append_plan(std::ostringstream& out, const LogicalPlan& logical, std::size_t depth) {
+void append_annotation(std::ostringstream& out,
+                       const LogicalPlan& logical,
+                       const std::function<std::string(const LogicalPlan&)>& annotation) {
+    if (!annotation) {
+        return;
+    }
+    const auto text = annotation(logical);
+    if (!text.empty()) {
+        out << " " << text;
+    }
+}
+
+void append_plan(std::ostringstream& out,
+                 const LogicalPlan& logical,
+                 std::size_t depth,
+                 const std::function<std::string(const LogicalPlan&)>& annotation = {}) {
     append_indent(out, depth);
     switch (logical.kind) {
     case LogicalKind::Scan:
@@ -143,6 +158,7 @@ void append_plan(std::ostringstream& out, const LogicalPlan& logical, std::size_
             out << " AS " << logical.binding_name;
         }
         out << "]";
+        append_annotation(out, logical, annotation);
         return;
     case LogicalKind::Join:
         out << "Join[";
@@ -152,10 +168,12 @@ void append_plan(std::ostringstream& out, const LogicalPlan& logical, std::size_
             }
             out << predicate_to_string(logical.predicates[i]);
         }
-        out << "]\n";
-        append_plan(out, require_left(logical), depth + 1);
+        out << "]";
+        append_annotation(out, logical, annotation);
         out << "\n";
-        append_plan(out, require_right(logical), depth + 1);
+        append_plan(out, require_left(logical), depth + 1, annotation);
+        out << "\n";
+        append_plan(out, require_right(logical), depth + 1, annotation);
         return;
     case LogicalKind::Filter:
         out << "Filter[";
@@ -165,8 +183,10 @@ void append_plan(std::ostringstream& out, const LogicalPlan& logical, std::size_
             }
             out << predicate_to_string(logical.predicates[i]);
         }
-        out << "]\n";
-        append_plan(out, require_input(logical), depth + 1);
+        out << "]";
+        append_annotation(out, logical, annotation);
+        out << "\n";
+        append_plan(out, require_input(logical), depth + 1, annotation);
         return;
     case LogicalKind::Project:
         out << "Project[";
@@ -176,8 +196,10 @@ void append_plan(std::ostringstream& out, const LogicalPlan& logical, std::size_
             }
             out << logical.projections[i].output_name << "=" << expression_to_string(logical.projections[i].expression);
         }
-        out << "]\n";
-        append_plan(out, require_input(logical), depth + 1);
+        out << "]";
+        append_annotation(out, logical, annotation);
+        out << "\n";
+        append_plan(out, require_input(logical), depth + 1, annotation);
         return;
     case LogicalKind::Aggregate:
         out << "Aggregate[group_keys=[";
@@ -194,12 +216,16 @@ void append_plan(std::ostringstream& out, const LogicalPlan& logical, std::size_
             }
             out << aggregate_expression_to_string(logical.aggregate_expressions[i]);
         }
-        out << "]]\n";
-        append_plan(out, require_input(logical), depth + 1);
+        out << "]]";
+        append_annotation(out, logical, annotation);
+        out << "\n";
+        append_plan(out, require_input(logical), depth + 1, annotation);
         return;
     case LogicalKind::Distinct:
-        out << "Distinct\n";
-        append_plan(out, require_input(logical), depth + 1);
+        out << "Distinct";
+        append_annotation(out, logical, annotation);
+        out << "\n";
+        append_plan(out, require_input(logical), depth + 1, annotation);
         return;
     case LogicalKind::Sort:
         out << "Sort[";
@@ -209,12 +235,22 @@ void append_plan(std::ostringstream& out, const LogicalPlan& logical, std::size_
             }
             out << sort_key_to_string(logical.sort_keys[i]);
         }
-        out << "]\n";
-        append_plan(out, require_input(logical), depth + 1);
+        out << "]";
+        append_annotation(out, logical, annotation);
+        out << "\n";
+        append_plan(out, require_input(logical), depth + 1, annotation);
         return;
     case LogicalKind::Limit:
-        out << "Limit[" << logical.limit_count << "]\n";
-        append_plan(out, require_input(logical), depth + 1);
+        out << "Limit[" << logical.limit_count << "]";
+        append_annotation(out, logical, annotation);
+        out << "\n";
+        append_plan(out, require_input(logical), depth + 1, annotation);
+        return;
+    case LogicalKind::Explain:
+        out << "Explain";
+        append_annotation(out, logical, annotation);
+        out << "\n";
+        append_plan(out, require_input(logical), depth + 1, annotation);
         return;
     }
     throw std::logic_error("unreachable logical plan kind");
@@ -225,6 +261,13 @@ void append_plan(std::ostringstream& out, const LogicalPlan& logical, std::size_
 std::string to_string(const LogicalPlan& logical) {
     std::ostringstream out;
     append_plan(out, logical, 0);
+    return out.str();
+}
+
+std::string to_string_annotated(const LogicalPlan& logical,
+                                const std::function<std::string(const LogicalPlan&)>& annotation) {
+    std::ostringstream out;
+    append_plan(out, logical, 0, annotation);
     return out.str();
 }
 

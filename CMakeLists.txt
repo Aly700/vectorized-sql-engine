@@ -13,6 +13,7 @@ add_library(sql_engine
     src/storage/columnar_batch.cpp
     src/execution/interpreter.cpp
     src/execution/vectorized.cpp
+    src/optimizer/explain.cpp
     src/optimizer/memo.cpp
     src/optimizer/rewrite.cpp
 )

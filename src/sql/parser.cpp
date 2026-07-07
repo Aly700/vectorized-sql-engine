@@ -70,7 +70,8 @@ bool is_reserved_keyword(std::string_view text) {
            equals_keyword(text, "DESC") || equals_keyword(text, "GROUP") || equals_keyword(text, "COUNT") ||
            equals_keyword(text, "SUM") || equals_keyword(text, "MIN") || equals_keyword(text, "MAX") ||
            equals_keyword(text, "HAVING") || equals_keyword(text, "DISTINCT") || equals_keyword(text, "LIMIT") ||
-           equals_keyword(text, "NULL") || equals_keyword(text, "IS") || equals_keyword(text, "NOT");
+           equals_keyword(text, "NULL") || equals_keyword(text, "IS") || equals_keyword(text, "NOT") ||
+           equals_keyword(text, "EXPLAIN");
 }
 
 class Lexer {
@@ -174,9 +175,13 @@ public:
     }
 
     SelectQuery parse_select() {
+        SelectQuery query;
+        if (is_keyword("EXPLAIN")) {
+            query.explain = true;
+            advance();
+        }
         expect_keyword("SELECT", "expected SELECT");
 
-        SelectQuery query;
         if (is_keyword("DISTINCT")) {
             query.distinct = true;
             advance();

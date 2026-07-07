@@ -252,6 +252,16 @@ bool query_has_aggregate(const SelectQuery& query) {
     return false;
 }
 
+plan::AggregateExpression hidden_count_star_aggregate() {
+    return plan::AggregateExpression{
+        "COUNT(*)",
+        AggregateFunction::Count,
+        std::nullopt,
+        0,
+        catalog::ColumnType::Int64,
+    };
+}
+
 plan::AggregateExpression bind_aggregate_call(const AggregateCall& aggregate,
                                               const std::vector<TableScope>& scopes) {
     if (aggregate.nested_aggregate) {
@@ -482,10 +492,7 @@ void mark_arbitrary_order(plan::LogicalPlan& logical) {
 plan::LogicalPlan bind_select(const SelectQuery& query, const catalog::Catalog& catalog) {
     const auto scopes = build_scopes(query, catalog);
     auto group_keys = bind_group_by_keys(query.group_by, scopes);
-    if (query.having.has_value() && group_keys.empty()) {
-        throw BindError(query.having->position, "HAVING requires GROUP BY in this SQL slice");
-    }
-    const auto aggregate_query = !group_keys.empty() || query_has_aggregate(query);
+    const auto aggregate_query = !group_keys.empty() || query_has_aggregate(query) || query.having.has_value();
 
     std::set<std::string> output_names;
     std::vector<std::string> output_name_order;
@@ -529,6 +536,9 @@ plan::LogicalPlan bind_select(const SelectQuery& query, const catalog::Catalog& 
     std::vector<plan::BoundPredicate> having_predicates;
     if (query.having.has_value()) {
         having_predicates = bind_having_predicates(query.having->conjuncts, scopes, group_keys, aggregate_expressions);
+        if (group_keys.empty() && aggregate_expressions.empty()) {
+            aggregate_expressions.push_back(hidden_count_star_aggregate());
+        }
     }
 
     auto sort_keys =
@@ -562,9 +572,11 @@ plan::LogicalPlan bind_select(const SelectQuery& query, const catalog::Catalog& 
         bound = plan::LogicalPlan::sort(std::move(sort_keys), std::move(bound));
     }
     if (query.limit.has_value()) {
-        auto limited = plan::LogicalPlan::limit(*query.limit, std::move(bound));
-        limited.order_permission = limited.input->order_permission;
-        return limited;
+        bound = plan::LogicalPlan::limit(*query.limit, std::move(bound));
+        bound.order_permission = bound.input->order_permission;
+    }
+    if (query.explain) {
+        return plan::LogicalPlan::explain(std::move(bound));
     }
     return bound;
 }

@@ -4,6 +4,7 @@
 #include "sql/ast.hpp"
 
 #include <cstddef>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -13,7 +14,7 @@
 
 namespace plan {
 
-enum class LogicalKind { Scan, Join, Filter, Project, Aggregate, Distinct, Sort, Limit };
+enum class LogicalKind { Scan, Join, Filter, Project, Aggregate, Distinct, Sort, Limit, Explain };
 enum class OrderPermission { Deterministic, Arbitrary };
 
 struct BoundColumnRef {
@@ -192,8 +193,18 @@ struct LogicalPlan {
         p.input = std::make_shared<LogicalPlan>(std::move(child));
         return p;
     }
+
+    static LogicalPlan explain(LogicalPlan child) {
+        LogicalPlan p;
+        p.kind = LogicalKind::Explain;
+        p.input = std::make_shared<LogicalPlan>(std::move(child));
+        return p;
+    }
 };
 
 [[nodiscard]] std::string to_string(const LogicalPlan& logical);
+[[nodiscard]] std::string to_string_annotated(
+    const LogicalPlan& logical,
+    const std::function<std::string(const LogicalPlan&)>& annotation);
 
 } // namespace plan

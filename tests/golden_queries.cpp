@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <iostream>
+#include <initializer_list>
 #include <limits>
 #include <optional>
 #include <sstream>
@@ -256,7 +257,32 @@ execution::Catalog make_catalog() {
     string_right.add_column("k", std::move(right_k));
     string_right.add_column("w", std::move(right_w));
     catalog.add_table("string_right", std::move(string_right));
+
+    auto make_single_key_batch = [](std::int64_t row_count) {
+        storage::Int64Column key;
+        for (std::int64_t value = 0; value < row_count; ++value) {
+            key.append(value);
+        }
+        storage::ColumnarBatch keyed;
+        keyed.add_column("k", std::move(key));
+        return keyed;
+    };
+    catalog.add_table("big", make_single_key_batch(1000));
+    catalog.add_table("mid", make_single_key_batch(100));
+    catalog.add_table("tiny", make_single_key_batch(2));
+    catalog.add_table("push_big", make_single_key_batch(10000));
+    catalog.add_table("push_mid", make_single_key_batch(10000));
     return catalog;
+}
+
+ExpectedResult explain_result(std::initializer_list<std::string> lines) {
+    ExpectedResult result;
+    result.columns = {"plan"};
+    result.rows.reserve(lines.size());
+    for (const auto& line : lines) {
+        result.rows.push_back({ExpectedCell{line}});
+    }
+    return result;
 }
 
 std::string format_result(const ExpectedResult& result) {
@@ -463,6 +489,27 @@ int main() {
             ExpectedResult{{"l.v", "r.w"}, {{1, 11}, {1, 13}, {4, 11}, {4, 13}}},
         },
         GoldenQuery{
+            "EXPLAIN string NULL query is deterministic",
+            "EXPLAIN SELECT s FROM strings WHERE s IS NULL",
+            explain_result({
+                "EXPLAIN",
+                "bound logical plan:",
+                "  Project[s=col(strings.s)]",
+                "    Filter[col(strings.s) IS NULL]",
+                "      Scan[strings]",
+                "memo exploration:",
+                "  groups: 3",
+                "  iterations: 0",
+                "  reached_fixpoint: yes",
+                "  fired rules: <none>",
+                "chosen plan:",
+                "  Project[s=col(strings.s)] rows=0.50 cost=10.00",
+                "    Filter[col(strings.s) IS NULL] rows=0.50 cost=10.00",
+                "      Scan[strings] rows=5.00 cost=5.00",
+                "total cost: 10.00",
+            }),
+        },
+        GoldenQuery{
             "string self join uses exact string equality",
             "SELECT x.s, y.s FROM string_dups AS x JOIN string_dups AS y ON x.s = y.s ORDER BY x.s ASC",
             ExpectedResult{{"x.s", "y.s"}, {{"", ""}, {"x", "x"}, {"x", "x"}, {"x", "x"}, {"x", "x"}}},
@@ -552,6 +599,39 @@ int main() {
             "left deep multi join preserves deterministic order",
             "SELECT t1.b, t2.c, t3.d FROM t1 JOIN t2 ON t1.a = t2.a JOIN t3 ON t2.c = t3.c WHERE t3.d >= 2",
             ExpectedResult{{"t1.b", "t2.c", "t3.d"}, {{20, 201, 2}, {20, 201, 3}, {30, 201, 2}, {30, 201, 3}}},
+        },
+        GoldenQuery{
+            "EXPLAIN multi join shows cost based join reorder",
+            "EXPLAIN SELECT big.k, mid.k, tiny.k FROM big JOIN mid ON big.k = mid.k JOIN tiny ON mid.k = tiny.k",
+            explain_result({
+                "EXPLAIN",
+                "bound logical plan:",
+                "  Project[big.k=col(big.k), mid.k=col(mid.k), tiny.k=col(tiny.k)]",
+                "    Join[col(mid.k) = col(tiny.k)]",
+                "      Join[col(big.k) = col(mid.k)]",
+                "        Scan[big]",
+                "        Scan[mid]",
+                "      Scan[tiny]",
+                "memo exploration:",
+                "  groups: 8",
+                "  iterations: 2",
+                "  reached_fixpoint: yes",
+                "  fired rules:",
+                "    0: JoinCommuteRule",
+                "    1: JoinCommuteRule",
+                "    2: JoinAssociateRule",
+                "    3: JoinAssociateRule",
+                "    4: JoinCommuteRule",
+                "    5: JoinCommuteRule",
+                "chosen plan:",
+                "  Project[big.k=col(big.k), mid.k=col(mid.k), tiny.k=col(tiny.k)] rows=2.00 cost=2206.00",
+                "    Join[col(big.k) = col(mid.k)] rows=2.00 cost=2206.00",
+                "      Scan[big] rows=1000.00 cost=1000.00",
+                "      Join[col(mid.k) = col(tiny.k)] rows=2.00 cost=204.00",
+                "        Scan[mid] rows=100.00 cost=100.00",
+                "        Scan[tiny] rows=2.00 cost=2.00",
+                "total cost: 2206.00",
+            }),
         },
         GoldenQuery{
             "qualified duplicate column names use qualified output names",
@@ -672,6 +752,36 @@ int main() {
             "having filters grouped rows using projected aggregate",
             "SELECT a, SUM(b) FROM t GROUP BY a HAVING SUM(b) > 20 ORDER BY a ASC",
             ExpectedResult{{"a", "SUM(b)"}, {{4, 40}}},
+        },
+        GoldenQuery{
+            "global HAVING keeps the single group",
+            "SELECT SUM(a) FROM t HAVING COUNT(*) > 0",
+            ExpectedResult{{"SUM(a)"}, {{10}}},
+        },
+        GoldenQuery{
+            "global HAVING can reject the single group",
+            "SELECT SUM(a) FROM t HAVING COUNT(*) > 100",
+            ExpectedResult{{"SUM(a)"}, {}},
+        },
+        GoldenQuery{
+            "global HAVING UNKNOWN from NULL aggregate rejects the group",
+            "SELECT SUM(x) FROM agg_null WHERE g = 2 HAVING SUM(x) > 0",
+            ExpectedResult{{"SUM(x)"}, {}},
+        },
+        GoldenQuery{
+            "global HAVING can keep NULL aggregate results",
+            "SELECT SUM(x) FROM agg_null WHERE g = 2 HAVING SUM(x) IS NULL",
+            ExpectedResult{{"SUM(x)"}, {{std::nullopt}}},
+        },
+        GoldenQuery{
+            "global HAVING over empty input can reject the empty group",
+            "SELECT COUNT(*) FROM empty HAVING COUNT(*) > 0",
+            ExpectedResult{{"COUNT(*)"}, {}},
+        },
+        GoldenQuery{
+            "global HAVING over empty input can keep NULL aggregate output",
+            "SELECT SUM(empty.a) FROM empty HAVING COUNT(*) = 0",
+            ExpectedResult{{"SUM(empty.a)"}, {{std::nullopt}}},
         },
         GoldenQuery{
             "HAVING UNKNOWN from NULL aggregate rejects group",
@@ -855,11 +965,37 @@ int main() {
             ExpectedError{ErrorKind::Bind, 46, "ORDER BY column 'b' must be a GROUP BY column or SELECT output name in aggregate queries"},
         },
         GoldenQuery{
-            "having without group by is a bind error",
+            "global HAVING with COUNT only aggregate is legal",
             "SELECT COUNT(*) FROM t HAVING COUNT(*) > 0",
-            ExpectedResult{},
-            true,
-            ExpectedError{ErrorKind::Bind, 23, "HAVING requires GROUP BY in this SQL slice"},
+            ExpectedResult{{"COUNT(*)"}, {{4}}},
+        },
+        GoldenQuery{
+            "EXPLAIN pushdown shows chosen pushed filter",
+            "EXPLAIN SELECT push_big.k, push_mid.k FROM push_big JOIN push_mid ON push_big.k = push_mid.k WHERE push_big.k = 7",
+            explain_result({
+                "EXPLAIN",
+                "bound logical plan:",
+                "  Project[push_big.k=col(push_big.k), push_mid.k=col(push_mid.k)]",
+                "    Filter[col(push_big.k) = lit(7)]",
+                "      Join[col(push_big.k) = col(push_mid.k)]",
+                "        Scan[push_big]",
+                "        Scan[push_mid]",
+                "memo exploration:",
+                "  groups: 8",
+                "  iterations: 2",
+                "  reached_fixpoint: yes",
+                "  fired rules:",
+                "    0: JoinCommuteRule",
+                "    1: FilterIntoJoinRule",
+                "    2: JoinCommuteRule",
+                "chosen plan:",
+                "  Project[push_big.k=col(push_big.k), push_mid.k=col(push_mid.k)] rows=1000.00 cost=41000.00",
+                "    Join[col(push_big.k) = col(push_mid.k)] rows=1000.00 cost=41000.00",
+                "      Filter[col(push_big.k) = lit(7)] rows=1000.00 cost=20000.00",
+                "        Scan[push_big] rows=10000.00 cost=10000.00",
+                "      Scan[push_mid] rows=10000.00 cost=10000.00",
+                "total cost: 41000.00",
+            }),
         },
         GoldenQuery{
             "non grouped having column is a bind error",

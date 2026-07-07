@@ -50,6 +50,8 @@ PhysicalPlan lower_to_physical(const LogicalPlan& logical) {
         return PhysicalPlan::sort(logical.sort_keys, lower_to_physical(require_input(logical)));
     case LogicalKind::Limit:
         return PhysicalPlan::limit(logical.limit_count, lower_to_physical(require_input(logical)));
+    case LogicalKind::Explain:
+        throw std::invalid_argument("EXPLAIN logical plans cannot be lowered to physical plans");
     }
     throw std::logic_error("unreachable logical plan kind");
 }

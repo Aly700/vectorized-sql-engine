@@ -209,6 +209,9 @@ public:
         }
 
         const auto distinct = chance(28);
+        // EXPLAIN is intentionally excluded from generation: it observes the
+        // optimizer report rather than query semantics. The shared differential
+        // verifier still handles EXPLAIN exactly if a fixed corpus case uses it.
         std::ostringstream sql;
         sql << "SELECT ";
         if (distinct) {

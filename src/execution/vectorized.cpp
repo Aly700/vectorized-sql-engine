@@ -1,5 +1,7 @@
 #include "execution/vectorized.hpp"
 
+#include "optimizer/explain.hpp"
+
 #include <algorithm>
 #include <cstdint>
 #include <functional>
@@ -1146,6 +1148,13 @@ const plan::PhysicalPlan& require_input(const plan::PhysicalPlan& plan) {
     return *plan.input;
 }
 
+const plan::LogicalPlan& require_logical_input(const plan::LogicalPlan& plan) {
+    if (!plan.input) {
+        throw std::invalid_argument("logical plan node is missing its input");
+    }
+    return *plan.input;
+}
+
 const plan::PhysicalPlan& require_left(const plan::PhysicalPlan& plan) {
     if (!plan.left) {
         throw std::invalid_argument("physical join node is missing its left input");
@@ -1602,6 +1611,9 @@ KernelDispatch select_kernel_dispatch(const plan::PhysicalPlan& plan, const Cata
 } // namespace
 
 storage::ColumnarBatch execute_vectorized(const plan::LogicalPlan& plan, const Catalog& catalog) {
+    if (plan.kind == plan::LogicalKind::Explain) {
+        return optimizer::explain(require_logical_input(plan), catalog);
+    }
     return execute_vectorized(plan::lower_to_physical(plan), catalog);
 }
 

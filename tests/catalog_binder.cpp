@@ -320,16 +320,19 @@ void assert_grouped_order_by_must_use_grouping_column() {
     throw std::logic_error("expected grouped ORDER BY bind error");
 }
 
-void assert_having_without_group_by_is_rejected() {
+void assert_global_having_binds_over_single_global_group() {
     auto catalog = make_schema_catalog();
-    try {
-        (void)sql::bind_select(sql::parse_select("SELECT COUNT(*) FROM t HAVING COUNT(*) > 0"), catalog);
-    } catch (const sql::BindError& error) {
-        assert(error.position() == 23);
-        assert(error.message() == "HAVING requires GROUP BY in this SQL slice");
-        return;
+    const auto logical = sql::bind_select(sql::parse_select("SELECT SUM(a) FROM t HAVING COUNT(*) > 0"), catalog);
+
+    const auto printed = plan::to_string(logical);
+    const auto expected =
+        std::string("Project[SUM(a)=col(SUM(a))]\n") +
+        "  Filter[col(COUNT(*)) > lit(0)]\n"
+        "    Aggregate[group_keys=[], aggregates=[SUM(a)=col(t.a), COUNT(*)]]\n"
+        "      Scan[t]";
+    if (printed != expected) {
+        throw std::logic_error("global HAVING plan shape mismatch:\n" + printed);
     }
-    throw std::logic_error("expected HAVING without GROUP BY bind error");
 }
 
 void assert_having_non_grouped_column_is_rejected() {
@@ -527,7 +530,7 @@ int main() {
     assert_non_grouped_projection_column_is_rejected();
     assert_nested_aggregate_is_rejected();
     assert_grouped_order_by_must_use_grouping_column();
-    assert_having_without_group_by_is_rejected();
+    assert_global_having_binds_over_single_global_group();
     assert_having_non_grouped_column_is_rejected();
     assert_grouped_order_by_accepts_grouping_column();
     assert_physical_table_qualifier_is_unknown_when_alias_exists();

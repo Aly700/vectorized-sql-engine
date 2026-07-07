@@ -169,6 +169,7 @@ struct JoinClause {
 };
 
 struct SelectQuery {
+    bool explain{false};
     bool distinct{false};
     std::vector<SelectItem> projection;
     std::string table;
