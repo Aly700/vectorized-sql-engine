@@ -131,3 +131,26 @@ join median speedup rose from 147.253x to 374.769x; few-group aggregation moved
 from 0.916x to 1.905x; many-group aggregation from 1.645x to 3.111x; sort from
 0.945x to 4.041x; and the joined/grouped/sorted/limited workload from 69.183x
 to 131.061x. No measured workload regressed materially in this run.
+
+## Post-NULL re-run (phase 16, 2026-07-07)
+
+Same methodology and machine as above. After the NULL arc (validity masks,
+3VL predicates, null-aware compiled kernels, NULL-skipping aggregates), the
+vectorized engine still wins every measured workload; correctness cross-checks
+all match. Checksums differ from earlier tables because the workload
+generator's data pool changed with nullable-column support.
+
+| workload | rows | correctness | interpreted min ms | interpreted median ms | vectorized min ms | vectorized median ms | median speedup |
+|---|---:|---|---:|---:|---:|---:|---:|
+| scan_filter_1pct | fact=200000 | match rows=2000 checksum=0x95ba2cbd0a720591 | 14.693 | 15.226 | 8.968 | 9.410 | 1.618x |
+| scan_filter_10pct | fact=200000 | match rows=20000 checksum=0x8031b34dc1b05c00 | 15.690 | 16.686 | 13.097 | 13.732 | 1.215x |
+| scan_filter_50pct | fact=200000 | match rows=100000 checksum=0xd4bb87b7e1354cb7 | 21.613 | 22.297 | 16.044 | 16.845 | 1.324x |
+| multi_key_hash_join | left=100000,right=256 | match rows=100000 checksum=0xd6eff9218be6da07 | 5167.567 | 9372.338 | 14.520 | 16.350 | 573.226x |
+| aggregate_few_groups | fact=200000,groups=8 | match rows=8 checksum=0xd3f7b04105d9e1d2 | 23.970 | 29.962 | 12.783 | 14.442 | 2.075x |
+| aggregate_many_groups | fact=200000,groups=50000 | match rows=50000 checksum=0xf5d6639180dcf25a | 88.744 | 114.908 | 23.906 | 28.040 | 4.098x |
+| sort | fact=200000 | match rows=1000 checksum=0x42e9485c298e1347 | 156.938 | 164.179 | 40.445 | 41.304 | 3.975x |
+| join_group_sort_limit | left=120000,right=256 | match rows=20 checksum=0x76e0a28dbe61b35d | 3203.757 | 3230.453 | 25.906 | 26.636 | 121.281x |
+
+Interpreted medians rose relative to phase 15 (machine load and null-aware
+row paths); vectorized retains its advantage on all workloads, so the phase-15
+conclusion stands after the NULL arc.
