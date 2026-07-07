@@ -29,14 +29,17 @@ const LogicalPlan& require_right(const LogicalPlan& logical) {
 }
 
 std::string expression_to_string(const BoundScalarExpr& expression) {
-    if (const auto* column = std::get_if<BoundColumnRef>(&expression)) {
+    if (const auto* column = std::get_if<BoundColumnRef>(&expression.value)) {
         if (column->binding.empty()) {
             return "col(" + column->column + ")";
         }
         return "col(" + column->binding + "." + column->column + ")";
     }
-    if (const auto* literal = std::get_if<sql::IntLiteral>(&expression)) {
+    if (const auto* literal = std::get_if<sql::IntLiteral>(&expression.value)) {
         return "lit(" + std::to_string(literal->value) + ")";
+    }
+    if (const auto* literal = std::get_if<sql::StringLiteral>(&expression.value)) {
+        return "lit(" + sql::quote_string_literal(literal->value) + ")";
     }
     return "lit(NULL)";
 }

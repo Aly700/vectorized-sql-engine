@@ -25,7 +25,12 @@ struct NullLiteral {
     std::size_t position{0};
 };
 
-using ScalarExpr = std::variant<ColumnRef, IntLiteral, NullLiteral>;
+struct StringLiteral {
+    std::string value;
+    std::size_t position{0};
+};
+
+using ScalarExpr = std::variant<ColumnRef, IntLiteral, StringLiteral, NullLiteral>;
 
 enum class AggregateFunction { Count, Sum, Min, Max };
 
@@ -40,7 +45,7 @@ struct AggregateCall {
 };
 
 using SelectExpr = std::variant<ScalarExpr, AggregateCall>;
-using HavingExpr = std::variant<ColumnRef, IntLiteral, NullLiteral, AggregateCall>;
+using HavingExpr = std::variant<ColumnRef, IntLiteral, StringLiteral, NullLiteral, AggregateCall>;
 using OrderByExpr = std::variant<ColumnRef, AggregateCall>;
 
 enum class ComparisonOp { Equal, NotEqual, Less, LessEqual, Greater, GreaterEqual };
@@ -187,6 +192,9 @@ inline std::size_t expression_position(const ScalarExpr& expression) {
     if (const auto* literal = std::get_if<IntLiteral>(&expression)) {
         return literal->position;
     }
+    if (const auto* literal = std::get_if<StringLiteral>(&expression)) {
+        return literal->position;
+    }
     return std::get<NullLiteral>(expression).position;
 }
 
@@ -202,6 +210,9 @@ inline std::size_t expression_position(const HavingExpr& expression) {
         return column->position;
     }
     if (const auto* literal = std::get_if<IntLiteral>(&expression)) {
+        return literal->position;
+    }
+    if (const auto* literal = std::get_if<StringLiteral>(&expression)) {
         return literal->position;
     }
     if (const auto* literal = std::get_if<NullLiteral>(&expression)) {
@@ -231,6 +242,18 @@ inline std::string aggregate_function_name(AggregateFunction function) {
     return "<unknown aggregate>";
 }
 
+inline std::string quote_string_literal(const std::string& value) {
+    std::string quoted = "'";
+    for (const auto ch : value) {
+        quoted.push_back(ch);
+        if (ch == '\'') {
+            quoted.push_back('\'');
+        }
+    }
+    quoted.push_back('\'');
+    return quoted;
+}
+
 inline std::string output_name(const ScalarExpr& expression) {
     if (const auto* column = std::get_if<ColumnRef>(&expression)) {
         if (column->qualifier.has_value()) {
@@ -240,6 +263,9 @@ inline std::string output_name(const ScalarExpr& expression) {
     }
     if (const auto* literal = std::get_if<IntLiteral>(&expression)) {
         return std::to_string(literal->value);
+    }
+    if (const auto* literal = std::get_if<StringLiteral>(&expression)) {
+        return quote_string_literal(literal->value);
     }
     return "NULL";
 }
@@ -277,6 +303,9 @@ inline std::string output_name(const HavingExpr& expression) {
     }
     if (const auto* literal = std::get_if<IntLiteral>(&expression)) {
         return std::to_string(literal->value);
+    }
+    if (const auto* literal = std::get_if<StringLiteral>(&expression)) {
+        return quote_string_literal(literal->value);
     }
     if (std::holds_alternative<NullLiteral>(expression)) {
         return "NULL";

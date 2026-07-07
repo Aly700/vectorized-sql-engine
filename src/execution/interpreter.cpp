@@ -13,7 +13,88 @@
 namespace execution {
 namespace {
 
-using Cell = std::optional<std::int64_t>;
+struct Cell {
+    catalog::ColumnType type{catalog::ColumnType::Int64};
+    bool is_null{true};
+    std::int64_t int_value{0};
+    std::string string_value;
+};
+
+bool operator==(const Cell& left, const Cell& right) {
+    if (left.is_null || right.is_null) {
+        return left.is_null == right.is_null && left.type == right.type;
+    }
+    if (left.type != right.type) {
+        return false;
+    }
+    return left.type == catalog::ColumnType::Int64 ? left.int_value == right.int_value
+                                                   : left.string_value == right.string_value;
+}
+
+bool operator<(const Cell& left, const Cell& right) {
+    if (left.type != right.type) {
+        return static_cast<int>(left.type) < static_cast<int>(right.type);
+    }
+    if (left.is_null || right.is_null) {
+        return left.is_null && !right.is_null;
+    }
+    return left.type == catalog::ColumnType::Int64 ? left.int_value < right.int_value
+                                                   : left.string_value < right.string_value;
+}
+
+Cell null_cell(catalog::ColumnType type) {
+    return Cell{type, true, 0, ""};
+}
+
+Cell int64_cell(std::int64_t value) {
+    return Cell{catalog::ColumnType::Int64, false, value, ""};
+}
+
+Cell string_cell(std::string value) {
+    Cell cell;
+    cell.type = catalog::ColumnType::String;
+    cell.is_null = false;
+    cell.string_value = std::move(value);
+    return cell;
+}
+
+struct OutputColumn {
+    catalog::ColumnType type{catalog::ColumnType::Int64};
+    storage::Int64Column int64;
+    storage::StringColumn string;
+
+    void reserve(std::size_t count) {
+        if (type == catalog::ColumnType::Int64) {
+            int64.reserve(count);
+        } else {
+            string.reserve(count);
+        }
+    }
+
+    void append(Cell value) {
+        if (type == catalog::ColumnType::Int64) {
+            if (value.is_null) {
+                int64.append_null();
+            } else {
+                int64.append(value.int_value);
+            }
+            return;
+        }
+        if (value.is_null) {
+            string.append_null();
+        } else {
+            string.append(std::move(value.string_value));
+        }
+    }
+
+    void add_to(storage::ColumnarBatch& batch, const std::string& name) && {
+        if (type == catalog::ColumnType::Int64) {
+            batch.add_column(name, std::move(int64));
+        } else {
+            batch.add_column(name, std::move(string));
+        }
+    }
+};
 
 enum class TruthValue { False, True, Unknown };
 
@@ -45,34 +126,39 @@ std::string column_identity_name(const plan::BoundColumnRef& column) {
     return column.binding + "." + column.column;
 }
 
-Cell cell_at(const storage::Int64Column& column, std::size_t row) {
-    if (column.is_null(row)) {
-        return std::nullopt;
+Cell cell_at(const storage::ColumnarBatch& batch, const std::string& name, std::size_t row) {
+    const auto type = batch.column_type(name);
+    if (type == catalog::ColumnType::Int64) {
+        const auto& column = batch.column(name);
+        if (column.is_null(row)) {
+            return null_cell(type);
+        }
+        return int64_cell(column.at(row));
     }
-    return column.at(row);
-}
 
-void append_cell(storage::Int64Column& column, Cell value) {
-    if (value.has_value()) {
-        column.append(*value);
-    } else {
-        column.append_null();
+    const auto& column = batch.string_column(name);
+    if (column.is_null(row)) {
+        return null_cell(type);
     }
+    return string_cell(column.at(row));
 }
 
 Cell evaluate_scalar(const plan::BoundScalarExpr& expression,
                      const storage::ColumnarBatch& batch,
                      std::size_t row) {
-    if (const auto* column = std::get_if<plan::BoundColumnRef>(&expression)) {
-        return cell_at(batch.column(column_identity_name(*column)), row);
+    if (const auto* column = std::get_if<plan::BoundColumnRef>(&expression.value)) {
+        return cell_at(batch, column_identity_name(*column), row);
     }
-    if (const auto* literal = std::get_if<sql::IntLiteral>(&expression)) {
-        return literal->value;
+    if (const auto* literal = std::get_if<sql::IntLiteral>(&expression.value)) {
+        return int64_cell(literal->value);
     }
-    return std::nullopt;
+    if (const auto* literal = std::get_if<sql::StringLiteral>(&expression.value)) {
+        return string_cell(literal->value);
+    }
+    return null_cell(expression.type);
 }
 
-bool compare_values(std::int64_t left, sql::ComparisonOp op, std::int64_t right) {
+bool compare_values(const Cell& left, sql::ComparisonOp op, const Cell& right) {
     switch (op) {
     case sql::ComparisonOp::Equal:
         return left == right;
@@ -81,11 +167,11 @@ bool compare_values(std::int64_t left, sql::ComparisonOp op, std::int64_t right)
     case sql::ComparisonOp::Less:
         return left < right;
     case sql::ComparisonOp::LessEqual:
-        return left <= right;
+        return left < right || left == right;
     case sql::ComparisonOp::Greater:
-        return left > right;
+        return right < left;
     case sql::ComparisonOp::GreaterEqual:
-        return left >= right;
+        return right < left || left == right;
     }
     throw std::logic_error("unreachable comparison operator");
 }
@@ -119,10 +205,10 @@ TruthValue evaluate_comparison(const plan::BoundComparisonExpr& comparison,
                                std::size_t row) {
     const auto left = evaluate_scalar(comparison.left, batch, row);
     const auto right = evaluate_scalar(comparison.right, batch, row);
-    if (!left.has_value() || !right.has_value()) {
+    if (left.is_null || right.is_null) {
         return TruthValue::Unknown;
     }
-    return truth_from_bool(compare_values(*left, comparison.op, *right));
+    return truth_from_bool(compare_values(left, comparison.op, right));
 }
 
 const plan::BoundPredicate& require_left_predicate(const plan::BoundPredicate& predicate) {
@@ -144,9 +230,9 @@ TruthValue evaluate_predicate(const plan::BoundPredicate& predicate, const stora
     case sql::PredicateKind::Comparison:
         return evaluate_comparison(predicate.comparison, batch, row);
     case sql::PredicateKind::IsNull:
-        return truth_from_bool(!evaluate_scalar(predicate.null_check, batch, row).has_value());
+        return truth_from_bool(evaluate_scalar(predicate.null_check, batch, row).is_null);
     case sql::PredicateKind::IsNotNull:
-        return truth_from_bool(evaluate_scalar(predicate.null_check, batch, row).has_value());
+        return truth_from_bool(!evaluate_scalar(predicate.null_check, batch, row).is_null);
     case sql::PredicateKind::And: {
         // Predicate trees are pure in this SQL slice, but evaluation order is
         // still fixed: left child, right child, then the boolean operator.
@@ -184,20 +270,22 @@ storage::RowMask evaluate_filter(const std::vector<plan::BoundPredicate>& predic
     return mask;
 }
 
-storage::Int64Column evaluate_projection(const plan::Projection& projection, const storage::ColumnarBatch& batch) {
-    storage::Int64Column column;
+OutputColumn evaluate_projection(const plan::Projection& projection, const storage::ColumnarBatch& batch) {
+    OutputColumn column;
+    column.type = projection.type;
     for (std::size_t row = 0; row < batch.row_count(); ++row) {
-        append_cell(column, evaluate_scalar(projection.expression, batch, row));
+        column.append(evaluate_scalar(projection.expression, batch, row));
     }
     return column;
 }
 
-storage::Int64Column evaluate_projection(const plan::Projection& projection,
-                                         const storage::ColumnarBatch& batch,
-                                         const std::vector<std::size_t>& rows) {
-    storage::Int64Column column;
+OutputColumn evaluate_projection(const plan::Projection& projection,
+                                 const storage::ColumnarBatch& batch,
+                                 const std::vector<std::size_t>& rows) {
+    OutputColumn column;
+    column.type = projection.type;
     for (auto row : rows) {
-        append_cell(column, evaluate_scalar(projection.expression, batch, row));
+        column.append(evaluate_scalar(projection.expression, batch, row));
     }
     return column;
 }
@@ -212,19 +300,19 @@ std::vector<std::size_t> stable_sorted_rows(const std::vector<plan::SortKey>& so
 
     std::stable_sort(rows.begin(), rows.end(), [&](std::size_t left, std::size_t right) {
         for (const auto& key : sort_keys) {
-            const auto& column = batch.column(column_identity_name(key.column));
-            const auto left_value = cell_at(column, left);
-            const auto right_value = cell_at(column, right);
+            const auto name = column_identity_name(key.column);
+            const auto left_value = cell_at(batch, name, left);
+            const auto right_value = cell_at(batch, name, right);
             if (left_value == right_value) {
                 continue;
             }
-            const auto left_is_null = !left_value.has_value();
-            const auto right_is_null = !right_value.has_value();
+            const auto left_is_null = left_value.is_null;
+            const auto right_is_null = right_value.is_null;
             if (left_is_null || right_is_null) {
                 return key.direction == sql::SortDirection::Asc ? right_is_null : left_is_null;
             }
-            return key.direction == sql::SortDirection::Asc ? *left_value < *right_value
-                                                            : *left_value > *right_value;
+            return key.direction == sql::SortDirection::Asc ? left_value < right_value
+                                                            : right_value < left_value;
         }
         return false;
     });
@@ -234,12 +322,12 @@ std::vector<std::size_t> stable_sorted_rows(const std::vector<plan::SortKey>& so
 storage::ColumnarBatch materialize_rows(const storage::ColumnarBatch& batch, const std::vector<std::size_t>& rows) {
     storage::ColumnarBatch out;
     for (const auto& name : batch.column_names()) {
-        storage::Int64Column column;
-        const auto& input_column = batch.column(name);
+        OutputColumn column;
+        column.type = batch.column_type(name);
         for (auto row : rows) {
-            append_cell(column, cell_at(input_column, row));
+            column.append(cell_at(batch, name, row));
         }
-        out.add_column(name, std::move(column));
+        std::move(column).add_to(out, name);
     }
     return out;
 }
@@ -248,7 +336,7 @@ std::vector<Cell> row_values(const storage::ColumnarBatch& batch, std::size_t ro
     std::vector<Cell> values;
     values.reserve(batch.column_names().size());
     for (const auto& name : batch.column_names()) {
-        values.push_back(cell_at(batch.column(name), row));
+        values.push_back(cell_at(batch, name, row));
     }
     return values;
 }
@@ -258,7 +346,8 @@ storage::ColumnarBatch materialize_project_rows(const plan::LogicalPlan& project
                                                 const std::vector<std::size_t>& rows) {
     storage::ColumnarBatch out;
     for (const auto& projection : project.projections) {
-        out.add_column(projection.output_name, evaluate_projection(projection, batch, rows));
+        auto column = evaluate_projection(projection, batch, rows);
+        std::move(column).add_to(out, projection.output_name);
     }
     return out;
 }
@@ -268,12 +357,12 @@ storage::ColumnarBatch materialize_project_output_rows(const plan::LogicalPlan& 
                                                        const std::vector<std::size_t>& rows) {
     storage::ColumnarBatch out;
     for (const auto& projection : project.projections) {
-        storage::Int64Column column;
-        const auto& input_column = batch.column(projection.output_name);
+        OutputColumn column;
+        column.type = batch.column_type(projection.output_name);
         for (auto row : rows) {
-            append_cell(column, cell_at(input_column, row));
+            column.append(cell_at(batch, projection.output_name, row));
         }
-        out.add_column(projection.output_name, std::move(column));
+        std::move(column).add_to(out, projection.output_name);
     }
     return out;
 }
@@ -289,7 +378,11 @@ void add_missing_sort_key_columns(storage::ColumnarBatch& sort_input,
         if (!source.has_column(name)) {
             throw std::logic_error("sort key column is not available before or after Project: " + name);
         }
-        sort_input.add_column(name, source.column(name));
+        if (source.column_type(name) == catalog::ColumnType::Int64) {
+            sort_input.add_column(name, source.column(name));
+        } else {
+            sort_input.add_column(name, source.string_column(name));
+        }
     }
 }
 
@@ -310,8 +403,7 @@ storage::ColumnarBatch materialize_project_sort_input(const plan::LogicalPlan& p
 struct AggregateValue {
     std::int64_t count{0};
     std::int64_t sum{0};
-    std::int64_t min{0};
-    std::int64_t max{0};
+    Cell value;
     bool has_value{false};
 };
 
@@ -341,7 +433,7 @@ Cell aggregate_argument_value(const plan::AggregateExpression& aggregate,
     if (!aggregate.argument.has_value()) {
         throw std::logic_error("aggregate argument is missing");
     }
-    return cell_at(batch.column(column_identity_name(*aggregate.argument)), row);
+    return cell_at(batch, column_identity_name(*aggregate.argument), row);
 }
 
 void update_aggregate(AggregateValue& value,
@@ -351,7 +443,7 @@ void update_aggregate(AggregateValue& value,
     switch (aggregate.function) {
     case sql::AggregateFunction::Count:
         if (aggregate.argument.has_value()) {
-            if (!aggregate_argument_value(aggregate, batch, row).has_value()) {
+            if (aggregate_argument_value(aggregate, batch, row).is_null) {
                 return;
             }
         }
@@ -359,35 +451,35 @@ void update_aggregate(AggregateValue& value,
         return;
     case sql::AggregateFunction::Sum: {
         const auto argument = aggregate_argument_value(aggregate, batch, row);
-        if (!argument.has_value()) {
+        if (argument.is_null) {
             return;
         }
         if (!value.has_value) {
-            value.sum = *argument;
+            value.sum = argument.int_value;
             value.has_value = true;
             return;
         }
-        value.sum = checked_sum(value.sum, *argument, aggregate.output_name);
+        value.sum = checked_sum(value.sum, argument.int_value, aggregate.output_name);
         return;
     }
     case sql::AggregateFunction::Min: {
         const auto argument = aggregate_argument_value(aggregate, batch, row);
-        if (!argument.has_value()) {
+        if (argument.is_null) {
             return;
         }
-        if (!value.has_value || *argument < value.min) {
-            value.min = *argument;
+        if (!value.has_value || argument < value.value) {
+            value.value = argument;
         }
         value.has_value = true;
         return;
     }
     case sql::AggregateFunction::Max: {
         const auto argument = aggregate_argument_value(aggregate, batch, row);
-        if (!argument.has_value()) {
+        if (argument.is_null) {
             return;
         }
-        if (!value.has_value || *argument > value.max) {
-            value.max = *argument;
+        if (!value.has_value || value.value < argument) {
+            value.value = argument;
         }
         value.has_value = true;
         return;
@@ -399,22 +491,22 @@ void update_aggregate(AggregateValue& value,
 Cell finalize_aggregate(const AggregateValue& value, const plan::AggregateExpression& aggregate) {
     switch (aggregate.function) {
     case sql::AggregateFunction::Count:
-        return value.count;
+        return int64_cell(value.count);
     case sql::AggregateFunction::Sum:
         if (!value.has_value) {
-            return std::nullopt;
+            return null_cell(catalog::ColumnType::Int64);
         }
-        return value.sum;
+        return int64_cell(value.sum);
     case sql::AggregateFunction::Min:
         if (!value.has_value) {
-            return std::nullopt;
+            return null_cell(aggregate.type);
         }
-        return value.min;
+        return value.value;
     case sql::AggregateFunction::Max:
         if (!value.has_value) {
-            return std::nullopt;
+            return null_cell(aggregate.type);
         }
-        return value.max;
+        return value.value;
     }
     throw std::logic_error("unreachable aggregate function");
 }
@@ -425,7 +517,7 @@ std::vector<Cell> group_key_values(const std::vector<plan::BoundColumnRef>& grou
     std::vector<Cell> values;
     values.reserve(group_keys.size());
     for (const auto& key : group_keys) {
-        values.push_back(cell_at(batch.column(column_identity_name(key)), row));
+        values.push_back(cell_at(batch, column_identity_name(key), row));
     }
     return values;
 }
@@ -441,7 +533,11 @@ storage::ColumnarBatch execute_scan(const plan::LogicalPlan& plan, const Catalog
     const auto& input = catalog.table(plan.table);
     storage::ColumnarBatch out;
     for (const auto& column_name : input.column_names()) {
-        out.add_column(plan.binding_name + "." + column_name, input.column(column_name));
+        if (input.column_type(column_name) == catalog::ColumnType::Int64) {
+            out.add_column(plan.binding_name + "." + column_name, input.column(column_name));
+        } else {
+            out.add_column(plan.binding_name + "." + column_name, input.string_column(column_name));
+        }
     }
     return out;
 }
@@ -449,22 +545,25 @@ storage::ColumnarBatch execute_scan(const plan::LogicalPlan& plan, const Catalog
 Cell evaluate_join_scalar(const plan::BoundScalarExpr& expression,
                           const storage::ColumnarBatch& left,
                           std::size_t left_row,
-                          const storage::ColumnarBatch& right,
-                          std::size_t right_row) {
-    if (const auto* column = std::get_if<plan::BoundColumnRef>(&expression)) {
+    const storage::ColumnarBatch& right,
+    std::size_t right_row) {
+    if (const auto* column = std::get_if<plan::BoundColumnRef>(&expression.value)) {
         const auto name = column_identity_name(*column);
         if (left.has_column(name)) {
-            return cell_at(left.column(name), left_row);
+            return cell_at(left, name, left_row);
         }
         if (right.has_column(name)) {
-            return cell_at(right.column(name), right_row);
+            return cell_at(right, name, right_row);
         }
         throw std::logic_error("bound join column identity is missing from both inputs: " + name);
     }
-    if (const auto* literal = std::get_if<sql::IntLiteral>(&expression)) {
-        return literal->value;
+    if (const auto* literal = std::get_if<sql::IntLiteral>(&expression.value)) {
+        return int64_cell(literal->value);
     }
-    return std::nullopt;
+    if (const auto* literal = std::get_if<sql::StringLiteral>(&expression.value)) {
+        return string_cell(literal->value);
+    }
+    return null_cell(expression.type);
 }
 
 TruthValue evaluate_join_comparison(const plan::BoundComparisonExpr& comparison,
@@ -474,10 +573,10 @@ TruthValue evaluate_join_comparison(const plan::BoundComparisonExpr& comparison,
                                     std::size_t right_row) {
     const auto left_value = evaluate_join_scalar(comparison.left, left, left_row, right, right_row);
     const auto right_value = evaluate_join_scalar(comparison.right, left, left_row, right, right_row);
-    if (!left_value.has_value() || !right_value.has_value()) {
+    if (left_value.is_null || right_value.is_null) {
         return TruthValue::Unknown;
     }
-    return truth_from_bool(compare_values(*left_value, comparison.op, *right_value));
+    return truth_from_bool(compare_values(left_value, comparison.op, right_value));
 }
 
 TruthValue evaluate_join_predicate(const plan::BoundPredicate& predicate,
@@ -489,9 +588,9 @@ TruthValue evaluate_join_predicate(const plan::BoundPredicate& predicate,
     case sql::PredicateKind::Comparison:
         return evaluate_join_comparison(predicate.comparison, left, left_row, right, right_row);
     case sql::PredicateKind::IsNull:
-        return truth_from_bool(!evaluate_join_scalar(predicate.null_check, left, left_row, right, right_row).has_value());
+        return truth_from_bool(evaluate_join_scalar(predicate.null_check, left, left_row, right, right_row).is_null);
     case sql::PredicateKind::IsNotNull:
-        return truth_from_bool(evaluate_join_scalar(predicate.null_check, left, left_row, right, right_row).has_value());
+        return truth_from_bool(!evaluate_join_scalar(predicate.null_check, left, left_row, right, right_row).is_null);
     case sql::PredicateKind::And: {
         const auto left_result =
             evaluate_join_predicate(require_left_predicate(predicate), left, left_row, right, right_row);
@@ -529,7 +628,13 @@ storage::ColumnarBatch execute_join(const plan::LogicalPlan& plan, const Catalog
 
     std::vector<std::string> output_names = left.column_names();
     output_names.insert(output_names.end(), right.column_names().begin(), right.column_names().end());
-    std::vector<storage::Int64Column> output_columns(output_names.size());
+    std::vector<OutputColumn> output_columns(output_names.size());
+    for (std::size_t i = 0; i < left.column_names().size(); ++i) {
+        output_columns[i].type = left.column_type(left.column_names()[i]);
+    }
+    for (std::size_t i = 0; i < right.column_names().size(); ++i) {
+        output_columns[left.column_names().size() + i].type = right.column_type(right.column_names()[i]);
+    }
 
     // Inner join order is part of the oracle contract: for each left row in
     // input order, scan every right row in input order. Future vectorized join
@@ -542,17 +647,17 @@ storage::ColumnarBatch execute_join(const plan::LogicalPlan& plan, const Catalog
 
             std::size_t output_index = 0;
             for (const auto& column_name : left.column_names()) {
-                append_cell(output_columns[output_index++], cell_at(left.column(column_name), left_row));
+                output_columns[output_index++].append(cell_at(left, column_name, left_row));
             }
             for (const auto& column_name : right.column_names()) {
-                append_cell(output_columns[output_index++], cell_at(right.column(column_name), right_row));
+                output_columns[output_index++].append(cell_at(right, column_name, right_row));
             }
         }
     }
 
     storage::ColumnarBatch out;
     for (std::size_t i = 0; i < output_names.size(); ++i) {
-        out.add_column(output_names[i], std::move(output_columns[i]));
+        std::move(output_columns[i]).add_to(out, output_names[i]);
     }
     return out;
 }
@@ -590,20 +695,22 @@ storage::ColumnarBatch execute_aggregate(const plan::LogicalPlan& plan, const Ca
 
     storage::ColumnarBatch out;
     for (std::size_t key_index = 0; key_index < plan.group_keys.size(); ++key_index) {
-        storage::Int64Column column;
+        OutputColumn column;
+        column.type = plan.group_keys[key_index].type;
         for (const auto& group : groups) {
-            append_cell(column, group.key_values.at(key_index));
+            column.append(group.key_values.at(key_index));
         }
-        out.add_column(column_identity_name(plan.group_keys[key_index]), std::move(column));
+        std::move(column).add_to(out, column_identity_name(plan.group_keys[key_index]));
     }
 
     for (std::size_t aggregate_index = 0; aggregate_index < plan.aggregate_expressions.size(); ++aggregate_index) {
         const auto& aggregate = plan.aggregate_expressions[aggregate_index];
-        storage::Int64Column column;
+        OutputColumn column;
+        column.type = aggregate.type;
         for (const auto& group : groups) {
-            append_cell(column, finalize_aggregate(group.aggregates.at(aggregate_index), aggregate));
+            column.append(finalize_aggregate(group.aggregates.at(aggregate_index), aggregate));
         }
-        out.add_column(aggregate.output_name, std::move(column));
+        std::move(column).add_to(out, aggregate.output_name);
     }
     return out;
 }
@@ -667,7 +774,7 @@ std::optional<catalog::TableSchema> Catalog::find_table_schema(const std::string
     schema.name = it->first;
     schema.row_count = it->second.row_count();
     for (const auto& column_name : it->second.column_names()) {
-        schema.columns.push_back(catalog::ColumnSchema{column_name, catalog::ColumnType::Int64});
+        schema.columns.push_back(catalog::ColumnSchema{column_name, it->second.column_type(column_name)});
     }
     return schema;
 }
@@ -694,7 +801,8 @@ storage::ColumnarBatch execute_interpreted(const plan::LogicalPlan& plan, const 
         auto input = execute_interpreted(*plan.input, catalog);
         storage::ColumnarBatch out;
         for (const auto& projection : plan.projections) {
-            out.add_column(projection.output_name, evaluate_projection(projection, input));
+            auto column = evaluate_projection(projection, input);
+            std::move(column).add_to(out, projection.output_name);
         }
         return out;
     }

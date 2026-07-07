@@ -21,7 +21,61 @@
 
 namespace differential {
 
-using Cell = std::optional<std::int64_t>;
+struct Cell {
+    catalog::ColumnType type{catalog::ColumnType::Int64};
+    bool is_null{true};
+    std::int64_t int_value{0};
+    std::string string_value;
+};
+
+inline bool operator==(const Cell& left, const Cell& right) {
+    if (left.is_null || right.is_null) {
+        return left.is_null == right.is_null && left.type == right.type;
+    }
+    if (left.type != right.type) {
+        return false;
+    }
+    return left.type == catalog::ColumnType::Int64 ? left.int_value == right.int_value
+                                                   : left.string_value == right.string_value;
+}
+
+inline bool operator<(const Cell& left, const Cell& right) {
+    if (left.type != right.type) {
+        return static_cast<int>(left.type) < static_cast<int>(right.type);
+    }
+    if (left.is_null || right.is_null) {
+        return left.is_null && !right.is_null;
+    }
+    return left.type == catalog::ColumnType::Int64 ? left.int_value < right.int_value
+                                                   : left.string_value < right.string_value;
+}
+
+inline Cell cell_at(const storage::ColumnarBatch& batch, const std::string& name, std::size_t row) {
+    const auto type = batch.column_type(name);
+    if (type == catalog::ColumnType::Int64) {
+        const auto& column = batch.column(name);
+        if (column.is_null(row)) {
+            return Cell{type, true, 0, ""};
+        }
+        return Cell{type, false, column.at(row), ""};
+    }
+
+    const auto& column = batch.string_column(name);
+    if (column.is_null(row)) {
+        return Cell{type, true, 0, ""};
+    }
+    return Cell{type, false, 0, column.at(row)};
+}
+
+inline std::string format_cell(const Cell& cell) {
+    if (cell.is_null) {
+        return "NULL";
+    }
+    if (cell.type == catalog::ColumnType::String) {
+        return "'" + cell.string_value + "'";
+    }
+    return std::to_string(cell.int_value);
+}
 
 struct ComparisonStats {
     std::size_t alternative_count{0};
@@ -52,12 +106,7 @@ inline std::string format_batch(const storage::ColumnarBatch& batch) {
             if (col != 0) {
                 out << ",";
             }
-            const auto& column = batch.column(column_order[col]);
-            if (column.is_null(row)) {
-                out << "NULL";
-            } else {
-                out << column.at(row);
-            }
+            out << format_cell(cell_at(batch, column_order[col], row));
         }
         out << "]";
     }
@@ -75,13 +124,6 @@ inline std::vector<std::string> sorted_column_names(const storage::ColumnarBatch
     return names;
 }
 
-inline Cell cell_at(const storage::Int64Column& column, std::size_t row) {
-    if (column.is_null(row)) {
-        return std::nullopt;
-    }
-    return column.at(row);
-}
-
 inline std::vector<std::vector<Cell>> sorted_rows_by_column_identity(const storage::ColumnarBatch& batch) {
     const auto names = sorted_column_names(batch);
     std::vector<std::vector<Cell>> rows;
@@ -90,7 +132,7 @@ inline std::vector<std::vector<Cell>> sorted_rows_by_column_identity(const stora
         std::vector<Cell> values;
         values.reserve(names.size());
         for (const auto& name : names) {
-            values.push_back(cell_at(batch.column(name), row));
+            values.push_back(cell_at(batch, name, row));
         }
         rows.push_back(std::move(values));
     }
@@ -132,11 +174,7 @@ inline std::string format_sorted_bag(const storage::ColumnarBatch& batch) {
             if (col != 0) {
                 out << ",";
             }
-            if (rows[row][col].has_value()) {
-                out << *rows[row][col];
-            } else {
-                out << "NULL";
-            }
+            out << format_cell(rows[row][col]);
         }
         out << "]";
     }
@@ -160,12 +198,12 @@ inline bool sort_cell_less(Cell left, Cell right, sql::SortDirection direction) 
     if (left == right) {
         return false;
     }
-    const auto left_is_null = !left.has_value();
-    const auto right_is_null = !right.has_value();
+    const auto left_is_null = left.is_null;
+    const auto right_is_null = right.is_null;
     if (left_is_null || right_is_null) {
         return direction == sql::SortDirection::Asc ? right_is_null : left_is_null;
     }
-    return direction == sql::SortDirection::Asc ? *left < *right : *left > *right;
+    return direction == sql::SortDirection::Asc ? left < right : right < left;
 }
 
 inline bool is_sorted_by_keys(const storage::ColumnarBatch& batch, const std::vector<plan::SortKey>& keys) {
@@ -177,9 +215,8 @@ inline bool is_sorted_by_keys(const storage::ColumnarBatch& batch, const std::ve
     for (std::size_t row = 1; row < batch.row_count(); ++row) {
         for (const auto& key : keys) {
             const auto column_name = *output_column_for_sort_key(key, batch);
-            const auto& column = batch.column(column_name);
-            const auto previous = cell_at(column, row - 1);
-            const auto current = cell_at(column, row);
+            const auto previous = cell_at(batch, column_name, row - 1);
+            const auto current = cell_at(batch, column_name, row);
             if (previous == current) {
                 continue;
             }
@@ -236,7 +273,7 @@ inline std::vector<Cell> row_by_output_order(const storage::ColumnarBatch& batch
     std::vector<Cell> values;
     values.reserve(batch.column_names().size());
     for (const auto& name : batch.column_names()) {
-        values.push_back(cell_at(batch.column(name), row));
+        values.push_back(cell_at(batch, name, row));
     }
     return values;
 }
@@ -273,7 +310,7 @@ inline std::optional<std::vector<Cell>> key_tuple_for_row(const storage::Columna
         if (!column_name.has_value()) {
             return std::nullopt;
         }
-        tuple.push_back(cell_at(batch.column(*column_name), row));
+        tuple.push_back(cell_at(batch, *column_name, row));
     }
     return tuple;
 }
@@ -349,6 +386,72 @@ inline bool contains_join(const plan::LogicalPlan& logical) {
     throw std::logic_error("unreachable logical plan kind");
 }
 
+inline bool scalar_touches_string(const plan::BoundScalarExpr& expression) {
+    return expression.type == catalog::ColumnType::String;
+}
+
+inline bool predicate_touches_string(const plan::BoundPredicate& predicate) {
+    switch (predicate.kind) {
+    case sql::PredicateKind::Comparison:
+        return scalar_touches_string(predicate.comparison.left) || scalar_touches_string(predicate.comparison.right);
+    case sql::PredicateKind::IsNull:
+    case sql::PredicateKind::IsNotNull:
+        return scalar_touches_string(predicate.null_check);
+    case sql::PredicateKind::And:
+    case sql::PredicateKind::Or:
+        if (predicate.left == nullptr || predicate.right == nullptr) {
+            throw std::logic_error("bound predicate is missing a child");
+        }
+        return predicate_touches_string(*predicate.left) || predicate_touches_string(*predicate.right);
+    }
+    throw std::logic_error("unreachable predicate kind");
+}
+
+inline bool plan_touches_string(const plan::LogicalPlan& logical) {
+    for (const auto& projection : logical.projections) {
+        if (projection.type == catalog::ColumnType::String || scalar_touches_string(projection.expression)) {
+            return true;
+        }
+    }
+    for (const auto& key : logical.group_keys) {
+        if (key.type == catalog::ColumnType::String) {
+            return true;
+        }
+    }
+    for (const auto& aggregate : logical.aggregate_expressions) {
+        if (aggregate.type == catalog::ColumnType::String ||
+            (aggregate.argument.has_value() && aggregate.argument->type == catalog::ColumnType::String)) {
+            return true;
+        }
+    }
+    for (const auto& key : logical.sort_keys) {
+        if (key.column.type == catalog::ColumnType::String) {
+            return true;
+        }
+    }
+    for (const auto& predicate : logical.predicates) {
+        if (predicate_touches_string(predicate)) {
+            return true;
+        }
+    }
+
+    switch (logical.kind) {
+    case plan::LogicalKind::Scan:
+        return false;
+    case plan::LogicalKind::Join:
+        return logical.left != nullptr && logical.right != nullptr &&
+               (plan_touches_string(*logical.left) || plan_touches_string(*logical.right));
+    case plan::LogicalKind::Filter:
+    case plan::LogicalKind::Project:
+    case plan::LogicalKind::Aggregate:
+    case plan::LogicalKind::Sort:
+    case plan::LogicalKind::Distinct:
+    case plan::LogicalKind::Limit:
+        return logical.input != nullptr && plan_touches_string(*logical.input);
+    }
+    throw std::logic_error("unreachable logical plan kind");
+}
+
 inline std::size_t join_keyword_count(const std::string& sql) {
     std::size_t count = 0;
     std::size_t pos = 0;
@@ -362,6 +465,9 @@ inline std::size_t join_keyword_count(const std::string& sql) {
 inline std::optional<std::string> accepted_runtime_error_category(const std::string& message) {
     if (message.find("overflowed int64") != std::string::npos) {
         return std::string{"int64-overflow"};
+    }
+    if (message == "vectorized execution does not support VARCHAR/string plans in phase 17a") {
+        return std::string{"vectorized-string-not-supported"};
     }
     return std::nullopt;
 }
@@ -447,6 +553,12 @@ inline bool verify_error_pair(const ExecutionOutcome& unrewritten_oracle,
     return false;
 }
 
+inline bool is_vectorized_string_guard(const ExecutionOutcome& outcome) {
+    return !outcome.batch.has_value() && !outcome.unexpected_error && outcome.error_category.has_value() &&
+           *outcome.error_category == "vectorized-string-not-supported" &&
+           outcome.error_message == "vectorized execution does not support VARCHAR/string plans in phase 17a";
+}
+
 inline bool verify_result_pair(const storage::ColumnarBatch& unrewritten_oracle,
                                const storage::ColumnarBatch& full_unlimited_oracle,
                                const ExecutionOutcome& candidate_oracle,
@@ -460,9 +572,13 @@ inline bool verify_result_pair(const storage::ColumnarBatch& unrewritten_oracle,
                                bool is_ordered_query,
                                const std::vector<plan::SortKey>* order_keys,
                                std::optional<std::size_t> limit_count,
+                               bool expect_vectorized_string_guard,
                                const std::string& memo_text = {}) {
     const auto* candidate_order_keys = root_sort_keys(candidate_plan);
-    const auto candidate_has_results = candidate_oracle.batch.has_value() && candidate_vectorized.batch.has_value();
+    const auto candidate_has_results =
+        candidate_oracle.batch.has_value() &&
+        (expect_vectorized_string_guard ? is_vectorized_string_guard(candidate_vectorized)
+                                        : candidate_vectorized.batch.has_value());
     const auto ordered_outputs_are_sorted =
         candidate_has_results &&
         (!is_ordered_query ||
@@ -475,13 +591,16 @@ inline bool verify_result_pair(const storage::ColumnarBatch& unrewritten_oracle,
              : is_ordered_query || is_join_query ? same_sorted_bag(unrewritten_oracle, *candidate_oracle.batch)
                                                  : same_batch(unrewritten_oracle, *candidate_oracle.batch));
     const auto vectorized_equal =
-        candidate_has_results && same_batch(*candidate_oracle.batch, *candidate_vectorized.batch);
+        candidate_has_results &&
+        (expect_vectorized_string_guard ? is_vectorized_string_guard(candidate_vectorized)
+                                        : same_batch(*candidate_oracle.batch, *candidate_vectorized.batch));
     const auto column_sets_match =
         candidate_has_results && same_column_identity_set(unrewritten_oracle, *candidate_oracle.batch) &&
-        same_column_identity_set(*candidate_oracle.batch, *candidate_vectorized.batch);
+        (expect_vectorized_string_guard ||
+         same_column_identity_set(*candidate_oracle.batch, *candidate_vectorized.batch));
     const auto output_order_matches =
         candidate_has_results && same_column_order(unrewritten_oracle, *candidate_oracle.batch) &&
-        same_column_order(*candidate_oracle.batch, *candidate_vectorized.batch);
+        (expect_vectorized_string_guard || same_column_order(*candidate_oracle.batch, *candidate_vectorized.batch));
 
     if (cross_plan_equal && vectorized_equal && column_sets_match && output_order_matches &&
         ordered_outputs_are_sorted) {
@@ -522,6 +641,7 @@ inline bool compare_engines(const std::string& sql,
     try {
         const auto parsed = sql::parse_select(sql);
         const auto logical = sql::bind_select(parsed, catalog);
+        const auto original_touches_string = plan_touches_string(logical);
         const auto is_join_query = contains_join(logical);
         const auto* order_keys = root_sort_keys(logical);
         const auto limit_count = root_limit_count(logical);
@@ -627,6 +747,7 @@ inline bool compare_engines(const std::string& sql,
                                       is_ordered_query,
                                       order_keys,
                                       limit_count,
+                                      original_touches_string || plan_touches_string(candidate_plan),
                                       memo_text);
         };
 

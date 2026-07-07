@@ -78,12 +78,48 @@ void assert_column_validity_copy_reuses_storage_until_mutation() {
     assert(mutated.is_null(3));
 }
 
+void assert_string_column_copy_reuses_storage_and_catalog_reports_type() {
+    storage::StringColumn original;
+    original.append("alpha");
+    original.append_null();
+    original.append("");
+
+    storage::ColumnarBatch batch;
+    batch.add_column("qualified.s", original);
+
+    const auto& shared = batch.string_column("qualified.s");
+    assert(batch.column_type("qualified.s") == catalog::ColumnType::String);
+    assert(shared.has_nulls());
+    assert(&shared.values() == &original.values());
+    assert(&shared.validity() == &original.validity());
+    assert(shared.at(0) == "alpha");
+    assert(shared.is_null(1));
+    assert(shared.at(2).empty());
+
+    auto mutated = shared;
+    mutated.append("omega");
+
+    assert(&mutated.values() != &shared.values());
+    assert(&mutated.validity() != &shared.validity());
+    assert(shared.size() == 3);
+    assert(mutated.size() == 4);
+    assert(mutated.at(3) == "omega");
+
+    execution::Catalog catalog;
+    catalog.add_table("strings", std::move(batch));
+    const auto schema = catalog.find_table_schema("strings");
+    assert(schema.has_value());
+    assert(schema->columns.size() == 1);
+    assert(schema->columns[0].type == catalog::ColumnType::String);
+}
+
 } // namespace
 
 int main() {
     assert_column_copy_reuses_storage_until_mutation();
     assert_column_reserve_detaches_shared_storage_without_changing_values();
     assert_column_validity_copy_reuses_storage_until_mutation();
+    assert_string_column_copy_reuses_storage_and_catalog_reports_type();
 
     auto query = sql::parse_select("SELECT a FROM t WHERE a = 2");
     assert(query.projection.size() == 1);

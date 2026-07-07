@@ -9,12 +9,28 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
 namespace {
 
-using ExpectedCell = std::optional<std::int64_t>;
+struct ExpectedCell {
+    enum class Kind { Null, Int64, String };
+
+    Kind kind{Kind::Null};
+    std::int64_t int_value{0};
+    std::string string_value;
+
+    ExpectedCell() = default;
+    ExpectedCell(std::nullopt_t) : kind(Kind::Null) {}
+
+    template <typename Int, typename = std::enable_if_t<std::is_integral_v<Int> && !std::is_same_v<Int, bool>>>
+    ExpectedCell(Int value) : kind(Kind::Int64), int_value(static_cast<std::int64_t>(value)) {}
+
+    ExpectedCell(const char* value) : kind(Kind::String), string_value(value) {}
+    ExpectedCell(std::string value) : kind(Kind::String), string_value(std::move(value)) {}
+};
 
 struct ExpectedResult {
     std::vector<std::string> columns;
@@ -192,6 +208,54 @@ execution::Catalog make_catalog() {
     storage::ColumnarBatch overflow;
     overflow.add_column("v", std::move(overflow_value));
     catalog.add_table("overflow", std::move(overflow));
+
+    storage::StringColumn strings_s;
+    strings_s.append("beta");
+    strings_s.append("");
+    strings_s.append_null();
+    strings_s.append("alpha");
+    strings_s.append("a'b");
+    storage::ColumnarBatch strings;
+    strings.add_column("s", std::move(strings_s));
+    catalog.add_table("strings", std::move(strings));
+
+    storage::StringColumn dup_s;
+    dup_s.append("x");
+    dup_s.append_null();
+    dup_s.append("x");
+    dup_s.append("");
+    dup_s.append_null();
+    storage::ColumnarBatch string_dups;
+    string_dups.add_column("s", std::move(dup_s));
+    catalog.add_table("string_dups", std::move(string_dups));
+
+    storage::StringColumn left_k;
+    left_k.append("a");
+    left_k.append_null();
+    left_k.append("b");
+    left_k.append("a");
+    storage::Int64Column left_v;
+    for (auto value : {1, 2, 3, 4}) {
+        left_v.append(value);
+    }
+    storage::ColumnarBatch string_left;
+    string_left.add_column("k", std::move(left_k));
+    string_left.add_column("v", std::move(left_v));
+    catalog.add_table("string_left", std::move(string_left));
+
+    storage::StringColumn right_k;
+    right_k.append_null();
+    right_k.append("a");
+    right_k.append("c");
+    right_k.append("a");
+    storage::Int64Column right_w;
+    for (auto value : {10, 11, 12, 13}) {
+        right_w.append(value);
+    }
+    storage::ColumnarBatch string_right;
+    string_right.add_column("k", std::move(right_k));
+    string_right.add_column("w", std::move(right_w));
+    catalog.add_table("string_right", std::move(string_right));
     return catalog;
 }
 
@@ -214,10 +278,12 @@ std::string format_result(const ExpectedResult& result) {
             if (col != 0) {
                 out << ",";
             }
-            if (result.rows[row][col].has_value()) {
-                out << *result.rows[row][col];
-            } else {
+            if (result.rows[row][col].kind == ExpectedCell::Kind::Null) {
                 out << "NULL";
+            } else if (result.rows[row][col].kind == ExpectedCell::Kind::String) {
+                out << "'" << result.rows[row][col].string_value << "'";
+            } else {
+                out << result.rows[row][col].int_value;
             }
         }
         out << "]";
@@ -248,6 +314,13 @@ std::string format_result(const storage::ColumnarBatch& batch) {
             }
             if (!batch.has_column(column_order[col])) {
                 out << "<missing:" << column_order[col] << ">";
+            } else if (batch.column_type(column_order[col]) == catalog::ColumnType::String) {
+                const auto& column = batch.string_column(column_order[col]);
+                if (column.is_null(row)) {
+                    out << "NULL";
+                } else {
+                    out << "'" << column.at(row) << "'";
+                }
             } else {
                 const auto& column = batch.column(column_order[col]);
                 if (column.is_null(row)) {
@@ -333,6 +406,66 @@ int main() {
             "comparison with NULL literal is UNKNOWN and rejected by WHERE",
             "SELECT k FROM nullable WHERE k = NULL",
             ExpectedResult{{"k"}, {}},
+        },
+        GoldenQuery{
+            "string projection preserves values empty string and NULL separately",
+            "SELECT s FROM strings",
+            ExpectedResult{{"s"}, {{"beta"}, {""}, {std::nullopt}, {"alpha"}, {"a'b"}}},
+        },
+        GoldenQuery{
+            "single quoted string literals support escaped quotes and empty string",
+            "SELECT 'it''s' AS escaped, '' AS empty FROM strings LIMIT 1",
+            ExpectedResult{{"escaped", "empty"}, {{"it's", ""}}},
+        },
+        GoldenQuery{
+            "string equality filters exact byte values",
+            "SELECT s FROM strings WHERE s = 'a''b' OR s = ''",
+            ExpectedResult{{"s"}, {{""}, {"a'b"}}},
+        },
+        GoldenQuery{
+            "string comparison with NULL literal is UNKNOWN",
+            "SELECT s FROM strings WHERE s = NULL",
+            ExpectedResult{{"s"}, {}},
+        },
+        GoldenQuery{
+            "string IS NULL keeps string NULL rows",
+            "SELECT s FROM strings WHERE s IS NULL",
+            ExpectedResult{{"s"}, {{std::nullopt}}},
+        },
+        GoldenQuery{
+            "string ORDER BY ascending is lexicographic with NULLs largest",
+            "SELECT s FROM strings ORDER BY s ASC",
+            ExpectedResult{{"s"}, { {""}, {"a'b"}, {"alpha"}, {"beta"}, {std::nullopt}}},
+        },
+        GoldenQuery{
+            "string ORDER BY descending puts NULLs first",
+            "SELECT s FROM strings ORDER BY s DESC",
+            ExpectedResult{{"s"}, {{std::nullopt}, {"beta"}, {"alpha"}, {"a'b"}, {""}}},
+        },
+        GoldenQuery{
+            "string MIN MAX use lexicographic NULL skipping semantics",
+            "SELECT MIN(s), MAX(s), COUNT(s), COUNT(*) FROM strings",
+            ExpectedResult{{"MIN(s)", "MAX(s)", "COUNT(s)", "COUNT(*)"}, {{"", "beta", 4, 5}}},
+        },
+        GoldenQuery{
+            "string DISTINCT treats matching NULL slots as equal and empty string as a value",
+            "SELECT DISTINCT s FROM string_dups",
+            ExpectedResult{{"s"}, {{"x"}, {std::nullopt}, {""}}},
+        },
+        GoldenQuery{
+            "string GROUP BY uses first appearance order and distinct NULL equality",
+            "SELECT s, COUNT(*) FROM string_dups GROUP BY s",
+            ExpectedResult{{"s", "COUNT(*)"}, {{"x", 2}, {std::nullopt, 2}, {"", 1}}},
+        },
+        GoldenQuery{
+            "string join equality matches strings and never NULLs",
+            "SELECT l.v, r.w FROM string_left AS l JOIN string_right AS r ON l.k = r.k",
+            ExpectedResult{{"l.v", "r.w"}, {{1, 11}, {1, 13}, {4, 11}, {4, 13}}},
+        },
+        GoldenQuery{
+            "string self join uses exact string equality",
+            "SELECT x.s, y.s FROM string_dups AS x JOIN string_dups AS y ON x.s = y.s ORDER BY x.s ASC",
+            ExpectedResult{{"x.s", "y.s"}, {{"", ""}, {"x", "x"}, {"x", "x"}, {"x", "x"}, {"x", "x"}}},
         },
         GoldenQuery{
             "UNKNOWN OR TRUE keeps TRUE rows",
@@ -680,6 +813,27 @@ int main() {
             ExpectedError{ErrorKind::Runtime, 0, "SUM(v) overflowed int64"},
         },
         GoldenQuery{
+            "string int64 comparison is a bind error",
+            "SELECT s FROM strings WHERE s = 1",
+            ExpectedResult{},
+            true,
+            ExpectedError{ErrorKind::Bind, 30, "comparison operands must have the same type: string vs int64"},
+        },
+        GoldenQuery{
+            "int64 string comparison is a bind error",
+            "SELECT a FROM t WHERE a = '1'",
+            ExpectedResult{},
+            true,
+            ExpectedError{ErrorKind::Bind, 24, "comparison operands must have the same type: int64 vs string"},
+        },
+        GoldenQuery{
+            "SUM over string is a bind error",
+            "SELECT SUM(s) FROM strings",
+            ExpectedResult{},
+            true,
+            ExpectedError{ErrorKind::Bind, 7, "SUM requires int64 argument, got string"},
+        },
+        GoldenQuery{
             "non grouped projected column is a bind error",
             "SELECT a, b, COUNT(*) FROM t GROUP BY a",
             ExpectedResult{},
@@ -748,6 +902,20 @@ int main() {
             ExpectedResult{},
             true,
             ExpectedError{ErrorKind::Parse, 10, "expected projection expression"},
+        },
+        GoldenQuery{
+            "unterminated string literal reports literal start",
+            "SELECT 'abc FROM strings",
+            ExpectedResult{},
+            true,
+            ExpectedError{ErrorKind::Parse, 7, "unterminated string literal"},
+        },
+        GoldenQuery{
+            "LIMIT still requires integer syntax",
+            "SELECT s FROM strings LIMIT '2'",
+            ExpectedResult{},
+            true,
+            ExpectedError{ErrorKind::Parse, 28, "expected non-negative integer after LIMIT"},
         },
         GoldenQuery{
             "unknown WHERE column is a bind error",

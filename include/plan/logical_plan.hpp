@@ -1,5 +1,6 @@
 #pragma once
 
+#include "catalog/catalog.hpp"
 #include "sql/ast.hpp"
 
 #include <cstddef>
@@ -19,9 +20,22 @@ struct BoundColumnRef {
     std::string binding;
     std::string column;
     std::size_t position{0};
+    catalog::ColumnType type{catalog::ColumnType::Int64};
 };
 
-using BoundScalarExpr = std::variant<BoundColumnRef, sql::IntLiteral, sql::NullLiteral>;
+struct BoundScalarExpr {
+    using Value = std::variant<BoundColumnRef, sql::IntLiteral, sql::StringLiteral, sql::NullLiteral>;
+
+    Value value;
+    catalog::ColumnType type{catalog::ColumnType::Int64};
+
+    BoundScalarExpr() = default;
+    BoundScalarExpr(BoundColumnRef column) : value(std::move(column)), type(std::get<BoundColumnRef>(value).type) {}
+    BoundScalarExpr(sql::IntLiteral literal) : value(literal), type(catalog::ColumnType::Int64) {}
+    BoundScalarExpr(sql::StringLiteral literal) : value(std::move(literal)), type(catalog::ColumnType::String) {}
+    BoundScalarExpr(sql::NullLiteral literal) : value(literal), type(catalog::ColumnType::Int64) {}
+    BoundScalarExpr(Value value, catalog::ColumnType type) : value(std::move(value)), type(type) {}
+};
 
 struct BoundComparisonExpr {
     BoundScalarExpr left;
@@ -71,6 +85,7 @@ struct BoundPredicate {
 struct Projection {
     std::string output_name;
     BoundScalarExpr expression;
+    catalog::ColumnType type{catalog::ColumnType::Int64};
 };
 
 struct SortKey {
@@ -83,6 +98,7 @@ struct AggregateExpression {
     sql::AggregateFunction function{sql::AggregateFunction::Count};
     std::optional<BoundColumnRef> argument;
     std::size_t position{0};
+    catalog::ColumnType type{catalog::ColumnType::Int64};
 };
 
 struct LogicalPlan {

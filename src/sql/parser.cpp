@@ -16,6 +16,7 @@ namespace {
 enum class TokenKind {
     Identifier,
     Integer,
+    String,
     Comma,
     Dot,
     LeftParen,
@@ -86,6 +87,26 @@ public:
 
         const auto position = offset_;
         const auto ch = input_[offset_];
+        if (ch == '\'') {
+            ++offset_;
+            std::string value;
+            while (offset_ < input_.size()) {
+                const auto current = input_[offset_];
+                if (current == '\'') {
+                    if (offset_ + 1 < input_.size() && input_[offset_ + 1] == '\'') {
+                        value.push_back('\'');
+                        offset_ += 2;
+                        continue;
+                    }
+                    ++offset_;
+                    return Token{TokenKind::String, std::move(value), position};
+                }
+                value.push_back(current);
+                ++offset_;
+            }
+            throw ParseError(position, "unterminated string literal");
+        }
+
         if (is_ident_start(static_cast<unsigned char>(ch))) {
             ++offset_;
             while (offset_ < input_.size() && is_ident_continue(static_cast<unsigned char>(input_[offset_]))) {
@@ -597,6 +618,12 @@ private:
             return literal;
         }
 
+        if (current_.kind == TokenKind::String) {
+            auto literal = StringLiteral{current_.text, current_.position};
+            advance();
+            return literal;
+        }
+
         throw ParseError(current_.position, message);
     }
 
@@ -621,6 +648,11 @@ private:
                 throw ParseError(current_.position, "integer literal out of range");
             }
             auto literal = IntLiteral{value, current_.position};
+            advance();
+            return literal;
+        }
+        if (current_.kind == TokenKind::String) {
+            auto literal = StringLiteral{current_.text, current_.position};
             advance();
             return literal;
         }

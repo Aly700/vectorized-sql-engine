@@ -30,11 +30,29 @@ storage::ColumnarBatch make_single_key_batch(std::int64_t row_count) {
     return batch;
 }
 
+storage::ColumnarBatch make_single_string_key_batch(std::int64_t row_count) {
+    storage::StringColumn key;
+    for (std::int64_t value = 0; value < row_count; ++value) {
+        key.append(std::to_string(value));
+    }
+
+    storage::ColumnarBatch batch;
+    batch.add_column("k", std::move(key));
+    return batch;
+}
+
 execution::Catalog make_skewed_catalog() {
     execution::Catalog catalog;
     catalog.add_table("big", make_single_key_batch(1000));
     catalog.add_table("mid", make_single_key_batch(100));
     catalog.add_table("tiny", make_single_key_batch(2));
+    return catalog;
+}
+
+execution::Catalog make_string_cost_catalog() {
+    execution::Catalog catalog;
+    catalog.add_table("sbig", make_single_string_key_batch(1000));
+    catalog.add_table("smid", make_single_string_key_batch(100));
     return catalog;
 }
 
@@ -318,6 +336,49 @@ void assert_distinct_and_limit_costs_use_output_count_without_new_semantics() {
     }
 }
 
+void assert_string_columns_use_row_count_costing_without_width_model() {
+    const auto catalog = make_string_cost_catalog();
+
+    const auto filter_sql = "SELECT k FROM sbig WHERE k = '7'";
+    const auto filter = sql::bind_select(sql::parse_select(filter_sql), catalog);
+    const auto filter_estimate = optimizer::estimate_cost(filter, catalog);
+    if (filter_estimate.rows != 100.0 || filter_estimate.cost != 2000.0) {
+        std::cerr << "string filter cost did not reuse row-count selectivity math\n"
+                  << "sql: " << filter_sql << "\n"
+                  << "plan:\n"
+                  << plan::to_string(filter) << "\n"
+                  << "rows: " << filter_estimate.rows << "\n"
+                  << "cost: " << filter_estimate.cost << "\n";
+        std::terminate();
+    }
+
+    const auto group_sql = "SELECT k, COUNT(*) FROM sbig GROUP BY k";
+    const auto group = sql::bind_select(sql::parse_select(group_sql), catalog);
+    const auto group_estimate = optimizer::estimate_cost(group, catalog);
+    if (group_estimate.rows != 1000.0 || group_estimate.cost != 3000.0) {
+        std::cerr << "string GROUP BY cost did not use group-count row math\n"
+                  << "sql: " << group_sql << "\n"
+                  << "plan:\n"
+                  << plan::to_string(group) << "\n"
+                  << "rows: " << group_estimate.rows << "\n"
+                  << "cost: " << group_estimate.cost << "\n";
+        std::terminate();
+    }
+
+    const auto join_sql = "SELECT sbig.k, smid.k FROM sbig JOIN smid ON sbig.k = smid.k";
+    const auto join = sql::bind_select(sql::parse_select(join_sql), catalog);
+    const auto join_estimate = optimizer::estimate_cost(join, catalog);
+    if (join_estimate.rows != 100.0 || join_estimate.cost != 2200.0) {
+        std::cerr << "string join cost did not reuse equi-join row math\n"
+                  << "sql: " << join_sql << "\n"
+                  << "plan:\n"
+                  << plan::to_string(join) << "\n"
+                  << "rows: " << join_estimate.rows << "\n"
+                  << "cost: " << join_estimate.cost << "\n";
+        std::terminate();
+    }
+}
+
 void assert_group_by_does_not_block_join_transforms() {
     const auto catalog = make_skewed_catalog();
     const auto sql =
@@ -564,6 +625,7 @@ int main() {
     assert_aliased_self_join_costs_physical_table_stats();
     assert_aggregate_cost_uses_group_count();
     assert_distinct_and_limit_costs_use_output_count_without_new_semantics();
+    assert_string_columns_use_row_count_costing_without_width_model();
     assert_group_by_does_not_block_join_transforms();
     assert_distinct_limit_do_not_block_join_transforms();
     assert_having_costs_as_filter_over_aggregate();

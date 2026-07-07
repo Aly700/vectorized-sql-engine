@@ -31,7 +31,7 @@ const plan::LogicalPlan& require_right(const plan::LogicalPlan& logical) {
 }
 
 std::optional<std::int64_t> literal_value(const plan::BoundScalarExpr& expression) {
-    if (const auto* literal = std::get_if<sql::IntLiteral>(&expression)) {
+    if (const auto* literal = std::get_if<sql::IntLiteral>(&expression.value)) {
         return literal->value;
     }
     return std::nullopt;
@@ -59,20 +59,24 @@ plan::BoundPredicate comparison_predicate(plan::BoundComparisonExpr comparison) 
     return plan::BoundPredicate::comparison_expr(std::move(comparison));
 }
 
+plan::BoundScalarExpr int_literal(std::int64_t value) {
+    return plan::BoundScalarExpr{sql::IntLiteral{value, 0}, catalog::ColumnType::Int64};
+}
+
 plan::BoundPredicate canonical_true() {
     return comparison_predicate(plan::BoundComparisonExpr{
-        sql::IntLiteral{1, 0},
+        int_literal(1),
         sql::ComparisonOp::Equal,
-        sql::IntLiteral{1, 0},
+        int_literal(1),
         0,
     });
 }
 
 plan::BoundPredicate canonical_false() {
     return comparison_predicate(plan::BoundComparisonExpr{
-        sql::IntLiteral{1, 0},
+        int_literal(1),
         sql::ComparisonOp::Equal,
-        sql::IntLiteral{0, 0},
+        int_literal(0),
         0,
     });
 }
@@ -157,7 +161,7 @@ std::vector<std::string> merge_tables(std::vector<std::string> left, const std::
 
 std::vector<std::string> referenced_tables(const plan::BoundScalarExpr& expression) {
     std::vector<std::string> tables;
-    if (const auto* column = std::get_if<plan::BoundColumnRef>(&expression)) {
+    if (const auto* column = std::get_if<plan::BoundColumnRef>(&expression.value)) {
         add_unique_table(tables, column->binding);
     }
     return tables;
@@ -186,7 +190,7 @@ std::vector<std::string> referenced_tables(const plan::BoundPredicate& predicate
 
 std::vector<plan::BoundColumnRef> referenced_columns(const plan::BoundScalarExpr& expression) {
     std::vector<plan::BoundColumnRef> columns;
-    if (const auto* column = std::get_if<plan::BoundColumnRef>(&expression)) {
+    if (const auto* column = std::get_if<plan::BoundColumnRef>(&expression.value)) {
         columns.push_back(*column);
     }
     return columns;
