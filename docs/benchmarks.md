@@ -165,3 +165,55 @@ implementation.
 | workload | rows | correctness | interpreted min ms | interpreted median ms | vectorized min ms | vectorized median ms | median speedup |
 |---|---:|---|---:|---:|---:|---:|---:|
 | string_group_by | string_fact=120000,groups=16 | match rows=16 checksum=0x8ce7a59f7d8fbc52 | 24.914 | 25.003 | 9.233 | 9.402 | 2.659x |
+
+## Phase 19 Boolean-Mask Filter Kernels (2026-07-07)
+
+Same optimized build command and correctness-checksum-before-timing discipline
+as above. The before table is a fresh Release run on branch
+`phase19-mask-kernels` before replacing vectorized Filter's row-wise predicate
+loop with paired `is_true`/`is_known` byte masks. The after table is the same
+benchmark after the mask kernel change.
+
+### Before Mask Kernels
+
+| workload | rows | correctness | interpreted min ms | interpreted median ms | vectorized min ms | vectorized median ms | median speedup |
+|---|---:|---|---:|---:|---:|---:|---:|
+| scan_filter_1pct | fact=200000 | match rows=2000 checksum=0x95ba2cbd0a720591 | 17.782 | 19.128 | 9.504 | 9.673 | 1.977x |
+| scan_filter_10pct | fact=200000 | match rows=20000 checksum=0x8031b34dc1b05c00 | 18.358 | 18.408 | 10.706 | 10.750 | 1.712x |
+| scan_filter_50pct | fact=200000 | match rows=100000 checksum=0xd4bb87b7e1354cb7 | 25.115 | 27.095 | 16.769 | 16.934 | 1.600x |
+| multi_key_hash_join | left=100000,right=256 | match rows=100000 checksum=0xd6eff9218be6da07 | 5750.826 | 5974.024 | 16.244 | 16.560 | 360.757x |
+| aggregate_few_groups | fact=200000,groups=8 | match rows=8 checksum=0xd3f7b04105d9e1d2 | 34.703 | 35.383 | 14.413 | 14.717 | 2.404x |
+| aggregate_many_groups | fact=200000,groups=50000 | match rows=50000 checksum=0xf5d6639180dcf25a | 85.207 | 87.990 | 25.445 | 26.379 | 3.336x |
+| sort | fact=200000 | match rows=1000 checksum=0x42e9485c298e1347 | 379.770 | 400.650 | 61.695 | 65.693 | 6.099x |
+| join_group_sort_limit | left=120000,right=256 | match rows=20 checksum=0x76e0a28dbe61b35d | 4191.192 | 4295.031 | 30.618 | 31.568 | 136.055x |
+| string_group_by | string_fact=120000,groups=16 | match rows=16 checksum=0x8ce7a59f7d8fbc52 | 24.497 | 26.179 | 9.345 | 9.420 | 2.779x |
+
+### After Mask Kernels
+
+| workload | rows | correctness | interpreted min ms | interpreted median ms | vectorized min ms | vectorized median ms | median speedup |
+|---|---:|---|---:|---:|---:|---:|---:|
+| scan_filter_1pct | fact=200000 | match rows=2000 checksum=0x95ba2cbd0a720591 | 17.498 | 17.831 | 8.168 | 8.221 | 2.169x |
+| scan_filter_10pct | fact=200000 | match rows=20000 checksum=0x8031b34dc1b05c00 | 19.853 | 21.639 | 9.627 | 9.821 | 2.203x |
+| scan_filter_50pct | fact=200000 | match rows=100000 checksum=0xd4bb87b7e1354cb7 | 26.551 | 27.165 | 15.158 | 15.243 | 1.782x |
+| multi_key_hash_join | left=100000,right=256 | match rows=100000 checksum=0xd6eff9218be6da07 | 5723.554 | 5891.121 | 15.159 | 15.459 | 381.077x |
+| aggregate_few_groups | fact=200000,groups=8 | match rows=8 checksum=0xd3f7b04105d9e1d2 | 33.617 | 33.845 | 14.343 | 14.937 | 2.266x |
+| aggregate_many_groups | fact=200000,groups=50000 | match rows=50000 checksum=0xf5d6639180dcf25a | 85.401 | 86.095 | 25.174 | 25.455 | 3.382x |
+| sort | fact=200000 | match rows=1000 checksum=0x42e9485c298e1347 | 376.568 | 379.790 | 63.152 | 64.445 | 5.893x |
+| join_group_sort_limit | left=120000,right=256 | match rows=20 checksum=0x76e0a28dbe61b35d | 4167.945 | 4406.484 | 28.676 | 29.492 | 149.414x |
+| string_group_by | string_fact=120000,groups=16 | match rows=16 checksum=0x8ce7a59f7d8fbc52 | 24.609 | 24.827 | 9.478 | 9.578 | 2.592x |
+
+### Phase 19 Readout
+
+The targeted scan/filter vectorized medians improved at every measured
+selectivity: 1 percent selectivity moved from 9.673 ms to 8.221 ms, 10 percent
+from 10.750 ms to 9.821 ms, and 50 percent from 16.934 ms to 15.243 ms. The
+median speedups versus the interpreted oracle rose from 1.977x to 2.169x,
+1.712x to 2.203x, and 1.600x to 1.782x respectively.
+
+No hybrid threshold was added because the simple mask path improved all three
+scan/filter selectivities in this run. Non-target vectorized medians were flat
+to favorable except for small movements in `aggregate_few_groups` (14.717 ms to
+14.937 ms) and `string_group_by` (9.420 ms to 9.578 ms). Those workloads do not
+exercise vectorized Filter in this benchmark set, so they are reported as
+run-to-run noise rather than attributed wins. Correctness checksums stayed
+byte-identical for every workload.

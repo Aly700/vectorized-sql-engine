@@ -29,6 +29,7 @@ struct BatchView {
     std::shared_ptr<const storage::ColumnarBatch> owned_batch;
     const storage::ColumnarBatch* batch{nullptr};
     SelectionVectorPtr selection;
+    bool selection_rows_match_positions{false};
 };
 
 struct EquiJoinKey {
@@ -246,6 +247,17 @@ struct CompiledPredicate {
     std::shared_ptr<CompiledPredicate> right;
 };
 
+struct PredicateMask {
+    std::vector<std::uint8_t> is_true;
+    std::vector<std::uint8_t> is_known;
+};
+
+struct PredicateEvaluationDomain {
+    const SelectionVector* selection{nullptr};
+    std::size_t size{0};
+    bool rows_match_positions{false};
+};
+
 struct CompiledProjection {
     std::string output_name;
     CompiledScalar expression;
@@ -336,7 +348,8 @@ void validate_view(const BatchView& view) {
     if (!view.selection) {
         throw std::logic_error("vectorized batch view is missing a selection vector");
     }
-    for (auto row : *view.selection) {
+    for (std::size_t position = 0; position < view.selection->size(); ++position) {
+        const auto row = (*view.selection)[position];
         if (row >= view.batch->row_count()) {
             throw std::logic_error("selection vector row is outside the batch");
         }
@@ -513,15 +526,6 @@ CompiledComparison compile_comparison(const plan::BoundComparisonExpr& compariso
     return compiled;
 }
 
-TruthValue evaluate_comparison(const CompiledComparison& comparison, std::size_t row) {
-    const auto left = comparison.left.cell(row);
-    const auto right = comparison.right.cell(row);
-    if (left.is_null || right.is_null) {
-        return TruthValue::Unknown;
-    }
-    return truth_from_bool(compare_cells(left, comparison.op, right));
-}
-
 const plan::BoundPredicate& require_left_predicate(const plan::BoundPredicate& predicate) {
     if (predicate.left == nullptr) {
         throw std::invalid_argument("bound predicate is missing its left child");
@@ -580,37 +584,306 @@ std::vector<CompiledPredicate> compile_predicates(const std::vector<plan::BoundP
     return compiled;
 }
 
-TruthValue evaluate_predicate(const CompiledPredicate& predicate, std::size_t row) {
+PredicateMask make_predicate_mask(std::size_t size) {
+    return PredicateMask{std::vector<std::uint8_t>(size), std::vector<std::uint8_t>(size)};
+}
+
+PredicateMask make_constant_predicate_mask(std::size_t size, std::uint8_t true_value, std::uint8_t known_value) {
+    return PredicateMask{std::vector<std::uint8_t>(size, true_value), std::vector<std::uint8_t>(size, known_value)};
+}
+
+PredicateEvaluationDomain make_predicate_domain(const BatchView& input) {
+    if (!input.selection) {
+        throw std::logic_error("cannot build a predicate domain without a selection vector");
+    }
+    return PredicateEvaluationDomain{input.selection.get(), input.selection->size(), input.selection_rows_match_positions};
+}
+
+template <typename Func>
+void for_each_domain_row(const PredicateEvaluationDomain& domain, Func&& func) {
+    if (domain.selection == nullptr) {
+        throw std::logic_error("predicate evaluation domain is missing a selection vector");
+    }
+    if (domain.rows_match_positions) {
+        for (std::size_t position = 0; position < domain.size; ++position) {
+            func(position, position);
+        }
+        return;
+    }
+    for (std::size_t position = 0; position < domain.size; ++position) {
+        func(position, (*domain.selection)[position]);
+    }
+}
+
+bool scalar_has_column(const CompiledScalar& scalar) {
+    return scalar.column_int_values != nullptr || scalar.column_string_values != nullptr;
+}
+
+bool scalar_is_always_null(const CompiledScalar& scalar) {
+    return !scalar_has_column(scalar) && scalar.literal_is_null;
+}
+
+bool scalar_can_be_null(const CompiledScalar& scalar) {
+    return scalar_has_column(scalar) ? scalar.column_validity != nullptr : scalar.literal_is_null;
+}
+
+template <typename Compare>
+PredicateMask evaluate_int_comparison_mask_with(const CompiledComparison& comparison,
+                                                const PredicateEvaluationDomain& domain,
+                                                Compare&& compare) {
+    if (scalar_is_always_null(comparison.left) || scalar_is_always_null(comparison.right)) {
+        return make_constant_predicate_mask(domain.size, 0, 0);
+    }
+    if (!scalar_has_column(comparison.left) && !scalar_has_column(comparison.right)) {
+        return make_constant_predicate_mask(
+            domain.size,
+            compare(comparison.left.literal, comparison.right.literal) ? std::uint8_t{1} : std::uint8_t{0},
+            1);
+    }
+
+    auto mask = make_predicate_mask(domain.size);
+    const auto* left_values = comparison.left.column_int_values;
+    const auto* right_values = comparison.right.column_int_values;
+    const auto left_literal = comparison.left.literal;
+    const auto right_literal = comparison.right.literal;
+    const auto nulls_possible = scalar_can_be_null(comparison.left) || scalar_can_be_null(comparison.right);
+
+    auto write_position = [&](std::size_t position, std::size_t row, std::int64_t left, std::int64_t right) {
+        const auto known = nulls_possible ? static_cast<std::uint8_t>(!comparison.left.is_null(row) &&
+                                                                      !comparison.right.is_null(row))
+                                          : std::uint8_t{1};
+        mask.is_known[position] = known;
+        mask.is_true[position] = static_cast<std::uint8_t>(known & static_cast<std::uint8_t>(compare(left, right)));
+    };
+
+    if (left_values != nullptr && right_values != nullptr) {
+        for_each_domain_row(domain, [&](std::size_t position, std::size_t row) {
+            write_position(position, row, (*left_values)[row], (*right_values)[row]);
+        });
+    } else if (left_values != nullptr) {
+        for_each_domain_row(domain, [&](std::size_t position, std::size_t row) {
+            write_position(position, row, (*left_values)[row], right_literal);
+        });
+    } else if (right_values != nullptr) {
+        for_each_domain_row(domain, [&](std::size_t position, std::size_t row) {
+            write_position(position, row, left_literal, (*right_values)[row]);
+        });
+    } else {
+        throw std::logic_error("int comparison mask reached an impossible scalar shape");
+    }
+    return mask;
+}
+
+template <typename Compare>
+PredicateMask evaluate_string_comparison_mask_with(const CompiledComparison& comparison,
+                                                   const PredicateEvaluationDomain& domain,
+                                                   Compare&& compare) {
+    if (scalar_is_always_null(comparison.left) || scalar_is_always_null(comparison.right)) {
+        return make_constant_predicate_mask(domain.size, 0, 0);
+    }
+    if (!scalar_has_column(comparison.left) && !scalar_has_column(comparison.right)) {
+        return make_constant_predicate_mask(
+            domain.size,
+            compare(comparison.left.string_literal, comparison.right.string_literal) ? std::uint8_t{1}
+                                                                                     : std::uint8_t{0},
+            1);
+    }
+
+    auto mask = make_predicate_mask(domain.size);
+    const auto* left_values = comparison.left.column_string_values;
+    const auto* right_values = comparison.right.column_string_values;
+    const auto& left_literal = comparison.left.string_literal;
+    const auto& right_literal = comparison.right.string_literal;
+    const auto nulls_possible = scalar_can_be_null(comparison.left) || scalar_can_be_null(comparison.right);
+
+    auto write_position = [&](std::size_t position, std::size_t row, const std::string& left, const std::string& right) {
+        const auto known = nulls_possible ? static_cast<std::uint8_t>(!comparison.left.is_null(row) &&
+                                                                      !comparison.right.is_null(row))
+                                          : std::uint8_t{1};
+        mask.is_known[position] = known;
+        mask.is_true[position] = static_cast<std::uint8_t>(known & static_cast<std::uint8_t>(compare(left, right)));
+    };
+
+    if (left_values != nullptr && right_values != nullptr) {
+        for_each_domain_row(domain, [&](std::size_t position, std::size_t row) {
+            write_position(position, row, (*left_values)[row], (*right_values)[row]);
+        });
+    } else if (left_values != nullptr) {
+        for_each_domain_row(domain, [&](std::size_t position, std::size_t row) {
+            write_position(position, row, (*left_values)[row], right_literal);
+        });
+    } else if (right_values != nullptr) {
+        for_each_domain_row(domain, [&](std::size_t position, std::size_t row) {
+            write_position(position, row, left_literal, (*right_values)[row]);
+        });
+    } else {
+        throw std::logic_error("string comparison mask reached an impossible scalar shape");
+    }
+    return mask;
+}
+
+PredicateMask evaluate_int_comparison_mask(const CompiledComparison& comparison,
+                                           const PredicateEvaluationDomain& domain) {
+    switch (comparison.op) {
+    case sql::ComparisonOp::Equal:
+        return evaluate_int_comparison_mask_with(comparison, domain, [](auto left, auto right) { return left == right; });
+    case sql::ComparisonOp::NotEqual:
+        return evaluate_int_comparison_mask_with(comparison, domain, [](auto left, auto right) { return left != right; });
+    case sql::ComparisonOp::Less:
+        return evaluate_int_comparison_mask_with(comparison, domain, [](auto left, auto right) { return left < right; });
+    case sql::ComparisonOp::LessEqual:
+        return evaluate_int_comparison_mask_with(comparison, domain, [](auto left, auto right) { return left <= right; });
+    case sql::ComparisonOp::Greater:
+        return evaluate_int_comparison_mask_with(comparison, domain, [](auto left, auto right) { return left > right; });
+    case sql::ComparisonOp::GreaterEqual:
+        return evaluate_int_comparison_mask_with(comparison, domain, [](auto left, auto right) { return left >= right; });
+    }
+    throw std::logic_error("unreachable comparison operator");
+}
+
+PredicateMask evaluate_string_comparison_mask(const CompiledComparison& comparison,
+                                              const PredicateEvaluationDomain& domain) {
+    switch (comparison.op) {
+    case sql::ComparisonOp::Equal:
+        return evaluate_string_comparison_mask_with(comparison, domain, [](const auto& left, const auto& right) {
+            return left == right;
+        });
+    case sql::ComparisonOp::NotEqual:
+        return evaluate_string_comparison_mask_with(comparison, domain, [](const auto& left, const auto& right) {
+            return left != right;
+        });
+    case sql::ComparisonOp::Less:
+        return evaluate_string_comparison_mask_with(comparison, domain, [](const auto& left, const auto& right) {
+            return left < right;
+        });
+    case sql::ComparisonOp::LessEqual:
+        return evaluate_string_comparison_mask_with(comparison, domain, [](const auto& left, const auto& right) {
+            return left <= right;
+        });
+    case sql::ComparisonOp::Greater:
+        return evaluate_string_comparison_mask_with(comparison, domain, [](const auto& left, const auto& right) {
+            return left > right;
+        });
+    case sql::ComparisonOp::GreaterEqual:
+        return evaluate_string_comparison_mask_with(comparison, domain, [](const auto& left, const auto& right) {
+            return left >= right;
+        });
+    }
+    throw std::logic_error("unreachable comparison operator");
+}
+
+PredicateMask evaluate_comparison_mask(const CompiledComparison& comparison,
+                                       const PredicateEvaluationDomain& domain) {
+    if (comparison.left.type != comparison.right.type) {
+        throw std::logic_error("compiled comparison mask received mismatched scalar types");
+    }
+    return comparison.left.type == catalog::ColumnType::Int64 ? evaluate_int_comparison_mask(comparison, domain)
+                                                              : evaluate_string_comparison_mask(comparison, domain);
+}
+
+PredicateMask evaluate_null_check_mask(const CompiledScalar& scalar,
+                                       const PredicateEvaluationDomain& domain,
+                                       bool is_not_null) {
+    if (!scalar_can_be_null(scalar)) {
+        return make_constant_predicate_mask(domain.size, is_not_null ? std::uint8_t{1} : std::uint8_t{0}, 1);
+    }
+    if (scalar_is_always_null(scalar)) {
+        return make_constant_predicate_mask(domain.size, is_not_null ? std::uint8_t{0} : std::uint8_t{1}, 1);
+    }
+
+    auto mask = make_predicate_mask(domain.size);
+    for_each_domain_row(domain, [&](std::size_t position, std::size_t row) {
+        const auto is_null = scalar.is_null(row);
+        mask.is_true[position] = static_cast<std::uint8_t>(is_not_null ? !is_null : is_null);
+        mask.is_known[position] = 1;
+    });
+    return mask;
+}
+
+void combine_and_in_place(PredicateMask& left, const PredicateMask& right) {
+    if (left.is_true.size() != right.is_true.size() || left.is_known.size() != right.is_known.size() ||
+        left.is_true.size() != left.is_known.size()) {
+        throw std::logic_error("AND mask combine received mismatched mask sizes");
+    }
+    for (std::size_t i = 0; i < left.is_true.size(); ++i) {
+        const auto lt = left.is_true[i];
+        const auto lk = left.is_known[i];
+        const auto rt = right.is_true[i];
+        const auto rk = right.is_known[i];
+        const auto true_value = static_cast<std::uint8_t>(lt & rt);
+        const auto false_value = static_cast<std::uint8_t>((lk & (lt ^ 1U)) | (rk & (rt ^ 1U)));
+        left.is_true[i] = true_value;
+        left.is_known[i] = static_cast<std::uint8_t>(true_value | false_value);
+    }
+}
+
+void combine_or_in_place(PredicateMask& left, const PredicateMask& right) {
+    if (left.is_true.size() != right.is_true.size() || left.is_known.size() != right.is_known.size() ||
+        left.is_true.size() != left.is_known.size()) {
+        throw std::logic_error("OR mask combine received mismatched mask sizes");
+    }
+    for (std::size_t i = 0; i < left.is_true.size(); ++i) {
+        const auto lt = left.is_true[i];
+        const auto lk = left.is_known[i];
+        const auto rt = right.is_true[i];
+        const auto rk = right.is_known[i];
+        const auto true_value = static_cast<std::uint8_t>(lt | rt);
+        const auto false_value = static_cast<std::uint8_t>((lk & (lt ^ 1U)) & (rk & (rt ^ 1U)));
+        left.is_true[i] = true_value;
+        left.is_known[i] = static_cast<std::uint8_t>(true_value | false_value);
+    }
+}
+
+PredicateMask evaluate_predicate_mask(const CompiledPredicate& predicate, const PredicateEvaluationDomain& domain) {
     switch (predicate.kind) {
     case sql::PredicateKind::Comparison:
-        return evaluate_comparison(predicate.comparison, row);
+        return evaluate_comparison_mask(predicate.comparison, domain);
     case sql::PredicateKind::IsNull:
-        return truth_from_bool(predicate.null_check.is_null(row));
+        return evaluate_null_check_mask(predicate.null_check, domain, false);
     case sql::PredicateKind::IsNotNull:
-        return truth_from_bool(!predicate.null_check.is_null(row));
+        return evaluate_null_check_mask(predicate.null_check, domain, true);
     case sql::PredicateKind::And: {
-        // Evaluation is deliberately left-to-right and short-circuit-free so
-        // the vectorized path has the same observable order as the oracle.
-        const auto left = evaluate_predicate(require_left_predicate(predicate), row);
-        const auto right = evaluate_predicate(require_right_predicate(predicate), row);
-        return and_truth(left, right);
+        auto left = evaluate_predicate_mask(require_left_predicate(predicate), domain);
+        auto right = evaluate_predicate_mask(require_right_predicate(predicate), domain);
+        combine_and_in_place(left, right);
+        return left;
     }
     case sql::PredicateKind::Or: {
-        const auto left = evaluate_predicate(require_left_predicate(predicate), row);
-        const auto right = evaluate_predicate(require_right_predicate(predicate), row);
-        return or_truth(left, right);
+        auto left = evaluate_predicate_mask(require_left_predicate(predicate), domain);
+        auto right = evaluate_predicate_mask(require_right_predicate(predicate), domain);
+        combine_or_in_place(left, right);
+        return left;
     }
     }
     throw std::logic_error("unreachable predicate kind");
 }
 
-TruthValue evaluate_predicates(const std::vector<CompiledPredicate>& predicates, std::size_t row) {
-    auto keep = TruthValue::True;
-    for (const auto& predicate : predicates) {
-        const auto predicate_result = evaluate_predicate(predicate, row);
-        keep = and_truth(keep, predicate_result);
+PredicateMask evaluate_predicates_mask(const std::vector<CompiledPredicate>& predicates,
+                                       const PredicateEvaluationDomain& domain) {
+    if (predicates.empty()) {
+        return make_constant_predicate_mask(domain.size, 1, 1);
     }
-    return keep;
+    auto mask = evaluate_predicate_mask(predicates.front(), domain);
+    for (std::size_t i = 1; i < predicates.size(); ++i) {
+        auto next = evaluate_predicate_mask(predicates[i], domain);
+        combine_and_in_place(mask, next);
+    }
+    return mask;
+}
+
+SelectionVector selection_from_true_mask(const PredicateMask& mask, const PredicateEvaluationDomain& domain) {
+    if (mask.is_true.size() != domain.size || mask.is_known.size() != domain.size) {
+        throw std::logic_error("predicate mask size does not match evaluation domain");
+    }
+    SelectionVector rows;
+    rows.reserve(domain.size);
+    for (std::size_t position = 0; position < domain.size; ++position) {
+        if (mask.is_true[position] == 0) {
+            continue;
+        }
+        rows.push_back(domain.rows_match_positions ? position : (*domain.selection)[position]);
+    }
+    return rows;
 }
 
 CompiledJoinScalar compile_join_scalar(const plan::BoundScalarExpr& expression,
@@ -1107,6 +1380,7 @@ BatchView execute_scan(const plan::PhysicalPlan& plan, const Catalog& catalog) {
     view.owned_batch = qualified;
     view.batch = qualified.get();
     view.selection = identity_selection(qualified->row_count());
+    view.selection_rows_match_positions = true;
     validate_view(view);
     return view;
 }
@@ -1174,15 +1448,11 @@ BatchView execute_filter(const plan::PhysicalPlan& plan, const Catalog& catalog)
     validate_view(input);
 
     const auto predicates = compile_predicates(plan.predicates, *input.batch);
-    SelectionVector rows;
-    rows.reserve(input.selection->size());
-    for (auto row : *input.selection) {
-        if (evaluate_predicates(predicates, row) == TruthValue::True) {
-            rows.push_back(row);
-        }
-    }
+    const auto domain = make_predicate_domain(input);
+    auto rows = selection_from_true_mask(evaluate_predicates_mask(predicates, domain), domain);
 
     input.selection = make_selection(std::move(rows));
+    input.selection_rows_match_positions = false;
     validate_view(input);
     return input;
 }
@@ -1202,6 +1472,7 @@ BatchView execute_join(const plan::PhysicalPlan& plan, const Catalog& catalog) {
     view.owned_batch = materialized;
     view.batch = materialized.get();
     view.selection = identity_selection(materialized->row_count());
+    view.selection_rows_match_positions = true;
     validate_view(view);
     return view;
 }
@@ -1365,6 +1636,7 @@ BatchView execute_project(const plan::PhysicalPlan& plan, const Catalog& catalog
     view.owned_batch = materialized;
     view.batch = materialized.get();
     view.selection = identity_selection(materialized->row_count());
+    view.selection_rows_match_positions = true;
     validate_view(view);
     return view;
 }
@@ -1433,6 +1705,7 @@ BatchView execute_aggregate(const plan::PhysicalPlan& plan, const Catalog& catal
     view.owned_batch = materialized;
     view.batch = materialized.get();
     view.selection = identity_selection(materialized->row_count());
+    view.selection_rows_match_positions = true;
     validate_view(view);
     return view;
 }
@@ -1456,6 +1729,7 @@ BatchView execute_distinct(const plan::PhysicalPlan& plan, const Catalog& catalo
     }
 
     input.selection = make_selection(std::move(rows));
+    input.selection_rows_match_positions = false;
     validate_view(input);
     return input;
 }
@@ -1471,7 +1745,9 @@ BatchView execute_sort(const plan::PhysicalPlan& plan, const Catalog& catalog) {
         sort_view.owned_batch = sort_input;
         sort_view.batch = sort_input.get();
         sort_view.selection = identity_selection(sort_input->row_count());
+        sort_view.selection_rows_match_positions = true;
         sort_view.selection = sort_selection(plan.sort_keys, sort_view);
+        sort_view.selection_rows_match_positions = false;
 
         auto materialized = std::make_shared<const storage::ColumnarBatch>(
             materialize_project_output_columns(input_plan, *sort_view.batch, *sort_view.selection));
@@ -1480,12 +1756,14 @@ BatchView execute_sort(const plan::PhysicalPlan& plan, const Catalog& catalog) {
         view.owned_batch = materialized;
         view.batch = materialized.get();
         view.selection = identity_selection(materialized->row_count());
+        view.selection_rows_match_positions = true;
         validate_view(view);
         return view;
     }
 
     auto input = execute_to_view(input_plan, catalog);
     input.selection = sort_selection(plan.sort_keys, input);
+    input.selection_rows_match_positions = false;
     validate_view(input);
     return input;
 }
