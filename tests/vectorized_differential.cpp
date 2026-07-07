@@ -91,6 +91,32 @@ execution::Catalog make_golden_catalog() {
     nullable.add_column("v", std::move(nullable_v));
     catalog.add_table("nullable", std::move(nullable));
 
+    storage::Int64Column agg_g;
+    agg_g.append_null();
+    agg_g.append_null();
+    agg_g.append(1);
+    agg_g.append(1);
+    agg_g.append(2);
+    agg_g.append(2);
+    agg_g.append_null();
+    storage::Int64Column agg_h;
+    for (auto value : {1, 1, 1, 2, 1, 1, 2}) {
+        agg_h.append(value);
+    }
+    storage::Int64Column agg_x;
+    agg_x.append_null();
+    agg_x.append(10);
+    agg_x.append_null();
+    agg_x.append(5);
+    agg_x.append_null();
+    agg_x.append_null();
+    agg_x.append(20);
+    storage::ColumnarBatch agg_null;
+    agg_null.add_column("g", std::move(agg_g));
+    agg_null.add_column("h", std::move(agg_h));
+    agg_null.add_column("x", std::move(agg_x));
+    catalog.add_table("agg_null", std::move(agg_null));
+
     storage::Int64Column j1_k;
     j1_k.append(1);
     j1_k.append_null();
@@ -344,6 +370,18 @@ std::optional<std::string> output_column_for_sort_key(const plan::SortKey& key, 
     return std::nullopt;
 }
 
+bool sort_cell_less(Cell left, Cell right, sql::SortDirection direction) {
+    if (left == right) {
+        return false;
+    }
+    const auto left_is_null = !left.has_value();
+    const auto right_is_null = !right.has_value();
+    if (left_is_null || right_is_null) {
+        return direction == sql::SortDirection::Asc ? right_is_null : left_is_null;
+    }
+    return direction == sql::SortDirection::Asc ? *left < *right : *left > *right;
+}
+
 bool is_sorted_by_keys(const storage::ColumnarBatch& batch, const std::vector<plan::SortKey>& keys) {
     for (const auto& key : keys) {
         if (!output_column_for_sort_key(key, batch).has_value()) {
@@ -360,10 +398,7 @@ bool is_sorted_by_keys(const storage::ColumnarBatch& batch, const std::vector<pl
             if (previous == current) {
                 continue;
             }
-            if (key.direction == sql::SortDirection::Asc && previous > current) {
-                return false;
-            }
-            if (key.direction == sql::SortDirection::Desc && previous < current) {
+            if (sort_cell_less(current, previous, key.direction)) {
                 return false;
             }
             decided = true;
@@ -589,9 +624,17 @@ bool run_result_golden_queries() {
         "SELECT v FROM nullable WHERE k = NULL OR v = 30",
         "SELECT k FROM nullable WHERE k = NULL AND 1 = 0",
         "SELECT v FROM nullable WHERE k = NULL AND v = 30",
+        "SELECT COUNT(*), COUNT(k), COUNT(v), SUM(k), MIN(v), MAX(v) FROM nullable",
+        "SELECT k, v FROM nullable ORDER BY k ASC",
+        "SELECT k, v FROM nullable ORDER BY k DESC",
         "SELECT COUNT(*), COUNT(b), SUM(a), MIN(b), MAX(b) FROM t",
         "SELECT b, COUNT(*), SUM(a), MIN(a), MAX(a) FROM t GROUP BY b",
         "SELECT b, COUNT(*) FROM t GROUP BY b ORDER BY b DESC",
+        "SELECT g, COUNT(*), COUNT(x), SUM(x), MIN(x), MAX(x) FROM agg_null GROUP BY g",
+        "SELECT g, h, COUNT(*), SUM(x) FROM agg_null GROUP BY g, h",
+        "SELECT g, SUM(x) FROM agg_null GROUP BY g HAVING SUM(x) > 5",
+        "SELECT g, SUM(x) FROM agg_null GROUP BY g HAVING SUM(x) IS NULL",
+        "SELECT SUM(x), MIN(x), MAX(x), COUNT(x), COUNT(*) FROM agg_null WHERE g = 2",
         "SELECT a FROM t GROUP BY a HAVING SUM(b) > 20",
         "SELECT a, COUNT(*) FROM t GROUP BY a HAVING SUM(b) > 1000",
         "SELECT b, COUNT(*) FROM t GROUP BY b HAVING b = 10 OR COUNT(*) > 1",
@@ -599,6 +642,8 @@ bool run_result_golden_queries() {
         "SELECT a, SUM(b) AS total FROM t GROUP BY a HAVING SUM(b) >= 20 ORDER BY total DESC",
         "SELECT a, SUM(b) FROM t GROUP BY a ORDER BY SUM(b) DESC",
         "SELECT DISTINCT b FROM t",
+        "SELECT DISTINCT g FROM agg_null",
+        "SELECT DISTINCT g, h FROM agg_null",
         "SELECT DISTINCT b FROM t ORDER BY b DESC",
         "SELECT a FROM t LIMIT 0",
         "SELECT a FROM t LIMIT 1",
@@ -607,6 +652,7 @@ bool run_result_golden_queries() {
         "SELECT a FROM t LIMIT 99",
         "SELECT a, b FROM t ORDER BY b DESC LIMIT 2",
         "SELECT DISTINCT b FROM t ORDER BY b ASC LIMIT 2",
+        "SELECT SUM(empty.a), MIN(empty.a), MAX(empty.a), COUNT(empty.a), COUNT(*) FROM empty",
     };
 
     bool ok = true;

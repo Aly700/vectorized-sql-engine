@@ -218,7 +218,13 @@ std::vector<std::size_t> stable_sorted_rows(const std::vector<plan::SortKey>& so
             if (left_value == right_value) {
                 continue;
             }
-            return key.direction == sql::SortDirection::Asc ? left_value < right_value : left_value > right_value;
+            const auto left_is_null = !left_value.has_value();
+            const auto right_is_null = !right_value.has_value();
+            if (left_is_null || right_is_null) {
+                return key.direction == sql::SortDirection::Asc ? right_is_null : left_is_null;
+            }
+            return key.direction == sql::SortDirection::Asc ? *left_value < *right_value
+                                                            : *left_value > *right_value;
         }
         return false;
     });
@@ -390,23 +396,23 @@ void update_aggregate(AggregateValue& value,
     throw std::logic_error("unreachable aggregate function");
 }
 
-std::int64_t finalize_aggregate(const AggregateValue& value, const plan::AggregateExpression& aggregate) {
+Cell finalize_aggregate(const AggregateValue& value, const plan::AggregateExpression& aggregate) {
     switch (aggregate.function) {
     case sql::AggregateFunction::Count:
         return value.count;
     case sql::AggregateFunction::Sum:
         if (!value.has_value) {
-            throw std::runtime_error(aggregate.output_name + " over empty input has no NULL-free result");
+            return std::nullopt;
         }
         return value.sum;
     case sql::AggregateFunction::Min:
         if (!value.has_value) {
-            throw std::runtime_error(aggregate.output_name + " over empty input has no NULL-free result");
+            return std::nullopt;
         }
         return value.min;
     case sql::AggregateFunction::Max:
         if (!value.has_value) {
-            throw std::runtime_error(aggregate.output_name + " over empty input has no NULL-free result");
+            return std::nullopt;
         }
         return value.max;
     }
@@ -563,6 +569,8 @@ storage::ColumnarBatch execute_aggregate(const plan::LogicalPlan& plan, const Ca
     for (std::size_t row = 0; row < input.row_count(); ++row) {
         std::size_t group_index = 0;
         if (!plan.group_keys.empty()) {
+            // GROUP BY uses distinct-style key equality: NULL slots compare
+            // equal here, while predicate and join equality still use SQL 3VL.
             auto key = group_key_values(plan.group_keys, input, row);
             const auto found = group_index_by_key.find(key);
             if (found == group_index_by_key.end()) {
@@ -593,7 +601,7 @@ storage::ColumnarBatch execute_aggregate(const plan::LogicalPlan& plan, const Ca
         const auto& aggregate = plan.aggregate_expressions[aggregate_index];
         storage::Int64Column column;
         for (const auto& group : groups) {
-            column.append(finalize_aggregate(group.aggregates.at(aggregate_index), aggregate));
+            append_cell(column, finalize_aggregate(group.aggregates.at(aggregate_index), aggregate));
         }
         out.add_column(aggregate.output_name, std::move(column));
     }

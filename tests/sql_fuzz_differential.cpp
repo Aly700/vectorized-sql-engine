@@ -149,7 +149,6 @@ public:
         auto catalog = make_catalog(tables);
         auto ranges = choose_ranges(tables);
         const auto all_columns = columns_for_ranges(ranges);
-        const auto non_nullable_columns = non_nullable(all_columns);
         const auto from_sql = from_clause(ranges);
         const auto aggregate_query = chance(48);
         std::vector<std::string> group_keys;
@@ -158,14 +157,14 @@ public:
 
         if (aggregate_query) {
             if (chance(70)) {
-                group_keys = sample_unique(column_sqls(non_nullable_columns),
-                                           between(1, std::min<std::size_t>(3, non_nullable_columns.size())));
+                group_keys = sample_unique(column_sqls(all_columns),
+                                           between(1, std::min<std::size_t>(3, all_columns.size())));
             }
             const auto aggregate_count = between(1, 3);
             for (std::size_t i = 0; i < aggregate_count; ++i) {
-                aggregate_exprs.push_back(random_aggregate(non_nullable_columns));
+                aggregate_exprs.push_back(random_aggregate(all_columns));
             }
-            select_items = aggregate_select_items(group_keys, aggregate_exprs, non_nullable_columns);
+            select_items = aggregate_select_items(group_keys, aggregate_exprs, all_columns);
         } else {
             select_items = scalar_select_items(all_columns);
         }
@@ -311,9 +310,7 @@ private:
                                                  const std::vector<ColumnRef>& all_columns) {
         std::vector<std::string> candidates;
         for (const auto& item : select_items) {
-            if (!item.nullable) {
-                candidates.push_back(item.alias);
-            }
+            candidates.push_back(item.alias);
         }
         if (distinct) {
             return candidates;
@@ -329,8 +326,7 @@ private:
     void add_safe_from_scope_order_keys(const std::vector<SelectItem>& select_items,
                                         std::vector<std::string>* candidates) {
         for (const auto& item : select_items) {
-            if (!item.source_column.has_value() || item.source_column->nullable ||
-                item.alias != item.source_column->column) {
+            if (!item.source_column.has_value() || item.alias != item.source_column->column) {
                 continue;
             }
             const auto text = sql_text(*item.source_column);
@@ -452,16 +448,6 @@ private:
                 refs.push_back(ColumnRef{range.alias,
                                          range.columns[column_index],
                                          range.nullable[column_index]});
-            }
-        }
-        return refs;
-    }
-
-    std::vector<ColumnRef> non_nullable(const std::vector<ColumnRef>& columns) const {
-        std::vector<ColumnRef> refs;
-        for (const auto& column : columns) {
-            if (!column.nullable) {
-                refs.push_back(column);
             }
         }
         return refs;

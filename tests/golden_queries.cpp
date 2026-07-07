@@ -76,6 +76,32 @@ execution::Catalog make_catalog() {
     nullable.add_column("v", std::move(nullable_v));
     catalog.add_table("nullable", std::move(nullable));
 
+    storage::Int64Column agg_g;
+    agg_g.append_null();
+    agg_g.append_null();
+    agg_g.append(1);
+    agg_g.append(1);
+    agg_g.append(2);
+    agg_g.append(2);
+    agg_g.append_null();
+    storage::Int64Column agg_h;
+    for (auto value : {1, 1, 1, 2, 1, 1, 2}) {
+        agg_h.append(value);
+    }
+    storage::Int64Column agg_x;
+    agg_x.append_null();
+    agg_x.append(10);
+    agg_x.append_null();
+    agg_x.append(5);
+    agg_x.append_null();
+    agg_x.append_null();
+    agg_x.append(20);
+    storage::ColumnarBatch agg_null;
+    agg_null.add_column("g", std::move(agg_g));
+    agg_null.add_column("h", std::move(agg_h));
+    agg_null.add_column("x", std::move(agg_x));
+    catalog.add_table("agg_null", std::move(agg_null));
+
     storage::Int64Column j1_k;
     j1_k.append(1);
     j1_k.append_null();
@@ -329,6 +355,12 @@ int main() {
             ExpectedResult{{"v"}, {}},
         },
         GoldenQuery{
+            "nullable aggregates ignore NULL inputs",
+            "SELECT COUNT(*), COUNT(k), COUNT(v), SUM(k), MIN(v), MAX(v) FROM nullable",
+            ExpectedResult{{"COUNT(*)", "COUNT(k)", "COUNT(v)", "SUM(k)", "MIN(v)", "MAX(v)"},
+                           {{4, 2, 3, 3, 10, 30}}},
+        },
+        GoldenQuery{
             "HAVING UNKNOWN rejects grouped rows",
             "SELECT a, COUNT(*) FROM t GROUP BY a HAVING COUNT(*) = NULL",
             ExpectedResult{{"a", "COUNT(*)"}, {}},
@@ -414,6 +446,16 @@ int main() {
             ExpectedResult{{"a", "original"}, {{40, 4}, {20, 2}, {20, 3}, {10, 1}}},
         },
         GoldenQuery{
+            "order by ascending places NULLs last",
+            "SELECT k, v FROM nullable ORDER BY k ASC",
+            ExpectedResult{{"k", "v"}, {{1, 10}, {2, std::nullopt}, {std::nullopt, 20}, {std::nullopt, 30}}},
+        },
+        GoldenQuery{
+            "order by descending places NULLs first",
+            "SELECT k, v FROM nullable ORDER BY k DESC",
+            ExpectedResult{{"k", "v"}, {{std::nullopt, 20}, {std::nullopt, 30}, {2, std::nullopt}, {1, 10}}},
+        },
+        GoldenQuery{
             "order by binds unprojected qualified join column from FROM scope",
             "SELECT t1.b FROM t1 JOIN t2 ON t1.a = t2.a ORDER BY t2.c DESC, t1.b ASC",
             ExpectedResult{{"t1.b"}, {{20}, {30}, {20}, {30}}},
@@ -476,9 +518,37 @@ int main() {
             ExpectedResult{{"t1.a", "COUNT(*)"}, {{2, 2}, {1, 1}}},
         },
         GoldenQuery{
+            "NULL grouping key forms one group and aggregates skip NULL inputs",
+            "SELECT g, COUNT(*), COUNT(x), SUM(x), MIN(x), MAX(x) FROM agg_null GROUP BY g",
+            ExpectedResult{{"g", "COUNT(*)", "COUNT(x)", "SUM(x)", "MIN(x)", "MAX(x)"},
+                           {{std::nullopt, 3, 2, 30, 10, 20},
+                            {1, 2, 1, 5, 5, 5},
+                            {2, 2, 0, std::nullopt, std::nullopt, std::nullopt}}},
+        },
+        GoldenQuery{
+            "multi key grouping treats matching NULL slots as equal",
+            "SELECT g, h, COUNT(*), SUM(x) FROM agg_null GROUP BY g, h",
+            ExpectedResult{{"g", "h", "COUNT(*)", "SUM(x)"},
+                           {{std::nullopt, 1, 2, 10},
+                            {1, 1, 1, std::nullopt},
+                            {1, 2, 1, 5},
+                            {2, 1, 2, std::nullopt},
+                            {std::nullopt, 2, 1, 20}}},
+        },
+        GoldenQuery{
             "having filters grouped rows using projected aggregate",
             "SELECT a, SUM(b) FROM t GROUP BY a HAVING SUM(b) > 20 ORDER BY a ASC",
             ExpectedResult{{"a", "SUM(b)"}, {{4, 40}}},
+        },
+        GoldenQuery{
+            "HAVING UNKNOWN from NULL aggregate rejects group",
+            "SELECT g, SUM(x) FROM agg_null GROUP BY g HAVING SUM(x) > 5",
+            ExpectedResult{{"g", "SUM(x)"}, {{std::nullopt, 30}}},
+        },
+        GoldenQuery{
+            "HAVING IS NULL sees NULL aggregate results",
+            "SELECT g, SUM(x) FROM agg_null GROUP BY g HAVING SUM(x) IS NULL",
+            ExpectedResult{{"g", "SUM(x)"}, {{2, std::nullopt}}},
         },
         GoldenQuery{
             "having computes unprojected aggregate then final project drops it",
@@ -531,6 +601,16 @@ int main() {
             ExpectedResult{{"COUNT(*)"}, {{4}}},
         },
         GoldenQuery{
+            "distinct treats NULLs as equal for deduplication",
+            "SELECT DISTINCT g FROM agg_null",
+            ExpectedResult{{"g"}, {{std::nullopt}, {1}, {2}}},
+        },
+        GoldenQuery{
+            "distinct complete rows compare NULL slots for equality",
+            "SELECT DISTINCT g, h FROM agg_null",
+            ExpectedResult{{"g", "h"}, {{std::nullopt, 1}, {1, 1}, {1, 2}, {2, 1}, {std::nullopt, 2}}},
+        },
+        GoldenQuery{
             "distinct sorts after dedup and keeps tie order stable",
             "SELECT DISTINCT k, v FROM dup ORDER BY k DESC",
             ExpectedResult{{"k", "v"}, {{2, 20}, {1, 10}, {1, 11}}},
@@ -581,11 +661,16 @@ int main() {
             ExpectedResult{{"a", "COUNT(*)"}, {}},
         },
         GoldenQuery{
-            "sum over empty global group fails loudly",
-            "SELECT SUM(empty.a) FROM empty",
-            ExpectedResult{},
-            true,
-            ExpectedError{ErrorKind::Runtime, 0, "SUM(empty.a) over empty input has no NULL-free result"},
+            "SUM MIN MAX over empty global group return NULL",
+            "SELECT SUM(empty.a), MIN(empty.a), MAX(empty.a), COUNT(empty.a), COUNT(*) FROM empty",
+            ExpectedResult{{"SUM(empty.a)", "MIN(empty.a)", "MAX(empty.a)", "COUNT(empty.a)", "COUNT(*)"},
+                           {{std::nullopt, std::nullopt, std::nullopt, 0, 0}}},
+        },
+        GoldenQuery{
+            "SUM MIN MAX over all NULL global group return NULL",
+            "SELECT SUM(x), MIN(x), MAX(x), COUNT(x), COUNT(*) FROM agg_null WHERE g = 2",
+            ExpectedResult{{"SUM(x)", "MIN(x)", "MAX(x)", "COUNT(x)", "COUNT(*)"},
+                           {{std::nullopt, std::nullopt, std::nullopt, 0, 2}}},
         },
         GoldenQuery{
             "sum overflow fails loudly",
