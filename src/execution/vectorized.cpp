@@ -40,6 +40,10 @@ struct JoinPredicateSplit {
     std::vector<plan::BoundPredicate> residuals;
 };
 
+// HashKey keeps NULL as an explicit slot for GROUP BY and DISTINCT, where SQL
+// uses distinct-style equality. Hash joins avoid NULL slots with
+// make_non_null_key(), preserving comparison semantics where NULL = NULL is
+// UNKNOWN rather than TRUE.
 struct HashKey {
     std::vector<Cell> values;
 
@@ -734,23 +738,23 @@ void update_aggregate(AggregateValue& value,
     throw std::logic_error("unreachable aggregate function");
 }
 
-std::int64_t finalize_aggregate(const AggregateValue& value, const plan::AggregateExpression& aggregate) {
+Cell finalize_aggregate(const AggregateValue& value, const plan::AggregateExpression& aggregate) {
     switch (aggregate.function) {
     case sql::AggregateFunction::Count:
         return value.count;
     case sql::AggregateFunction::Sum:
         if (!value.has_value) {
-            throw std::runtime_error(aggregate.output_name + " over empty input has no NULL-free result");
+            return std::nullopt;
         }
         return value.sum;
     case sql::AggregateFunction::Min:
         if (!value.has_value) {
-            throw std::runtime_error(aggregate.output_name + " over empty input has no NULL-free result");
+            return std::nullopt;
         }
         return value.min;
     case sql::AggregateFunction::Max:
         if (!value.has_value) {
-            throw std::runtime_error(aggregate.output_name + " over empty input has no NULL-free result");
+            return std::nullopt;
         }
         return value.max;
     }
@@ -1049,6 +1053,18 @@ std::vector<CompiledSortKey> compile_sort_keys(const std::vector<plan::SortKey>&
     return compiled;
 }
 
+bool sort_cell_less(Cell left, Cell right, sql::SortDirection direction) {
+    if (left == right) {
+        return false;
+    }
+    const auto left_is_null = !left.has_value();
+    const auto right_is_null = !right.has_value();
+    if (left_is_null || right_is_null) {
+        return direction == sql::SortDirection::Asc ? right_is_null : left_is_null;
+    }
+    return direction == sql::SortDirection::Asc ? *left < *right : *left > *right;
+}
+
 SelectionVectorPtr sort_selection(const std::vector<plan::SortKey>& sort_keys, const BatchView& input) {
     validate_view(input);
 
@@ -1063,7 +1079,7 @@ SelectionVectorPtr sort_selection(const std::vector<plan::SortKey>& sort_keys, c
             if (left_value == right_value) {
                 continue;
             }
-            return key.direction == sql::SortDirection::Asc ? left_value < right_value : left_value > right_value;
+            return sort_cell_less(left_value, right_value, key.direction);
         }
         return false;
     });
@@ -1094,6 +1110,9 @@ storage::ColumnarBatch materialize_aggregate(const plan::PhysicalPlan& plan, con
     }
 
     for (auto row : *input.selection) {
+        // GROUP BY uses distinct-style key equality: explicit NULL slots in
+        // HashKey compare equal here. Hash joins call make_non_null_key()
+        // instead, so this equality never makes NULL match NULL in joins.
         std::size_t group_index = 0;
         if (!plan.group_keys.empty()) {
             auto key = make_key(row, group_keys);
@@ -1128,7 +1147,7 @@ storage::ColumnarBatch materialize_aggregate(const plan::PhysicalPlan& plan, con
         storage::Int64Column column;
         column.reserve(groups.size());
         for (const auto& group : groups) {
-            column.append(finalize_aggregate(group.aggregates.at(aggregate_index), aggregate));
+            append_cell(column, finalize_aggregate(group.aggregates.at(aggregate_index), aggregate));
         }
         out.add_column(aggregate.output_name, std::move(column));
     }
@@ -1156,6 +1175,8 @@ BatchView execute_distinct(const plan::PhysicalPlan& plan, const Catalog& catalo
     SelectionVector rows;
     rows.reserve(input.selection->size());
     for (auto row : *input.selection) {
+        // DISTINCT shares GROUP BY's key equality: rows with matching NULL
+        // slots deduplicate, independent of comparison or join semantics.
         auto key = make_key(row, output_columns);
         const auto [_, inserted] = seen.emplace(std::move(key));
         if (inserted) {

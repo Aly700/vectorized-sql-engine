@@ -156,6 +156,18 @@ inline std::optional<std::string> output_column_for_sort_key(const plan::SortKey
     return std::nullopt;
 }
 
+inline bool sort_cell_less(Cell left, Cell right, sql::SortDirection direction) {
+    if (left == right) {
+        return false;
+    }
+    const auto left_is_null = !left.has_value();
+    const auto right_is_null = !right.has_value();
+    if (left_is_null || right_is_null) {
+        return direction == sql::SortDirection::Asc ? right_is_null : left_is_null;
+    }
+    return direction == sql::SortDirection::Asc ? *left < *right : *left > *right;
+}
+
 inline bool is_sorted_by_keys(const storage::ColumnarBatch& batch, const std::vector<plan::SortKey>& keys) {
     for (const auto& key : keys) {
         if (!output_column_for_sort_key(key, batch).has_value()) {
@@ -171,10 +183,7 @@ inline bool is_sorted_by_keys(const storage::ColumnarBatch& batch, const std::ve
             if (previous == current) {
                 continue;
             }
-            if (key.direction == sql::SortDirection::Asc && previous > current) {
-                return false;
-            }
-            if (key.direction == sql::SortDirection::Desc && previous < current) {
+            if (sort_cell_less(current, previous, key.direction)) {
                 return false;
             }
             break;
@@ -353,9 +362,6 @@ inline std::size_t join_keyword_count(const std::string& sql) {
 inline std::optional<std::string> accepted_runtime_error_category(const std::string& message) {
     if (message.find("overflowed int64") != std::string::npos) {
         return std::string{"int64-overflow"};
-    }
-    if (message.find("over empty input has no NULL-free result") != std::string::npos) {
-        return std::string{"empty-input-aggregate"};
     }
     return std::nullopt;
 }

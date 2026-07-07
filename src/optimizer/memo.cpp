@@ -730,8 +730,8 @@ RelationEstimate aggregate_estimate(const std::vector<plan::BoundColumnRef>& gro
 
     // Aggregate performs one linear input pass plus one output pass over the
     // first-appearance group vector. Global aggregation returns one group even
-    // for empty input so COUNT(*) can produce zero before Phase 16b defines
-    // full aggregate NULL-result semantics.
+    // for empty input so COUNT(*) can produce zero and SUM/MIN/MAX can produce
+    // NULL under the aggregate result contract.
     estimate.cost = safe_add(safe_add(child.cost, child.rows), estimate.rows);
     for (const auto& key : group_keys) {
         const auto key_name = column_key(key);
