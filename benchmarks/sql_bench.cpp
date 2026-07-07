@@ -20,6 +20,7 @@ constexpr std::size_t kJoinLeftRows = 100'000;
 constexpr std::size_t kJoinRightRows = 256;
 constexpr std::size_t kEndToEndLeftRows = 120'000;
 constexpr std::size_t kEndToEndRightRows = 256;
+constexpr std::size_t kStringRows = 120'000;
 constexpr std::size_t kRepetitions = 5;
 
 std::uint64_t benchmark_sink = 0;
@@ -90,10 +91,18 @@ ResultSignature signature_for(const storage::ColumnarBatch& batch) {
     }
     for (std::size_t row = 0; row < batch.row_count(); ++row) {
         for (const auto& name : batch.column_names()) {
-            const auto& column = batch.column(name);
-            mix_byte(hash, column.is_null(row) ? 0 : 1);
-            if (!column.is_null(row)) {
-                mix_u64(hash, static_cast<std::uint64_t>(column.at(row)));
+            if (batch.column_type(name) == catalog::ColumnType::Int64) {
+                const auto& column = batch.column(name);
+                mix_byte(hash, column.is_null(row) ? 0 : 1);
+                if (!column.is_null(row)) {
+                    mix_u64(hash, static_cast<std::uint64_t>(column.at(row)));
+                }
+            } else {
+                const auto& column = batch.string_column(name);
+                mix_byte(hash, column.is_null(row) ? 0 : 1);
+                if (!column.is_null(row)) {
+                    mix_string(hash, column.at(row));
+                }
             }
         }
     }
@@ -115,6 +124,14 @@ void add_column(storage::ColumnarBatch& batch, std::string name, std::vector<std
     storage::Int64Column column;
     for (auto value : values) {
         column.append(value);
+    }
+    batch.add_column(std::move(name), std::move(column));
+}
+
+void add_string_column(storage::ColumnarBatch& batch, std::string name, std::vector<std::string> values) {
+    storage::StringColumn column;
+    for (auto& value : values) {
+        column.append(std::move(value));
     }
     batch.add_column(std::move(name), std::move(column));
 }
@@ -237,6 +254,41 @@ storage::ColumnarBatch make_e2e_right_table() {
     return batch;
 }
 
+storage::ColumnarBatch make_string_fact_table() {
+    static const std::vector<std::string> key_pool{
+        "",
+        "alpha",
+        "beta",
+        "gamma",
+        "delta",
+        "key000",
+        "key001",
+        "key002",
+        "key003",
+        "key004",
+        "key005",
+        "key006",
+        "key007",
+        "key008",
+        "key009",
+        "omega",
+    };
+
+    std::vector<std::string> k;
+    std::vector<std::string> label;
+    k.reserve(kStringRows);
+    label.reserve(kStringRows);
+    for (std::size_t row = 0; row < kStringRows; ++row) {
+        k.push_back(key_pool[row % key_pool.size()]);
+        label.push_back("label" + std::to_string((row * 17) % 4096));
+    }
+
+    storage::ColumnarBatch batch;
+    add_string_column(batch, "k", std::move(k));
+    add_string_column(batch, "label", std::move(label));
+    return batch;
+}
+
 execution::Catalog make_catalog() {
     execution::Catalog catalog;
     catalog.add_table("fact", make_fact_table());
@@ -244,6 +296,7 @@ execution::Catalog make_catalog() {
     catalog.add_table("join_right", make_join_right_table());
     catalog.add_table("e2e_left", make_e2e_left_table());
     catalog.add_table("e2e_right", make_e2e_right_table());
+    catalog.add_table("string_fact", make_string_fact_table());
     return catalog;
 }
 
@@ -288,6 +341,10 @@ std::vector<Workload> make_workloads(const execution::Catalog& catalog) {
         "WHERE l.filter_key < 80 "
         "GROUP BY l.group_id HAVING SUM(r.measure) > 0 "
         "ORDER BY total DESC LIMIT 20");
+    add("string_group_by",
+        "string_fact=120000,groups=16",
+        "SELECT k, COUNT(*) AS n, MIN(label) AS first_label, MAX(label) AS last_label "
+        "FROM string_fact GROUP BY k ORDER BY k ASC");
 
     return workloads;
 }

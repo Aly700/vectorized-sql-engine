@@ -758,12 +758,18 @@ bool run_join_oracle_corpus() {
 }
 
 execution::Catalog make_string_catalog() {
+    storage::Int64Column id;
+    for (auto value : {1, 2, 3, 4, 5}) {
+        id.append(value);
+    }
     storage::StringColumn s;
     s.append("b");
     s.append("");
     s.append_null();
     s.append("a");
+    s.append("");
     storage::ColumnarBatch strings;
+    strings.add_column("id", std::move(id));
     strings.add_column("s", std::move(s));
 
     storage::StringColumn l_k;
@@ -797,18 +803,22 @@ execution::Catalog make_string_catalog() {
     return catalog;
 }
 
-bool run_string_oracle_guard_corpus() {
+bool run_vectorized_string_corpus() {
     const auto catalog = make_string_catalog();
     const auto table_text =
-        "string tables: strings rows=[[b],[],[NULL],[a]], string_left rows=[[a,1],[NULL,2],[b,3]], "
+        "string tables: strings rows=[[1,b],[2,],[3,NULL],[4,a],[5,]], "
+        "string_left rows=[[a,1],[NULL,2],[b,3]], "
         "string_right rows=[[NULL,10],[b,11],[a,12]]";
     const std::vector<std::string> sqls{
-        "SELECT s FROM strings WHERE s = 'a' OR s = ''",
-        "SELECT s, COUNT(*) FROM strings GROUP BY s ORDER BY s ASC",
-        "SELECT MIN(s), MAX(s), COUNT(s), COUNT(*) FROM strings",
+        "SELECT id, s FROM strings WHERE s = 'a' OR s = '' ORDER BY s ASC, id ASC",
         "SELECT l.v, r.w FROM string_left AS l JOIN string_right AS r ON l.k = r.k ORDER BY l.v ASC",
+        "SELECT x.v, y.v FROM string_left AS x JOIN string_left AS y ON x.k = y.k ORDER BY x.v ASC, y.v ASC",
+        "SELECT MIN(s), MAX(s), COUNT(s), COUNT(*) FROM strings",
+        "SELECT s, COUNT(*) FROM strings GROUP BY s ORDER BY s ASC",
         "SELECT DISTINCT s FROM strings ORDER BY s DESC LIMIT 3",
-        "SELECT 'x' AS literal FROM strings LIMIT 1",
+        "SELECT s FROM strings ORDER BY s ASC LIMIT 3",
+        "SELECT id, s, 'x' AS literal FROM strings WHERE s IS NOT NULL ORDER BY id ASC",
+        "SELECT id, s FROM strings WHERE s = '' OR s IS NULL ORDER BY id ASC",
     };
 
     bool ok = true;
@@ -959,7 +969,7 @@ void assert_physical_lowering_shape() {
     assert(physical.input->input->table == "t");
 }
 
-void assert_physical_lowering_rejects_string_touching_plans() {
+void assert_physical_lowering_accepts_string_touching_plans() {
     storage::StringColumn s;
     s.append("a");
     s.append_null();
@@ -971,39 +981,30 @@ void assert_physical_lowering_rejects_string_touching_plans() {
 
     const auto string_column_plan =
         sql::bind_select(sql::parse_select("SELECT s FROM strings WHERE s = 'a'"), catalog);
-    bool saw_string_column_guard = false;
-    try {
-        (void)plan::lower_to_physical(string_column_plan);
-    } catch (const std::runtime_error& error) {
-        assert(std::string(error.what()) == "vectorized execution does not support VARCHAR/string plans in phase 17a");
-        saw_string_column_guard = true;
-    }
-    if (!saw_string_column_guard) {
-        throw std::logic_error("expected vectorized string column guard");
-    }
+    const auto physical = plan::lower_to_physical(string_column_plan);
+    assert(physical.kind == plan::PhysicalKind::Project);
+    const auto interpreted = execution::execute_interpreted(string_column_plan, catalog);
+    const auto vectorized = execution::execute_vectorized(string_column_plan, catalog);
+    assert(differential::same_batch(interpreted, vectorized));
 
     const auto int_catalog = make_golden_catalog();
     const auto string_literal_plan =
         sql::bind_select(sql::parse_select("SELECT 'x' AS x FROM t LIMIT 1"), int_catalog);
-    try {
-        (void)execution::execute_vectorized(string_literal_plan, int_catalog);
-    } catch (const std::runtime_error& error) {
-        assert(std::string(error.what()) == "vectorized execution does not support VARCHAR/string plans in phase 17a");
-        return;
-    }
-    throw std::logic_error("expected vectorized string guard");
+    const auto literal_interpreted = execution::execute_interpreted(string_literal_plan, int_catalog);
+    const auto literal_vectorized = execution::execute_vectorized(string_literal_plan, int_catalog);
+    assert(differential::same_batch(literal_interpreted, literal_vectorized));
 }
 
 } // namespace
 
 int main() {
     assert_physical_lowering_shape();
-    assert_physical_lowering_rejects_string_touching_plans();
+    assert_physical_lowering_accepts_string_touching_plans();
 
     bool ok = true;
     ok = run_result_golden_queries() && ok;
     ok = run_join_oracle_corpus() && ok;
-    ok = run_string_oracle_guard_corpus() && ok;
+    ok = run_vectorized_string_corpus() && ok;
     ok = run_generated_corpus() && ok;
     return ok ? 0 : 1;
 }

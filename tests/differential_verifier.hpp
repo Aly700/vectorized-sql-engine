@@ -386,72 +386,6 @@ inline bool contains_join(const plan::LogicalPlan& logical) {
     throw std::logic_error("unreachable logical plan kind");
 }
 
-inline bool scalar_touches_string(const plan::BoundScalarExpr& expression) {
-    return expression.type == catalog::ColumnType::String;
-}
-
-inline bool predicate_touches_string(const plan::BoundPredicate& predicate) {
-    switch (predicate.kind) {
-    case sql::PredicateKind::Comparison:
-        return scalar_touches_string(predicate.comparison.left) || scalar_touches_string(predicate.comparison.right);
-    case sql::PredicateKind::IsNull:
-    case sql::PredicateKind::IsNotNull:
-        return scalar_touches_string(predicate.null_check);
-    case sql::PredicateKind::And:
-    case sql::PredicateKind::Or:
-        if (predicate.left == nullptr || predicate.right == nullptr) {
-            throw std::logic_error("bound predicate is missing a child");
-        }
-        return predicate_touches_string(*predicate.left) || predicate_touches_string(*predicate.right);
-    }
-    throw std::logic_error("unreachable predicate kind");
-}
-
-inline bool plan_touches_string(const plan::LogicalPlan& logical) {
-    for (const auto& projection : logical.projections) {
-        if (projection.type == catalog::ColumnType::String || scalar_touches_string(projection.expression)) {
-            return true;
-        }
-    }
-    for (const auto& key : logical.group_keys) {
-        if (key.type == catalog::ColumnType::String) {
-            return true;
-        }
-    }
-    for (const auto& aggregate : logical.aggregate_expressions) {
-        if (aggregate.type == catalog::ColumnType::String ||
-            (aggregate.argument.has_value() && aggregate.argument->type == catalog::ColumnType::String)) {
-            return true;
-        }
-    }
-    for (const auto& key : logical.sort_keys) {
-        if (key.column.type == catalog::ColumnType::String) {
-            return true;
-        }
-    }
-    for (const auto& predicate : logical.predicates) {
-        if (predicate_touches_string(predicate)) {
-            return true;
-        }
-    }
-
-    switch (logical.kind) {
-    case plan::LogicalKind::Scan:
-        return false;
-    case plan::LogicalKind::Join:
-        return logical.left != nullptr && logical.right != nullptr &&
-               (plan_touches_string(*logical.left) || plan_touches_string(*logical.right));
-    case plan::LogicalKind::Filter:
-    case plan::LogicalKind::Project:
-    case plan::LogicalKind::Aggregate:
-    case plan::LogicalKind::Sort:
-    case plan::LogicalKind::Distinct:
-    case plan::LogicalKind::Limit:
-        return logical.input != nullptr && plan_touches_string(*logical.input);
-    }
-    throw std::logic_error("unreachable logical plan kind");
-}
-
 inline std::size_t join_keyword_count(const std::string& sql) {
     std::size_t count = 0;
     std::size_t pos = 0;
@@ -465,9 +399,6 @@ inline std::size_t join_keyword_count(const std::string& sql) {
 inline std::optional<std::string> accepted_runtime_error_category(const std::string& message) {
     if (message.find("overflowed int64") != std::string::npos) {
         return std::string{"int64-overflow"};
-    }
-    if (message == "vectorized execution does not support VARCHAR/string plans in phase 17a") {
-        return std::string{"vectorized-string-not-supported"};
     }
     return std::nullopt;
 }
@@ -553,12 +484,6 @@ inline bool verify_error_pair(const ExecutionOutcome& unrewritten_oracle,
     return false;
 }
 
-inline bool is_vectorized_string_guard(const ExecutionOutcome& outcome) {
-    return !outcome.batch.has_value() && !outcome.unexpected_error && outcome.error_category.has_value() &&
-           *outcome.error_category == "vectorized-string-not-supported" &&
-           outcome.error_message == "vectorized execution does not support VARCHAR/string plans in phase 17a";
-}
-
 inline bool verify_result_pair(const storage::ColumnarBatch& unrewritten_oracle,
                                const storage::ColumnarBatch& full_unlimited_oracle,
                                const ExecutionOutcome& candidate_oracle,
@@ -572,13 +497,9 @@ inline bool verify_result_pair(const storage::ColumnarBatch& unrewritten_oracle,
                                bool is_ordered_query,
                                const std::vector<plan::SortKey>* order_keys,
                                std::optional<std::size_t> limit_count,
-                               bool expect_vectorized_string_guard,
                                const std::string& memo_text = {}) {
     const auto* candidate_order_keys = root_sort_keys(candidate_plan);
-    const auto candidate_has_results =
-        candidate_oracle.batch.has_value() &&
-        (expect_vectorized_string_guard ? is_vectorized_string_guard(candidate_vectorized)
-                                        : candidate_vectorized.batch.has_value());
+    const auto candidate_has_results = candidate_oracle.batch.has_value() && candidate_vectorized.batch.has_value();
     const auto ordered_outputs_are_sorted =
         candidate_has_results &&
         (!is_ordered_query ||
@@ -591,16 +512,13 @@ inline bool verify_result_pair(const storage::ColumnarBatch& unrewritten_oracle,
              : is_ordered_query || is_join_query ? same_sorted_bag(unrewritten_oracle, *candidate_oracle.batch)
                                                  : same_batch(unrewritten_oracle, *candidate_oracle.batch));
     const auto vectorized_equal =
-        candidate_has_results &&
-        (expect_vectorized_string_guard ? is_vectorized_string_guard(candidate_vectorized)
-                                        : same_batch(*candidate_oracle.batch, *candidate_vectorized.batch));
+        candidate_has_results && same_batch(*candidate_oracle.batch, *candidate_vectorized.batch);
     const auto column_sets_match =
         candidate_has_results && same_column_identity_set(unrewritten_oracle, *candidate_oracle.batch) &&
-        (expect_vectorized_string_guard ||
-         same_column_identity_set(*candidate_oracle.batch, *candidate_vectorized.batch));
+        same_column_identity_set(*candidate_oracle.batch, *candidate_vectorized.batch);
     const auto output_order_matches =
         candidate_has_results && same_column_order(unrewritten_oracle, *candidate_oracle.batch) &&
-        (expect_vectorized_string_guard || same_column_order(*candidate_oracle.batch, *candidate_vectorized.batch));
+        same_column_order(*candidate_oracle.batch, *candidate_vectorized.batch);
 
     if (cross_plan_equal && vectorized_equal && column_sets_match && output_order_matches &&
         ordered_outputs_are_sorted) {
@@ -641,7 +559,6 @@ inline bool compare_engines(const std::string& sql,
     try {
         const auto parsed = sql::parse_select(sql);
         const auto logical = sql::bind_select(parsed, catalog);
-        const auto original_touches_string = plan_touches_string(logical);
         const auto is_join_query = contains_join(logical);
         const auto* order_keys = root_sort_keys(logical);
         const auto limit_count = root_limit_count(logical);
@@ -747,7 +664,6 @@ inline bool compare_engines(const std::string& sql,
                                       is_ordered_query,
                                       order_keys,
                                       limit_count,
-                                      original_touches_string || plan_touches_string(candidate_plan),
                                       memo_text);
         };
 

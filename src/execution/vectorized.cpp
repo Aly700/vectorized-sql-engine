@@ -17,9 +17,8 @@
 namespace execution {
 namespace {
 
-using Cell = std::optional<std::int64_t>;
-
 enum class TruthValue { False, True, Unknown };
+enum class KernelDispatch { Int64Only, Typed };
 
 using SelectionVector = std::vector<std::size_t>;
 using SelectionVectorPtr = std::shared_ptr<const SelectionVector>;
@@ -40,12 +39,68 @@ struct JoinPredicateSplit {
     std::vector<plan::BoundPredicate> residuals;
 };
 
-// HashKey keeps NULL as an explicit slot for GROUP BY and DISTINCT, where SQL
-// uses distinct-style equality. Hash joins avoid NULL slots with
+struct TypedCell {
+    catalog::ColumnType type{catalog::ColumnType::Int64};
+    bool is_null{true};
+    std::int64_t int_value{0};
+    std::string string_value;
+};
+
+bool operator==(const TypedCell& left, const TypedCell& right) {
+    if (left.type != right.type) {
+        return false;
+    }
+    if (left.is_null || right.is_null) {
+        return left.is_null == right.is_null;
+    }
+    return left.type == catalog::ColumnType::Int64 ? left.int_value == right.int_value
+                                                   : left.string_value == right.string_value;
+}
+
+TypedCell null_cell(catalog::ColumnType type) {
+    TypedCell cell;
+    cell.type = type;
+    cell.is_null = true;
+    return cell;
+}
+
+TypedCell int_cell(std::int64_t value) {
+    TypedCell cell;
+    cell.type = catalog::ColumnType::Int64;
+    cell.is_null = false;
+    cell.int_value = value;
+    return cell;
+}
+
+TypedCell string_cell(std::string value) {
+    TypedCell cell;
+    cell.type = catalog::ColumnType::String;
+    cell.is_null = false;
+    cell.string_value = std::move(value);
+    return cell;
+}
+
+std::size_t hash_cell(const TypedCell& cell) {
+    std::size_t seed = static_cast<std::size_t>(cell.type);
+    const auto hashed = [&] {
+        if (cell.is_null) {
+            return std::size_t{0x517cc1b727220a95ULL};
+        }
+        if (cell.type == catalog::ColumnType::Int64) {
+            return std::hash<std::int64_t>{}(cell.int_value);
+        }
+        return std::hash<std::string>{}(cell.string_value);
+    }();
+    seed ^= hashed + 0x9e3779b97f4a7c15ULL + (seed << 6U) + (seed >> 2U);
+    return seed;
+}
+
+// HashKey keeps NULL as an explicit typed slot for GROUP BY and DISTINCT, where
+// SQL uses distinct-style equality. Hash joins avoid NULL slots with
 // make_non_null_key(), preserving comparison semantics where NULL = NULL is
 // UNKNOWN rather than TRUE.
 struct HashKey {
-    std::vector<Cell> values;
+    std::vector<TypedCell> values;
 
     bool operator==(const HashKey& other) const { return values == other.values; }
 };
@@ -53,8 +108,8 @@ struct HashKey {
 struct HashKeyHash {
     std::size_t operator()(const HashKey& key) const {
         std::size_t seed = key.values.size();
-        for (auto value : key.values) {
-            const auto hashed = value.has_value() ? std::hash<std::int64_t>{}(*value) : 0x517cc1b727220a95ULL;
+        for (const auto& value : key.values) {
+            const auto hashed = hash_cell(value);
             seed ^= hashed + 0x9e3779b97f4a7c15ULL + (seed << 6U) + (seed >> 2U);
         }
         return seed;
@@ -62,24 +117,72 @@ struct HashKeyHash {
 };
 
 struct CompiledColumn {
-    const std::vector<std::int64_t>* values{nullptr};
+    catalog::ColumnType type{catalog::ColumnType::Int64};
+    const std::vector<std::int64_t>* int_values{nullptr};
+    const std::vector<std::string>* string_values{nullptr};
     const std::vector<std::uint8_t>* validity{nullptr};
 
     [[nodiscard]] bool is_null(std::size_t row) const {
         return validity != nullptr && (*validity)[row] == 0;
     }
 
-    [[nodiscard]] Cell cell(std::size_t row) const {
+    [[nodiscard]] TypedCell cell(std::size_t row) const {
         if (is_null(row)) {
-            return std::nullopt;
+            return null_cell(type);
         }
-        return (*values)[row];
+        if (type == catalog::ColumnType::Int64) {
+            return int_cell((*int_values)[row]);
+        }
+        return string_cell((*string_values)[row]);
+    }
+};
+
+struct TypedColumnBuilder {
+    catalog::ColumnType type{catalog::ColumnType::Int64};
+    storage::Int64Column int64;
+    storage::StringColumn string;
+
+    explicit TypedColumnBuilder(catalog::ColumnType column_type) : type(column_type) {}
+
+    void reserve(std::size_t count) {
+        if (type == catalog::ColumnType::Int64) {
+            int64.reserve(count);
+        } else {
+            string.reserve(count);
+        }
+    }
+
+    void append(const TypedCell& cell) {
+        if (cell.type != type) {
+            throw std::logic_error("typed column builder received a cell with the wrong type");
+        }
+        if (type == catalog::ColumnType::Int64) {
+            if (cell.is_null) {
+                int64.append_null();
+            } else {
+                int64.append(cell.int_value);
+            }
+            return;
+        }
+        if (cell.is_null) {
+            string.append_null();
+        } else {
+            string.append(cell.string_value);
+        }
+    }
+
+    void add_to(storage::ColumnarBatch& batch, std::string name) && {
+        if (type == catalog::ColumnType::Int64) {
+            batch.add_column(std::move(name), std::move(int64));
+        } else {
+            batch.add_column(std::move(name), std::move(string));
+        }
     }
 };
 
 struct JoinOutputBuilder {
     std::vector<std::string> names;
-    std::vector<storage::Int64Column> columns;
+    std::vector<TypedColumnBuilder> columns;
     std::vector<CompiledColumn> left_columns;
     std::vector<CompiledColumn> right_columns;
 };
@@ -89,6 +192,8 @@ struct AggregateValue {
     std::int64_t sum{0};
     std::int64_t min{0};
     std::int64_t max{0};
+    std::string string_min;
+    std::string string_max;
     bool has_value{false};
 };
 
@@ -98,23 +203,30 @@ struct AggregateGroupState {
 };
 
 struct CompiledScalar {
-    const std::vector<std::int64_t>* column_values{nullptr};
+    catalog::ColumnType type{catalog::ColumnType::Int64};
+    const std::vector<std::int64_t>* column_int_values{nullptr};
+    const std::vector<std::string>* column_string_values{nullptr};
     const std::vector<std::uint8_t>* column_validity{nullptr};
     std::int64_t literal{0};
+    std::string string_literal;
     bool literal_is_null{false};
 
     [[nodiscard]] bool is_null(std::size_t row) const {
-        if (column_values == nullptr) {
+        if (column_int_values == nullptr && column_string_values == nullptr) {
             return literal_is_null;
         }
         return column_validity != nullptr && (*column_validity)[row] == 0;
     }
 
-    [[nodiscard]] Cell cell(std::size_t row) const {
+    [[nodiscard]] TypedCell cell(std::size_t row) const {
         if (is_null(row)) {
-            return std::nullopt;
+            return null_cell(type);
         }
-        return column_values == nullptr ? literal : (*column_values)[row];
+        if (type == catalog::ColumnType::Int64) {
+            return column_int_values == nullptr ? int_cell(literal) : int_cell((*column_int_values)[row]);
+        }
+        return column_string_values == nullptr ? string_cell(string_literal)
+                                               : string_cell((*column_string_values)[row]);
     }
 };
 
@@ -138,40 +250,42 @@ struct CompiledProjection {
 };
 
 struct CompiledSortKey {
-    const std::vector<std::int64_t>* values{nullptr};
+    catalog::ColumnType type{catalog::ColumnType::Int64};
+    const std::vector<std::int64_t>* int_values{nullptr};
+    const std::vector<std::string>* string_values{nullptr};
     const std::vector<std::uint8_t>* validity{nullptr};
     sql::SortDirection direction{sql::SortDirection::Asc};
 };
 
 struct CompiledJoinScalar {
-    const std::vector<std::int64_t>* left_values{nullptr};
-    const std::vector<std::uint8_t>* left_validity{nullptr};
-    const std::vector<std::int64_t>* right_values{nullptr};
-    const std::vector<std::uint8_t>* right_validity{nullptr};
+    enum class Source { Literal, Left, Right };
+
+    Source source{Source::Literal};
+    catalog::ColumnType type{catalog::ColumnType::Int64};
+    const std::vector<std::int64_t>* int_values{nullptr};
+    const std::vector<std::string>* string_values{nullptr};
+    const std::vector<std::uint8_t>* validity{nullptr};
     std::int64_t literal{0};
+    std::string string_literal;
     bool literal_is_null{false};
 
     [[nodiscard]] bool is_null(std::size_t left_row, std::size_t right_row) const {
-        if (left_values != nullptr) {
-            return left_validity != nullptr && (*left_validity)[left_row] == 0;
-        }
-        if (right_values != nullptr) {
-            return right_validity != nullptr && (*right_validity)[right_row] == 0;
+        if (source != Source::Literal) {
+            const auto row = source == Source::Left ? left_row : right_row;
+            return validity != nullptr && (*validity)[row] == 0;
         }
         return literal_is_null;
     }
 
-    [[nodiscard]] Cell cell(std::size_t left_row, std::size_t right_row) const {
+    [[nodiscard]] TypedCell cell(std::size_t left_row, std::size_t right_row) const {
         if (is_null(left_row, right_row)) {
-            return std::nullopt;
+            return null_cell(type);
         }
-        if (left_values != nullptr) {
-            return (*left_values)[left_row];
+        if (source == Source::Literal) {
+            return type == catalog::ColumnType::Int64 ? int_cell(literal) : string_cell(string_literal);
         }
-        if (right_values != nullptr) {
-            return (*right_values)[right_row];
-        }
-        return literal;
+        const auto row = source == Source::Left ? left_row : right_row;
+        return type == catalog::ColumnType::Int64 ? int_cell((*int_values)[row]) : string_cell((*string_values)[row]);
     }
 };
 
@@ -191,7 +305,8 @@ struct CompiledJoinPredicate {
 
 struct CompiledAggregateExpression {
     const plan::AggregateExpression* aggregate{nullptr};
-    const std::vector<std::int64_t>* argument_values{nullptr};
+    const std::vector<std::int64_t>* argument_int_values{nullptr};
+    const std::vector<std::string>* argument_string_values{nullptr};
     const std::vector<std::uint8_t>* argument_validity{nullptr};
 };
 
@@ -208,12 +323,8 @@ SelectionVectorPtr identity_selection(std::size_t row_count) {
     return make_selection(std::move(rows));
 }
 
-void append_cell(storage::Int64Column& column, Cell value) {
-    if (value.has_value()) {
-        column.append(*value);
-    } else {
-        column.append_null();
-    }
+void append_cell(TypedColumnBuilder& column, const TypedCell& value) {
+    column.append(value);
 }
 
 void validate_view(const BatchView& view) {
@@ -238,14 +349,37 @@ std::string column_identity_name(const plan::BoundColumnRef& column) {
 }
 
 CompiledColumn compile_column(const plan::BoundColumnRef& column, const storage::ColumnarBatch& batch) {
-    const auto& storage_column = batch.column(column_identity_name(column));
-    return CompiledColumn{&storage_column.values(),
+    const auto name = column_identity_name(column);
+    if (batch.column_type(name) != column.type) {
+        throw std::logic_error("bound column type does not match storage column: " + name);
+    }
+    if (column.type == catalog::ColumnType::Int64) {
+        const auto& storage_column = batch.column(name);
+        return CompiledColumn{column.type,
+                              &storage_column.values(),
+                              nullptr,
+                              storage_column.has_nulls() ? &storage_column.validity() : nullptr};
+    }
+    const auto& storage_column = batch.string_column(name);
+    return CompiledColumn{column.type,
+                          nullptr,
+                          &storage_column.values(),
                           storage_column.has_nulls() ? &storage_column.validity() : nullptr};
 }
 
 CompiledColumn compile_named_column(const storage::ColumnarBatch& batch, const std::string& name) {
-    const auto& storage_column = batch.column(name);
-    return CompiledColumn{&storage_column.values(),
+    const auto type = batch.column_type(name);
+    if (type == catalog::ColumnType::Int64) {
+        const auto& storage_column = batch.column(name);
+        return CompiledColumn{type,
+                              &storage_column.values(),
+                              nullptr,
+                              storage_column.has_nulls() ? &storage_column.validity() : nullptr};
+    }
+    const auto& storage_column = batch.string_column(name);
+    return CompiledColumn{type,
+                          nullptr,
+                          &storage_column.values(),
                           storage_column.has_nulls() ? &storage_column.validity() : nullptr};
 }
 
@@ -271,9 +405,20 @@ std::vector<CompiledColumn> compile_named_columns(const storage::ColumnarBatch& 
 
 CompiledScalar compile_scalar(const plan::BoundScalarExpr& expression, const storage::ColumnarBatch& batch) {
     CompiledScalar compiled;
+    compiled.type = expression.type;
     if (const auto* column = std::get_if<plan::BoundColumnRef>(&expression.value)) {
-        const auto& storage_column = batch.column(column_identity_name(*column));
-        compiled.column_values = &storage_column.values();
+        const auto name = column_identity_name(*column);
+        if (batch.column_type(name) != expression.type) {
+            throw std::logic_error("bound scalar type does not match storage column: " + name);
+        }
+        if (expression.type == catalog::ColumnType::Int64) {
+            const auto& storage_column = batch.column(name);
+            compiled.column_int_values = &storage_column.values();
+            compiled.column_validity = storage_column.has_nulls() ? &storage_column.validity() : nullptr;
+            return compiled;
+        }
+        const auto& storage_column = batch.string_column(name);
+        compiled.column_string_values = &storage_column.values();
         compiled.column_validity = storage_column.has_nulls() ? &storage_column.validity() : nullptr;
         return compiled;
     }
@@ -281,11 +426,15 @@ CompiledScalar compile_scalar(const plan::BoundScalarExpr& expression, const sto
         compiled.literal = literal->value;
         return compiled;
     }
+    if (const auto* literal = std::get_if<sql::StringLiteral>(&expression.value)) {
+        compiled.string_literal = literal->value;
+        return compiled;
+    }
     compiled.literal_is_null = true;
     return compiled;
 }
 
-bool compare_values(std::int64_t left, sql::ComparisonOp op, std::int64_t right) {
+bool compare_int_values(std::int64_t left, sql::ComparisonOp op, std::int64_t right) {
     switch (op) {
     case sql::ComparisonOp::Equal:
         return left == right;
@@ -301,6 +450,32 @@ bool compare_values(std::int64_t left, sql::ComparisonOp op, std::int64_t right)
         return left >= right;
     }
     throw std::logic_error("unreachable comparison operator");
+}
+
+bool compare_string_values(const std::string& left, sql::ComparisonOp op, const std::string& right) {
+    switch (op) {
+    case sql::ComparisonOp::Equal:
+        return left == right;
+    case sql::ComparisonOp::NotEqual:
+        return left != right;
+    case sql::ComparisonOp::Less:
+        return left < right;
+    case sql::ComparisonOp::LessEqual:
+        return left <= right;
+    case sql::ComparisonOp::Greater:
+        return left > right;
+    case sql::ComparisonOp::GreaterEqual:
+        return left >= right;
+    }
+    throw std::logic_error("unreachable comparison operator");
+}
+
+bool compare_cells(const TypedCell& left, sql::ComparisonOp op, const TypedCell& right) {
+    if (left.type != right.type) {
+        throw std::logic_error("typed comparison received mismatched cell types");
+    }
+    return left.type == catalog::ColumnType::Int64 ? compare_int_values(left.int_value, op, right.int_value)
+                                                   : compare_string_values(left.string_value, op, right.string_value);
 }
 
 TruthValue truth_from_bool(bool value) {
@@ -339,10 +514,10 @@ CompiledComparison compile_comparison(const plan::BoundComparisonExpr& compariso
 TruthValue evaluate_comparison(const CompiledComparison& comparison, std::size_t row) {
     const auto left = comparison.left.cell(row);
     const auto right = comparison.right.cell(row);
-    if (!left.has_value() || !right.has_value()) {
+    if (left.is_null || right.is_null) {
         return TruthValue::Unknown;
     }
-    return truth_from_bool(compare_values(*left, comparison.op, *right));
+    return truth_from_bool(compare_cells(left, comparison.op, right));
 }
 
 const plan::BoundPredicate& require_left_predicate(const plan::BoundPredicate& predicate) {
@@ -440,24 +615,49 @@ CompiledJoinScalar compile_join_scalar(const plan::BoundScalarExpr& expression,
                                        const storage::ColumnarBatch& left,
                                        const storage::ColumnarBatch& right) {
     CompiledJoinScalar compiled;
+    compiled.type = expression.type;
     if (const auto* column = std::get_if<plan::BoundColumnRef>(&expression.value)) {
         const auto name = column_identity_name(*column);
         if (left.has_column(name)) {
-            const auto& storage_column = left.column(name);
-            compiled.left_values = &storage_column.values();
-            compiled.left_validity = storage_column.has_nulls() ? &storage_column.validity() : nullptr;
+            if (left.column_type(name) != expression.type) {
+                throw std::logic_error("bound join scalar type does not match left storage column: " + name);
+            }
+            compiled.source = CompiledJoinScalar::Source::Left;
+            if (expression.type == catalog::ColumnType::Int64) {
+                const auto& storage_column = left.column(name);
+                compiled.int_values = &storage_column.values();
+                compiled.validity = storage_column.has_nulls() ? &storage_column.validity() : nullptr;
+            } else {
+                const auto& storage_column = left.string_column(name);
+                compiled.string_values = &storage_column.values();
+                compiled.validity = storage_column.has_nulls() ? &storage_column.validity() : nullptr;
+            }
             return compiled;
         }
         if (right.has_column(name)) {
-            const auto& storage_column = right.column(name);
-            compiled.right_values = &storage_column.values();
-            compiled.right_validity = storage_column.has_nulls() ? &storage_column.validity() : nullptr;
+            if (right.column_type(name) != expression.type) {
+                throw std::logic_error("bound join scalar type does not match right storage column: " + name);
+            }
+            compiled.source = CompiledJoinScalar::Source::Right;
+            if (expression.type == catalog::ColumnType::Int64) {
+                const auto& storage_column = right.column(name);
+                compiled.int_values = &storage_column.values();
+                compiled.validity = storage_column.has_nulls() ? &storage_column.validity() : nullptr;
+            } else {
+                const auto& storage_column = right.string_column(name);
+                compiled.string_values = &storage_column.values();
+                compiled.validity = storage_column.has_nulls() ? &storage_column.validity() : nullptr;
+            }
             return compiled;
         }
         throw std::logic_error("bound join column identity is missing from both inputs: " + name);
     }
     if (const auto* literal = std::get_if<sql::IntLiteral>(&expression.value)) {
         compiled.literal = literal->value;
+        return compiled;
+    }
+    if (const auto* literal = std::get_if<sql::StringLiteral>(&expression.value)) {
+        compiled.string_literal = literal->value;
         return compiled;
     }
     compiled.literal_is_null = true;
@@ -479,10 +679,10 @@ TruthValue evaluate_join_comparison(const CompiledJoinComparison& comparison,
                                     std::size_t right_row) {
     const auto left = comparison.left.cell(left_row, right_row);
     const auto right = comparison.right.cell(left_row, right_row);
-    if (!left.has_value() || !right.has_value()) {
+    if (left.is_null || right.is_null) {
         return TruthValue::Unknown;
     }
-    return truth_from_bool(compare_values(*left, comparison.op, *right));
+    return truth_from_bool(compare_cells(left, comparison.op, right));
 }
 
 const CompiledJoinPredicate& require_left_predicate(const CompiledJoinPredicate& predicate) {
@@ -632,7 +832,7 @@ std::optional<HashKey> make_non_null_key(std::size_t row, const std::vector<Comp
     key.values.reserve(key_columns.size());
     for (const auto& column : key_columns) {
         const auto value = column.cell(row);
-        if (!value.has_value()) {
+        if (value.is_null) {
             return std::nullopt;
         }
         key.values.push_back(value);
@@ -660,9 +860,19 @@ CompiledAggregateExpression compile_aggregate_expression(const plan::AggregateEx
     CompiledAggregateExpression compiled;
     compiled.aggregate = &aggregate;
     if (aggregate.argument.has_value()) {
-        const auto& storage_column = batch.column(column_identity_name(*aggregate.argument));
-        compiled.argument_values = &storage_column.values();
-        compiled.argument_validity = storage_column.has_nulls() ? &storage_column.validity() : nullptr;
+        const auto name = column_identity_name(*aggregate.argument);
+        if (batch.column_type(name) != aggregate.argument->type) {
+            throw std::logic_error("aggregate argument type does not match storage column: " + name);
+        }
+        if (aggregate.argument->type == catalog::ColumnType::Int64) {
+            const auto& storage_column = batch.column(name);
+            compiled.argument_int_values = &storage_column.values();
+            compiled.argument_validity = storage_column.has_nulls() ? &storage_column.validity() : nullptr;
+        } else {
+            const auto& storage_column = batch.string_column(name);
+            compiled.argument_string_values = &storage_column.values();
+            compiled.argument_validity = storage_column.has_nulls() ? &storage_column.validity() : nullptr;
+        }
     }
     return compiled;
 }
@@ -678,14 +888,18 @@ std::vector<CompiledAggregateExpression> compile_aggregate_expressions(
     return compiled;
 }
 
-Cell aggregate_argument_value(const CompiledAggregateExpression& aggregate, std::size_t row) {
-    if (aggregate.argument_values == nullptr) {
+TypedCell aggregate_argument_value(const CompiledAggregateExpression& aggregate, std::size_t row) {
+    const auto& expression = *aggregate.aggregate;
+    if (!expression.argument.has_value()) {
         throw std::logic_error("aggregate argument is missing");
     }
     if (aggregate.argument_validity != nullptr && (*aggregate.argument_validity)[row] == 0) {
-        return std::nullopt;
+        return null_cell(expression.argument->type);
     }
-    return (*aggregate.argument_values)[row];
+    if (expression.argument->type == catalog::ColumnType::Int64) {
+        return int_cell((*aggregate.argument_int_values)[row]);
+    }
+    return string_cell((*aggregate.argument_string_values)[row]);
 }
 
 void update_aggregate(AggregateValue& value,
@@ -694,42 +908,50 @@ void update_aggregate(AggregateValue& value,
     const auto& aggregate = *compiled.aggregate;
     switch (aggregate.function) {
     case sql::AggregateFunction::Count:
-        if (aggregate.argument.has_value() && !aggregate_argument_value(compiled, row).has_value()) {
+        if (aggregate.argument.has_value() && aggregate_argument_value(compiled, row).is_null) {
             return;
         }
         increment_count(value, aggregate.output_name);
         return;
     case sql::AggregateFunction::Sum: {
         const auto argument = aggregate_argument_value(compiled, row);
-        if (!argument.has_value()) {
+        if (argument.is_null) {
             return;
         }
         if (!value.has_value) {
-            value.sum = *argument;
+            value.sum = argument.int_value;
             value.has_value = true;
             return;
         }
-        value.sum = checked_sum(value.sum, *argument, aggregate.output_name);
+        value.sum = checked_sum(value.sum, argument.int_value, aggregate.output_name);
         return;
     }
     case sql::AggregateFunction::Min: {
         const auto argument = aggregate_argument_value(compiled, row);
-        if (!argument.has_value()) {
+        if (argument.is_null) {
             return;
         }
-        if (!value.has_value || *argument < value.min) {
-            value.min = *argument;
+        if (aggregate.type == catalog::ColumnType::Int64) {
+            if (!value.has_value || argument.int_value < value.min) {
+                value.min = argument.int_value;
+            }
+        } else if (!value.has_value || argument.string_value < value.string_min) {
+            value.string_min = argument.string_value;
         }
         value.has_value = true;
         return;
     }
     case sql::AggregateFunction::Max: {
         const auto argument = aggregate_argument_value(compiled, row);
-        if (!argument.has_value()) {
+        if (argument.is_null) {
             return;
         }
-        if (!value.has_value || *argument > value.max) {
-            value.max = *argument;
+        if (aggregate.type == catalog::ColumnType::Int64) {
+            if (!value.has_value || argument.int_value > value.max) {
+                value.max = argument.int_value;
+            }
+        } else if (!value.has_value || argument.string_value > value.string_max) {
+            value.string_max = argument.string_value;
         }
         value.has_value = true;
         return;
@@ -738,25 +960,25 @@ void update_aggregate(AggregateValue& value,
     throw std::logic_error("unreachable aggregate function");
 }
 
-Cell finalize_aggregate(const AggregateValue& value, const plan::AggregateExpression& aggregate) {
+TypedCell finalize_aggregate(const AggregateValue& value, const plan::AggregateExpression& aggregate) {
     switch (aggregate.function) {
     case sql::AggregateFunction::Count:
-        return value.count;
+        return int_cell(value.count);
     case sql::AggregateFunction::Sum:
         if (!value.has_value) {
-            return std::nullopt;
+            return null_cell(catalog::ColumnType::Int64);
         }
-        return value.sum;
+        return int_cell(value.sum);
     case sql::AggregateFunction::Min:
         if (!value.has_value) {
-            return std::nullopt;
+            return null_cell(aggregate.type);
         }
-        return value.min;
+        return aggregate.type == catalog::ColumnType::Int64 ? int_cell(value.min) : string_cell(value.string_min);
     case sql::AggregateFunction::Max:
         if (!value.has_value) {
-            return std::nullopt;
+            return null_cell(aggregate.type);
         }
-        return value.max;
+        return aggregate.type == catalog::ColumnType::Int64 ? int_cell(value.max) : string_cell(value.string_max);
     }
     throw std::logic_error("unreachable aggregate function");
 }
@@ -773,13 +995,15 @@ JoinOutputBuilder make_join_output_builder(const storage::ColumnarBatch& left,
     JoinOutputBuilder builder;
     builder.names = left.column_names();
     builder.names.insert(builder.names.end(), right.column_names().begin(), right.column_names().end());
-    builder.columns.resize(builder.names.size());
+    builder.columns.reserve(builder.names.size());
     builder.left_columns.reserve(left.column_names().size());
     for (const auto& column_name : left.column_names()) {
+        builder.columns.emplace_back(left.column_type(column_name));
         builder.left_columns.push_back(compile_named_column(left, column_name));
     }
     builder.right_columns.reserve(right.column_names().size());
     for (const auto& column_name : right.column_names()) {
+        builder.columns.emplace_back(right.column_type(column_name));
         builder.right_columns.push_back(compile_named_column(right, column_name));
     }
     return builder;
@@ -800,7 +1024,7 @@ void append_joined_row(JoinOutputBuilder& builder,
 storage::ColumnarBatch finish_join_output(JoinOutputBuilder builder) {
     storage::ColumnarBatch out;
     for (std::size_t i = 0; i < builder.names.size(); ++i) {
-        out.add_column(builder.names[i], std::move(builder.columns[i]));
+        std::move(builder.columns[i]).add_to(out, std::move(builder.names[i]));
     }
     return out;
 }
@@ -984,24 +1208,27 @@ storage::ColumnarBatch materialize_projection(const plan::PhysicalPlan& plan, co
 
     storage::ColumnarBatch out;
     for (const auto& projection : projections) {
-        storage::Int64Column column;
+        TypedColumnBuilder column(projection.expression.type);
         column.reserve(input.selection->size());
         for (auto row : *input.selection) {
             append_cell(column, projection.expression.cell(row));
         }
-        out.add_column(projection.output_name, std::move(column));
+        std::move(column).add_to(out, projection.output_name);
     }
     return out;
 }
 
-storage::Int64Column materialize_selected_column(const BatchView& input, const std::string& name) {
-    storage::Int64Column column;
+void add_materialized_selected_column(storage::ColumnarBatch& out,
+                                      const BatchView& input,
+                                      std::string output_name,
+                                      const std::string& input_name) {
+    TypedColumnBuilder column(input.batch->column_type(input_name));
     column.reserve(input.selection->size());
-    const auto input_column = compile_named_column(*input.batch, name);
+    const auto input_column = compile_named_column(*input.batch, input_name);
     for (auto row : *input.selection) {
         append_cell(column, input_column.cell(row));
     }
-    return column;
+    std::move(column).add_to(out, std::move(output_name));
 }
 
 void add_missing_sort_key_columns(storage::ColumnarBatch& sort_input,
@@ -1016,7 +1243,7 @@ void add_missing_sort_key_columns(storage::ColumnarBatch& sort_input,
         if (!source.batch->has_column(name)) {
             throw std::logic_error("sort key column is not available before or after Project: " + name);
         }
-        sort_input.add_column(name, materialize_selected_column(source, name));
+        add_materialized_selected_column(sort_input, source, name, name);
     }
 }
 
@@ -1033,13 +1260,13 @@ storage::ColumnarBatch materialize_project_output_columns(const plan::PhysicalPl
                                                           const SelectionVector& rows) {
     storage::ColumnarBatch out;
     for (const auto& projection : project.projections) {
-        storage::Int64Column column;
+        TypedColumnBuilder column(projection.type);
         column.reserve(rows.size());
         const auto input_column = compile_named_column(batch, projection.output_name);
         for (auto row : rows) {
             append_cell(column, input_column.cell(row));
         }
-        out.add_column(projection.output_name, std::move(column));
+        std::move(column).add_to(out, projection.output_name);
     }
     return out;
 }
@@ -1049,24 +1276,57 @@ std::vector<CompiledSortKey> compile_sort_keys(const std::vector<plan::SortKey>&
     std::vector<CompiledSortKey> compiled;
     compiled.reserve(sort_keys.size());
     for (const auto& key : sort_keys) {
-        const auto& storage_column = batch.column(column_identity_name(key.column));
-        compiled.push_back(CompiledSortKey{&storage_column.values(),
-                                           storage_column.has_nulls() ? &storage_column.validity() : nullptr,
-                                           key.direction});
+        const auto name = column_identity_name(key.column);
+        if (batch.column_type(name) != key.column.type) {
+            throw std::logic_error("sort key type does not match storage column: " + name);
+        }
+        if (key.column.type == catalog::ColumnType::Int64) {
+            const auto& storage_column = batch.column(name);
+            compiled.push_back(CompiledSortKey{key.column.type,
+                                               &storage_column.values(),
+                                               nullptr,
+                                               storage_column.has_nulls() ? &storage_column.validity() : nullptr,
+                                               key.direction});
+        } else {
+            const auto& storage_column = batch.string_column(name);
+            compiled.push_back(CompiledSortKey{key.column.type,
+                                               nullptr,
+                                               &storage_column.values(),
+                                               storage_column.has_nulls() ? &storage_column.validity() : nullptr,
+                                               key.direction});
+        }
     }
     return compiled;
 }
 
-bool sort_cell_less(Cell left, Cell right, sql::SortDirection direction) {
+TypedCell sort_key_cell(const CompiledSortKey& key, std::size_t row) {
+    if (key.validity != nullptr && (*key.validity)[row] == 0) {
+        return null_cell(key.type);
+    }
+    if (key.type == catalog::ColumnType::Int64) {
+        return int_cell((*key.int_values)[row]);
+    }
+    return string_cell((*key.string_values)[row]);
+}
+
+bool sort_cell_less(const TypedCell& left, const TypedCell& right, sql::SortDirection direction) {
     if (left == right) {
         return false;
     }
-    const auto left_is_null = !left.has_value();
-    const auto right_is_null = !right.has_value();
+    const auto left_is_null = left.is_null;
+    const auto right_is_null = right.is_null;
     if (left_is_null || right_is_null) {
         return direction == sql::SortDirection::Asc ? right_is_null : left_is_null;
     }
-    return direction == sql::SortDirection::Asc ? *left < *right : *left > *right;
+    if (left.type != right.type) {
+        throw std::logic_error("sort comparison received mismatched cell types");
+    }
+    if (left.type == catalog::ColumnType::Int64) {
+        return direction == sql::SortDirection::Asc ? left.int_value < right.int_value
+                                                    : left.int_value > right.int_value;
+    }
+    return direction == sql::SortDirection::Asc ? left.string_value < right.string_value
+                                                : left.string_value > right.string_value;
 }
 
 SelectionVectorPtr sort_selection(const std::vector<plan::SortKey>& sort_keys, const BatchView& input) {
@@ -1076,10 +1336,8 @@ SelectionVectorPtr sort_selection(const std::vector<plan::SortKey>& sort_keys, c
     SelectionVector rows = *input.selection;
     std::stable_sort(rows.begin(), rows.end(), [&](std::size_t left, std::size_t right) {
         for (const auto& key : compiled_sort_keys) {
-            const auto left_value =
-                key.validity != nullptr && (*key.validity)[left] == 0 ? Cell{} : Cell{(*key.values)[left]};
-            const auto right_value =
-                key.validity != nullptr && (*key.validity)[right] == 0 ? Cell{} : Cell{(*key.values)[right]};
+            const auto left_value = sort_key_cell(key, left);
+            const auto right_value = sort_key_cell(key, right);
             if (left_value == right_value) {
                 continue;
             }
@@ -1138,22 +1396,22 @@ storage::ColumnarBatch materialize_aggregate(const plan::PhysicalPlan& plan, con
 
     storage::ColumnarBatch out;
     for (std::size_t key_index = 0; key_index < plan.group_keys.size(); ++key_index) {
-        storage::Int64Column column;
+        TypedColumnBuilder column(plan.group_keys[key_index].type);
         column.reserve(groups.size());
         for (const auto& group : groups) {
             append_cell(column, group.key.values.at(key_index));
         }
-        out.add_column(column_identity_name(plan.group_keys[key_index]), std::move(column));
+        std::move(column).add_to(out, column_identity_name(plan.group_keys[key_index]));
     }
 
     for (std::size_t aggregate_index = 0; aggregate_index < plan.aggregate_expressions.size(); ++aggregate_index) {
         const auto& aggregate = plan.aggregate_expressions[aggregate_index];
-        storage::Int64Column column;
+        TypedColumnBuilder column(aggregate.type);
         column.reserve(groups.size());
         for (const auto& group : groups) {
             append_cell(column, finalize_aggregate(group.aggregates.at(aggregate_index), aggregate));
         }
-        out.add_column(aggregate.output_name, std::move(column));
+        std::move(column).add_to(out, aggregate.output_name);
     }
     return out;
 }
@@ -1244,15 +1502,101 @@ storage::ColumnarBatch materialize_view(const BatchView& view) {
 
     storage::ColumnarBatch out;
     for (const auto& name : view.batch->column_names()) {
-        storage::Int64Column column;
+        TypedColumnBuilder column(view.batch->column_type(name));
         column.reserve(view.selection->size());
         const auto input_column = compile_named_column(*view.batch, name);
         for (auto row : *view.selection) {
             append_cell(column, input_column.cell(row));
         }
-        out.add_column(name, std::move(column));
+        std::move(column).add_to(out, name);
     }
     return out;
+}
+
+bool scalar_requires_typed_dispatch(const plan::BoundScalarExpr& expression) {
+    return expression.type == catalog::ColumnType::String;
+}
+
+bool predicate_requires_typed_dispatch(const plan::BoundPredicate& predicate) {
+    switch (predicate.kind) {
+    case sql::PredicateKind::Comparison:
+        return scalar_requires_typed_dispatch(predicate.comparison.left) ||
+               scalar_requires_typed_dispatch(predicate.comparison.right);
+    case sql::PredicateKind::IsNull:
+    case sql::PredicateKind::IsNotNull:
+        return scalar_requires_typed_dispatch(predicate.null_check);
+    case sql::PredicateKind::And:
+    case sql::PredicateKind::Or:
+        if (predicate.left == nullptr || predicate.right == nullptr) {
+            throw std::logic_error("bound predicate is missing a child");
+        }
+        return predicate_requires_typed_dispatch(*predicate.left) ||
+               predicate_requires_typed_dispatch(*predicate.right);
+    }
+    throw std::logic_error("unreachable predicate kind");
+}
+
+bool scanned_table_requires_typed_dispatch(const plan::PhysicalPlan& plan, const Catalog& catalog) {
+    const auto schema = catalog.find_table_schema(plan.table);
+    if (!schema.has_value()) {
+        throw std::out_of_range("unknown table: " + plan.table);
+    }
+    for (const auto& column : schema->columns) {
+        if (column.type == catalog::ColumnType::String) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool plan_requires_typed_dispatch(const plan::PhysicalPlan& plan, const Catalog& catalog) {
+    for (const auto& projection : plan.projections) {
+        if (projection.type == catalog::ColumnType::String ||
+            scalar_requires_typed_dispatch(projection.expression)) {
+            return true;
+        }
+    }
+    for (const auto& key : plan.group_keys) {
+        if (key.type == catalog::ColumnType::String) {
+            return true;
+        }
+    }
+    for (const auto& aggregate : plan.aggregate_expressions) {
+        if (aggregate.type == catalog::ColumnType::String ||
+            (aggregate.argument.has_value() && aggregate.argument->type == catalog::ColumnType::String)) {
+            return true;
+        }
+    }
+    for (const auto& key : plan.sort_keys) {
+        if (key.column.type == catalog::ColumnType::String) {
+            return true;
+        }
+    }
+    for (const auto& predicate : plan.predicates) {
+        if (predicate_requires_typed_dispatch(predicate)) {
+            return true;
+        }
+    }
+
+    switch (plan.kind) {
+    case plan::PhysicalKind::Scan:
+        return scanned_table_requires_typed_dispatch(plan, catalog);
+    case plan::PhysicalKind::Join:
+        return plan_requires_typed_dispatch(require_left(plan), catalog) ||
+               plan_requires_typed_dispatch(require_right(plan), catalog);
+    case plan::PhysicalKind::Filter:
+    case plan::PhysicalKind::Project:
+    case plan::PhysicalKind::Aggregate:
+    case plan::PhysicalKind::Distinct:
+    case plan::PhysicalKind::Sort:
+    case plan::PhysicalKind::Limit:
+        return plan_requires_typed_dispatch(require_input(plan), catalog);
+    }
+    throw std::logic_error("unreachable physical plan kind");
+}
+
+KernelDispatch select_kernel_dispatch(const plan::PhysicalPlan& plan, const Catalog& catalog) {
+    return plan_requires_typed_dispatch(plan, catalog) ? KernelDispatch::Typed : KernelDispatch::Int64Only;
 }
 
 } // namespace
@@ -1262,7 +1606,13 @@ storage::ColumnarBatch execute_vectorized(const plan::LogicalPlan& plan, const C
 }
 
 storage::ColumnarBatch execute_vectorized(const plan::PhysicalPlan& plan, const Catalog& catalog) {
-    return materialize_view(execute_to_view(plan, catalog));
+    switch (select_kernel_dispatch(plan, catalog)) {
+    case KernelDispatch::Int64Only:
+        return materialize_view(execute_to_view(plan, catalog));
+    case KernelDispatch::Typed:
+        return materialize_view(execute_to_view(plan, catalog));
+    }
+    throw std::logic_error("unreachable vectorized kernel dispatch");
 }
 
 } // namespace execution
