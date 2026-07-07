@@ -154,3 +154,14 @@ generator's data pool changed with nullable-column support.
 Interpreted medians rose relative to phase 15 (machine load and null-aware
 row paths); vectorized retains its advantage on all workloads, so the phase-15
 conclusion stands after the NULL arc.
+
+## Phase 17b String Baseline (2026-07-07)
+
+Same optimized build command and correctness-checksum-before-timing discipline
+as above. This phase added one string workload as a baseline for future string
+performance work; no string optimization was attempted beyond the correctness
+implementation.
+
+| workload | rows | correctness | interpreted min ms | interpreted median ms | vectorized min ms | vectorized median ms | median speedup |
+|---|---:|---|---:|---:|---:|---:|---:|
+| string_group_by | string_fact=120000,groups=16 | match rows=16 checksum=0x8ce7a59f7d8fbc52 | 24.914 | 25.003 | 9.233 | 9.402 | 2.659x |

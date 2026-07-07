@@ -1,4 +1,5 @@
 #include "differential_verifier.hpp"
+#include "sql/ast.hpp"
 #include "sql/errors.hpp"
 
 #include <algorithm>
@@ -19,14 +20,17 @@ namespace {
 
 constexpr std::size_t kDefaultSeedCount = 160;
 
-// Phase 17a deliberately keeps generated fuzz schemas int64-only. Hand-written
-// string differential cases exercise oracle rewrites plus the vectorized guard;
-// randomized string columns/literals wait for Phase 17b vectorized string kernels.
-using Cell = std::optional<std::int64_t>;
+struct Cell {
+    catalog::ColumnType type{catalog::ColumnType::Int64};
+    bool is_null{true};
+    std::int64_t int_value{0};
+    std::string string_value;
+};
 
 struct GeneratedTable {
     std::string name;
     std::vector<std::string> columns;
+    std::vector<catalog::ColumnType> types;
     std::vector<bool> nullable;
     std::vector<std::vector<Cell>> rows;
 };
@@ -34,6 +38,7 @@ struct GeneratedTable {
 struct ColumnRef {
     std::string alias;
     std::string column;
+    catalog::ColumnType type{catalog::ColumnType::Int64};
     bool nullable{false};
 };
 
@@ -41,6 +46,7 @@ struct RangeItem {
     std::string table;
     std::string alias;
     std::vector<std::string> columns;
+    std::vector<catalog::ColumnType> types;
     std::vector<bool> nullable;
 };
 
@@ -48,6 +54,13 @@ struct SelectItem {
     std::string expression;
     std::string alias;
     std::optional<ColumnRef> source_column;
+    catalog::ColumnType type{catalog::ColumnType::Int64};
+    bool nullable{false};
+};
+
+struct AggregateExpr {
+    std::string expression;
+    catalog::ColumnType type{catalog::ColumnType::Int64};
     bool nullable{false};
 };
 
@@ -55,6 +68,12 @@ struct GeneratedCase {
     execution::Catalog catalog;
     std::string sql;
     std::string catalog_dump;
+    std::size_t string_column_count{0};
+    bool has_string_literal{false};
+    bool has_string_join_key{false};
+    bool has_string_group_key{false};
+    bool has_string_distinct_output{false};
+    bool has_string_order_key{false};
 };
 
 std::string sql_text(const ColumnRef& ref) {
@@ -82,16 +101,29 @@ std::string comparison_op_text(sql::ComparisonOp op) {
 storage::ColumnarBatch make_batch(const GeneratedTable& table) {
     storage::ColumnarBatch batch;
     for (std::size_t column_index = 0; column_index < table.columns.size(); ++column_index) {
-        storage::Int64Column column;
-        for (const auto& row : table.rows) {
-            const auto value = row[column_index];
-            if (value.has_value()) {
-                column.append(*value);
-            } else {
-                column.append_null();
+        if (table.types[column_index] == catalog::ColumnType::Int64) {
+            storage::Int64Column column;
+            for (const auto& row : table.rows) {
+                const auto& value = row[column_index];
+                if (value.is_null) {
+                    column.append_null();
+                } else {
+                    column.append(value.int_value);
+                }
             }
+            batch.add_column(table.columns[column_index], std::move(column));
+        } else {
+            storage::StringColumn column;
+            for (const auto& row : table.rows) {
+                const auto& value = row[column_index];
+                if (value.is_null) {
+                    column.append_null();
+                } else {
+                    column.append(value.string_value);
+                }
+            }
+            batch.add_column(table.columns[column_index], std::move(column));
         }
-        batch.add_column(table.columns[column_index], std::move(column));
     }
     return batch;
 }
@@ -113,7 +145,8 @@ std::string format_catalog(const std::vector<GeneratedTable>& tables) {
             if (column != 0) {
                 out << ",";
             }
-            out << table.columns[column];
+            out << table.columns[column] << ":"
+                << (table.types[column] == catalog::ColumnType::Int64 ? "int64" : "string");
         }
         out << "] rows=[";
         for (std::size_t row = 0; row < table.rows.size(); ++row) {
@@ -125,11 +158,13 @@ std::string format_catalog(const std::vector<GeneratedTable>& tables) {
                 if (column != 0) {
                     out << ",";
                 }
-                const auto value = table.rows[row][column];
-                if (value.has_value()) {
-                    out << *value;
-                } else {
+                const auto& value = table.rows[row][column];
+                if (value.is_null) {
                     out << "NULL";
+                } else if (value.type == catalog::ColumnType::Int64) {
+                    out << value.int_value;
+                } else {
+                    out << sql::quote_string_literal(value.string_value);
                 }
             }
             out << "]";
@@ -148,19 +183,20 @@ public:
     explicit QueryGenerator(std::uint64_t seed) : rng_(seed) {}
 
     GeneratedCase generate() {
+        saw_string_join_key_ = false;
         auto tables = generate_tables();
         auto catalog = make_catalog(tables);
         auto ranges = choose_ranges(tables);
         const auto all_columns = columns_for_ranges(ranges);
         const auto from_sql = from_clause(ranges);
         const auto aggregate_query = chance(48);
-        std::vector<std::string> group_keys;
-        std::vector<std::string> aggregate_exprs;
+        std::vector<ColumnRef> group_keys;
+        std::vector<AggregateExpr> aggregate_exprs;
         std::vector<SelectItem> select_items;
 
         if (aggregate_query) {
             if (chance(70)) {
-                group_keys = sample_unique(column_sqls(all_columns),
+                group_keys = sample_unique_columns(all_columns,
                                            between(1, std::min<std::size_t>(3, all_columns.size())));
             }
             const auto aggregate_count = between(1, 3);
@@ -195,7 +231,7 @@ public:
                 if (i != 0) {
                     sql << ", ";
                 }
-                sql << group_keys[i];
+                sql << sql_text(group_keys[i]);
             }
         }
         if (!group_keys.empty() && chance(55)) {
@@ -212,12 +248,24 @@ public:
                 }
                 sql << keys[i] << (chance(50) ? " ASC" : " DESC");
             }
+            saw_string_order_key_ = any_string_order_key(keys, select_items, all_columns);
+        } else {
+            saw_string_order_key_ = false;
         }
         if (chance(45)) {
             sql << " LIMIT " << between(0, 8);
         }
 
-        return GeneratedCase{std::move(catalog), sql.str(), format_catalog(tables)};
+        const auto sql_string = sql.str();
+        return GeneratedCase{std::move(catalog),
+                             sql_string,
+                             format_catalog(tables),
+                             string_column_count(tables),
+                             sql_string.find('\'') != std::string::npos,
+                             saw_string_join_key_,
+                             any_string_group_key(group_keys),
+                             distinct && any_string_select_item(select_items),
+                             saw_string_order_key_};
     }
 
 private:
@@ -231,6 +279,9 @@ private:
             const auto column_count = between(2, 4);
             for (std::size_t column_index = 0; column_index < column_count; ++column_index) {
                 table.columns.push_back("c" + std::to_string(column_index));
+                table.types.push_back(column_index == 0 || (column_index != 1 && chance(55))
+                                          ? catalog::ColumnType::Int64
+                                          : catalog::ColumnType::String);
                 table.nullable.push_back(column_index != 0 && chance(65));
             }
             const auto row_count = between(0, 12);
@@ -238,7 +289,7 @@ private:
                 std::vector<Cell> row;
                 row.reserve(column_count);
                 for (std::size_t column_index = 0; column_index < column_count; ++column_index) {
-                    row.push_back(random_cell(table.nullable[column_index]));
+                    row.push_back(random_cell(table.types[column_index], table.nullable[column_index]));
                 }
                 table.rows.push_back(std::move(row));
             }
@@ -253,7 +304,11 @@ private:
         ranges.reserve(range_count);
         for (std::size_t i = 0; i < range_count; ++i) {
             const auto& table = pick(tables);
-            ranges.push_back(RangeItem{table.name, "r" + std::to_string(i), table.columns, table.nullable});
+            ranges.push_back(RangeItem{table.name,
+                                       "r" + std::to_string(i),
+                                       table.columns,
+                                       table.types,
+                                       table.nullable});
         }
         return ranges;
     }
@@ -272,21 +327,21 @@ private:
         return out.str();
     }
 
-    std::vector<SelectItem> aggregate_select_items(const std::vector<std::string>& group_keys,
-                                                   const std::vector<std::string>& aggregate_exprs,
+    std::vector<SelectItem> aggregate_select_items(const std::vector<ColumnRef>& group_keys,
+                                                   const std::vector<AggregateExpr>& aggregate_exprs,
                                                    const std::vector<ColumnRef>& all_columns) {
         std::vector<SelectItem> items;
         const auto projected_group_count =
             group_keys.empty() ? std::size_t{0} : between(1, group_keys.size());
-        auto projected_groups = sample_unique(group_keys, projected_group_count);
+        auto projected_groups = sample_unique_columns(group_keys, projected_group_count);
         for (const auto& key : projected_groups) {
-            const auto source = column_ref_for_sql(all_columns, key);
-            items.push_back(SelectItem{key, next_alias(all_columns, source), source, source->nullable});
+            items.push_back(SelectItem{sql_text(key), next_alias(all_columns, key), key, key.type, key.nullable});
         }
 
         auto projected_aggregates = sample_with_replacement(aggregate_exprs, between(1, aggregate_exprs.size()));
         for (const auto& aggregate : projected_aggregates) {
-            items.push_back(SelectItem{aggregate, next_alias(all_columns), std::nullopt, false});
+            items.push_back(
+                SelectItem{aggregate.expression, next_alias(all_columns), std::nullopt, aggregate.type, aggregate.nullable});
         }
         return items;
     }
@@ -297,10 +352,16 @@ private:
         for (std::size_t i = 0; i < item_count; ++i) {
             if (chance(82)) {
                 const auto column = pick(all_columns);
-                items.push_back(SelectItem{sql_text(column), next_alias(all_columns, column), column, column.nullable});
+                items.push_back(
+                    SelectItem{sql_text(column), next_alias(all_columns, column), column, column.type, column.nullable});
             } else {
-                const auto value = literal();
-                items.push_back(SelectItem{value, next_alias(all_columns), std::nullopt, value == "NULL"});
+                const auto type = random_literal_type();
+                const auto value = literal(type);
+                items.push_back(SelectItem{value,
+                                           next_alias(all_columns),
+                                           std::nullopt,
+                                           value == "NULL" ? catalog::ColumnType::Int64 : type,
+                                           value == "NULL"});
             }
         }
         return items;
@@ -308,7 +369,7 @@ private:
 
     std::vector<std::string> order_by_candidates(bool distinct,
                                                  bool aggregate_query,
-                                                 const std::vector<std::string>& group_keys,
+                                                 const std::vector<ColumnRef>& group_keys,
                                                  const std::vector<SelectItem>& select_items,
                                                  const std::vector<ColumnRef>& all_columns) {
         std::vector<std::string> candidates;
@@ -339,9 +400,62 @@ private:
         }
     }
 
+    bool any_string_order_key(const std::vector<std::string>& keys,
+                              const std::vector<SelectItem>& select_items,
+                              const std::vector<ColumnRef>& all_columns) const {
+        for (const auto& key : keys) {
+            for (const auto& item : select_items) {
+                if (item.alias == key && item.type == catalog::ColumnType::String) {
+                    return true;
+                }
+            }
+            for (const auto& column : all_columns) {
+                if (sql_text(column) == key && column.type == catalog::ColumnType::String) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    bool any_string_group_key(const std::vector<ColumnRef>& group_keys) const {
+        for (const auto& key : group_keys) {
+            if (key.type == catalog::ColumnType::String) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool any_string_select_item(const std::vector<SelectItem>& select_items) const {
+        for (const auto& item : select_items) {
+            if (item.type == catalog::ColumnType::String) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    std::size_t string_column_count(const std::vector<GeneratedTable>& tables) const {
+        std::size_t count = 0;
+        for (const auto& table : tables) {
+            for (const auto type : table.types) {
+                if (type == catalog::ColumnType::String) {
+                    ++count;
+                }
+            }
+        }
+        return count;
+    }
+
     std::string join_predicate(const std::vector<ColumnRef>& left_columns, const std::vector<ColumnRef>& right_columns) {
-        const auto left = sql_text(pick(left_columns));
-        const auto right = sql_text(pick(right_columns));
+        const auto common_types = common_column_types(left_columns, right_columns);
+        const auto type = contains_type(common_types, catalog::ColumnType::String) && chance(45)
+                              ? catalog::ColumnType::String
+                              : pick(common_types);
+        saw_string_join_key_ = saw_string_join_key_ || type == catalog::ColumnType::String;
+        const auto left = sql_text(pick(columns_of_type(left_columns, type)));
+        const auto right = sql_text(pick(columns_of_type(right_columns, type)));
         auto predicate = left + " = " + right;
         if (chance(65)) {
             std::vector<ColumnRef> all = left_columns;
@@ -369,16 +483,19 @@ private:
         const auto column_first = chance(70);
         const auto use_two_columns = chance(24);
         if (use_two_columns) {
-            return sql_text(pick(columns)) + " " + op + " " + sql_text(pick(columns));
+            const auto type = pick(column_types(columns));
+            const auto typed_columns = columns_of_type(columns, type);
+            return sql_text(pick(typed_columns)) + " " + op + " " + sql_text(pick(typed_columns));
         }
+        const auto column = pick(columns);
         if (column_first) {
-            return sql_text(pick(columns)) + " " + op + " " + literal();
+            return sql_text(column) + " " + op + " " + literal(column.type);
         }
-        return literal() + " " + op + " " + sql_text(pick(columns));
+        return literal(column.type) + " " + op + " " + sql_text(column);
     }
 
-    std::string having_tree(const std::vector<std::string>& group_keys,
-                            const std::vector<std::string>& aggregate_exprs,
+    std::string having_tree(const std::vector<ColumnRef>& group_keys,
+                            const std::vector<AggregateExpr>& aggregate_exprs,
                             int depth) {
         if (depth == 0 || chance(45)) {
             return having_leaf(group_keys, aggregate_exprs);
@@ -387,39 +504,33 @@ private:
                having_tree(group_keys, aggregate_exprs, depth - 1) + ")";
     }
 
-    std::string having_leaf(const std::vector<std::string>& group_keys,
-                            const std::vector<std::string>& aggregate_exprs) {
-        return having_expr(group_keys, aggregate_exprs) + " " + comparison_op_text(random_op()) + " " +
-               (chance(70) ? literal() : having_expr(group_keys, aggregate_exprs));
+    std::string having_leaf(const std::vector<ColumnRef>& group_keys,
+                            const std::vector<AggregateExpr>& aggregate_exprs) {
+        const auto expressions = having_expressions(group_keys, aggregate_exprs);
+        const auto type = pick(expression_types(expressions));
+        const auto typed_expressions = expressions_of_type(expressions, type);
+        return pick(typed_expressions).expression + " " + comparison_op_text(random_op()) + " " +
+               (chance(70) ? literal(type) : pick(typed_expressions).expression);
     }
 
-    std::string having_expr(const std::vector<std::string>& group_keys,
-                            const std::vector<std::string>& aggregate_exprs) {
-        if (chance(45) && !group_keys.empty()) {
-            return pick(group_keys);
-        }
-        if (chance(75) && !aggregate_exprs.empty()) {
-            return pick(aggregate_exprs);
-        }
-        return literal();
-    }
-
-    std::string random_aggregate(const std::vector<ColumnRef>& columns) {
+    AggregateExpr random_aggregate(const std::vector<ColumnRef>& columns) {
         const auto choice = between(0, 4);
         if (choice == 0) {
-            return "COUNT(*)";
+            return AggregateExpr{"COUNT(*)", catalog::ColumnType::Int64, false};
         }
-        const auto argument = sql_text(pick(columns));
         if (choice == 1) {
-            return "COUNT(" + argument + ")";
+            return AggregateExpr{"COUNT(" + sql_text(pick(columns)) + ")", catalog::ColumnType::Int64, false};
         }
         if (choice == 2) {
-            return "SUM(" + argument + ")";
+            const auto argument = sql_text(pick(columns_of_type(columns, catalog::ColumnType::Int64)));
+            return AggregateExpr{"SUM(" + argument + ")", catalog::ColumnType::Int64, true};
         }
+        const auto argument_column = pick(columns);
+        const auto argument = sql_text(argument_column);
         if (choice == 3) {
-            return "MIN(" + argument + ")";
+            return AggregateExpr{"MIN(" + argument + ")", argument_column.type, true};
         }
-        return "MAX(" + argument + ")";
+        return AggregateExpr{"MAX(" + argument + ")", argument_column.type, true};
     }
 
     std::string next_alias(const std::vector<ColumnRef>& all_columns,
@@ -450,28 +561,35 @@ private:
             for (std::size_t column_index = 0; column_index < range.columns.size(); ++column_index) {
                 refs.push_back(ColumnRef{range.alias,
                                          range.columns[column_index],
+                                         range.types[column_index],
                                          range.nullable[column_index]});
             }
         }
         return refs;
     }
 
-    std::vector<std::string> column_sqls(const std::vector<ColumnRef>& columns) const {
-        std::vector<std::string> values;
-        values.reserve(columns.size());
-        for (const auto& column : columns) {
-            values.push_back(sql_text(column));
-        }
-        return values;
+    bool same_column_identity(const ColumnRef& left, const ColumnRef& right) const {
+        return left.alias == right.alias && left.column == right.column;
     }
 
-    std::optional<ColumnRef> column_ref_for_sql(const std::vector<ColumnRef>& columns, const std::string& text) const {
-        for (const auto& column : columns) {
-            if (sql_text(column) == text) {
-                return column;
+    std::vector<ColumnRef> sample_unique_columns(std::vector<ColumnRef> values, std::size_t count) {
+        std::sort(values.begin(), values.end(), [](const ColumnRef& left, const ColumnRef& right) {
+            if (left.alias != right.alias) {
+                return left.alias < right.alias;
             }
+            return left.column < right.column;
+        });
+        values.erase(std::unique(values.begin(),
+                                 values.end(),
+                                 [&](const ColumnRef& left, const ColumnRef& right) {
+                                     return same_column_identity(left, right);
+                                 }),
+                     values.end());
+        std::shuffle(values.begin(), values.end(), rng_);
+        if (values.size() > count) {
+            values.resize(count);
         }
-        return std::nullopt;
+        return values;
     }
 
     std::vector<std::string> sample_unique(std::vector<std::string> values, std::size_t count) {
@@ -484,13 +602,87 @@ private:
         return values;
     }
 
-    std::vector<std::string> sample_with_replacement(const std::vector<std::string>& values, std::size_t count) {
-        std::vector<std::string> sample;
+    template <typename T>
+    std::vector<T> sample_with_replacement(const std::vector<T>& values, std::size_t count) {
+        std::vector<T> sample;
         sample.reserve(count);
         for (std::size_t i = 0; i < count; ++i) {
             sample.push_back(pick(values));
         }
         return sample;
+    }
+
+    bool contains_type(const std::vector<catalog::ColumnType>& types, catalog::ColumnType type) const {
+        return std::find(types.begin(), types.end(), type) != types.end();
+    }
+
+    std::vector<catalog::ColumnType> column_types(const std::vector<ColumnRef>& columns) const {
+        std::vector<catalog::ColumnType> types;
+        for (const auto& column : columns) {
+            if (!contains_type(types, column.type)) {
+                types.push_back(column.type);
+            }
+        }
+        return types;
+    }
+
+    std::vector<catalog::ColumnType> common_column_types(const std::vector<ColumnRef>& left,
+                                                        const std::vector<ColumnRef>& right) const {
+        std::vector<catalog::ColumnType> common;
+        for (const auto type : column_types(left)) {
+            if (contains_type(column_types(right), type)) {
+                common.push_back(type);
+            }
+        }
+        return common;
+    }
+
+    std::vector<ColumnRef> columns_of_type(const std::vector<ColumnRef>& columns, catalog::ColumnType type) const {
+        std::vector<ColumnRef> typed;
+        for (const auto& column : columns) {
+            if (column.type == type) {
+                typed.push_back(column);
+            }
+        }
+        if (typed.empty()) {
+            throw std::logic_error("generator has no columns of requested type");
+        }
+        return typed;
+    }
+
+    std::vector<AggregateExpr> having_expressions(const std::vector<ColumnRef>& group_keys,
+                                                  const std::vector<AggregateExpr>& aggregate_exprs) const {
+        std::vector<AggregateExpr> expressions;
+        expressions.reserve(group_keys.size() + aggregate_exprs.size());
+        for (const auto& key : group_keys) {
+            expressions.push_back(AggregateExpr{sql_text(key), key.type, key.nullable});
+        }
+        expressions.insert(expressions.end(), aggregate_exprs.begin(), aggregate_exprs.end());
+        return expressions;
+    }
+
+    std::vector<catalog::ColumnType> expression_types(const std::vector<AggregateExpr>& expressions) const {
+        std::vector<catalog::ColumnType> types;
+        for (const auto& expression : expressions) {
+            if (!contains_type(types, expression.type)) {
+                types.push_back(expression.type);
+            }
+        }
+        return types;
+    }
+
+    std::vector<AggregateExpr> expressions_of_type(const std::vector<AggregateExpr>& expressions,
+                                                   catalog::ColumnType type) const {
+        std::vector<AggregateExpr> typed;
+        for (const auto& expression : expressions) {
+            if (expression.type == type) {
+                typed.push_back(expression);
+            }
+        }
+        if (typed.empty()) {
+            throw std::logic_error("generator has no expressions of requested type");
+        }
+        return typed;
     }
 
     sql::ComparisonOp random_op() {
@@ -537,18 +729,70 @@ private:
         return static_cast<std::int64_t>(between(0, 20)) - 10;
     }
 
-    Cell random_cell(bool nullable) {
-        if (nullable && chance(22)) {
-            return std::nullopt;
+    std::string random_string_value() {
+        static const std::vector<std::string> pool{
+            "",
+            "",
+            "a",
+            "a",
+            "b",
+            "b",
+            "aa",
+            "z",
+            "key0",
+            "key1",
+            "key1",
+            "left",
+            "right",
+        };
+        if (chance(88)) {
+            return pick(pool);
         }
-        return random_value();
+        return "s" + std::to_string(between(0, 9));
     }
 
-    std::string literal() {
+    Cell int_cell(std::int64_t value) const {
+        Cell cell;
+        cell.type = catalog::ColumnType::Int64;
+        cell.is_null = false;
+        cell.int_value = value;
+        return cell;
+    }
+
+    Cell string_cell(std::string value) const {
+        Cell cell;
+        cell.type = catalog::ColumnType::String;
+        cell.is_null = false;
+        cell.string_value = std::move(value);
+        return cell;
+    }
+
+    Cell null_cell(catalog::ColumnType type) const {
+        Cell cell;
+        cell.type = type;
+        cell.is_null = true;
+        return cell;
+    }
+
+    Cell random_cell(catalog::ColumnType type, bool nullable) {
+        if (nullable && chance(22)) {
+            return null_cell(type);
+        }
+        return type == catalog::ColumnType::Int64 ? int_cell(random_value()) : string_cell(random_string_value());
+    }
+
+    catalog::ColumnType random_literal_type() {
+        return chance(45) ? catalog::ColumnType::String : catalog::ColumnType::Int64;
+    }
+
+    std::string literal(catalog::ColumnType type) {
         if (chance(14)) {
             return "NULL";
         }
-        return std::to_string(random_value());
+        if (type == catalog::ColumnType::Int64) {
+            return std::to_string(random_value());
+        }
+        return sql::quote_string_literal(random_string_value());
     }
 
     bool chance(int percent) { return between(1, 100) <= static_cast<std::size_t>(percent); }
@@ -566,6 +810,8 @@ private:
     std::mt19937_64 rng_;
     std::size_t next_output_alias_{0};
     std::vector<std::string> used_output_aliases_;
+    bool saw_string_join_key_{false};
+    bool saw_string_order_key_{false};
 };
 
 std::optional<std::uint64_t> parse_seed_arg(int argc, char** argv) {
@@ -632,6 +878,12 @@ int main(int argc, char** argv) {
     std::size_t execution_paths = 0;
     std::size_t accepted_error_paths = 0;
     std::size_t max_group_expression_count = 0;
+    std::size_t string_columns = 0;
+    std::size_t string_literal_queries = 0;
+    std::size_t string_join_key_queries = 0;
+    std::size_t string_group_key_queries = 0;
+    std::size_t string_distinct_output_queries = 0;
+    std::size_t string_order_key_queries = 0;
     bool hit_expression_bound = false;
     bool hit_plan_bound = false;
 
@@ -647,6 +899,12 @@ int main(int argc, char** argv) {
         execution_paths += stats.execution_path_count;
         accepted_error_paths += stats.accepted_error_path_count;
         max_group_expression_count = std::max(max_group_expression_count, stats.max_group_expression_count);
+        string_columns += generated.string_column_count;
+        string_literal_queries += generated.has_string_literal ? 1 : 0;
+        string_join_key_queries += generated.has_string_join_key ? 1 : 0;
+        string_group_key_queries += generated.has_string_group_key ? 1 : 0;
+        string_distinct_output_queries += generated.has_string_distinct_output ? 1 : 0;
+        string_order_key_queries += generated.has_string_order_key ? 1 : 0;
         hit_expression_bound = hit_expression_bound || stats.hit_expression_bound;
         hit_plan_bound = hit_plan_bound || stats.hit_plan_bound;
     }
@@ -655,6 +913,12 @@ int main(int argc, char** argv) {
               << " alternatives=" << alternatives << " execution_paths=" << execution_paths
               << " accepted_error_paths=" << accepted_error_paths
               << " max_group_expressions=" << max_group_expression_count
+              << " string_columns=" << string_columns
+              << " string_literal_queries=" << string_literal_queries
+              << " string_join_key_queries=" << string_join_key_queries
+              << " string_group_key_queries=" << string_group_key_queries
+              << " string_distinct_output_queries=" << string_distinct_output_queries
+              << " string_order_key_queries=" << string_order_key_queries
               << " hit_expression_bound=" << (hit_expression_bound ? "yes" : "no")
               << " hit_plan_bound=" << (hit_plan_bound ? "yes" : "no") << "\n";
     return 0;
