@@ -59,14 +59,15 @@ struct MemoExploreResult {
 // Replacement expression: The same Filter with each matched comparison leaf replaced by canonical
 // TRUE/FALSE, then with boolean tree algebra applied deterministically: TRUE OR x -> TRUE, FALSE OR
 // x -> x, TRUE AND x -> x, FALSE AND x -> FALSE.
-// Semantic equivalence argument: This rule folds only int64-literal-vs-int64-literal comparisons;
-// `NULL` literals are not returned by the helper used for folding and therefore are never folded
-// into TRUE/FALSE. A comparison between two int64 literals has a fixed non-UNKNOWN result for every
-// input row. The boolean identities are valid for every SQL 3VL value x: TRUE OR x is TRUE, FALSE
-// OR x is x, TRUE AND x is x, and FALSE AND x is FALSE. Replacing a subtree with the identical 3VL
-// value preserves the rows whose final predicate is TRUE, and UNKNOWN rejection is unchanged. Each
-// algebra simplification strictly reduces tree size; folding an int64 literal comparison replaces
-// one non-canonical leaf with one canonical non-NULL leaf and no default rule reintroduces
+// Semantic equivalence argument: This rule folds only type-checked
+// int64-literal-vs-int64-literal comparisons; string literals and `NULL` literals are not returned
+// by the helper used for folding and therefore are never folded into TRUE/FALSE. A comparison
+// between two int64 literals has a fixed non-UNKNOWN result for every input row. The boolean
+// identities are valid for every SQL 3VL value x: TRUE OR x is TRUE, FALSE OR x is x, TRUE AND x
+// is x, and FALSE AND x is FALSE. Replacing a subtree with the identical 3VL value preserves the
+// rows whose final predicate is TRUE, and UNKNOWN rejection is unchanged. Each algebra
+// simplification strictly reduces tree size; folding an int64 literal comparison replaces one
+// non-canonical leaf with one canonical non-NULL leaf and no default rule reintroduces
 // non-canonical literal comparisons.
 // Preconditions: Folded canonical TRUE/FALSE leaves are non-NULL int64 comparisons; predicates are
 // pure and side-effect-free; duplicate rows are preserved because this rule only changes per-row
@@ -151,10 +152,12 @@ public:
 // Semantic equivalence argument: For inner join under bag semantics and TRUE-only filter/join
 // semantics, applying a pure one-side predicate before the join preserves exactly the matching pair
 // multiplicities that would survive filtering after the join: TRUE rows keep all candidate pairs,
-// while FALSE and UNKNOWN rows produce no accepted pair in either shape. A comparison leaf that
-// reads both inputs is semantically a join predicate because it is evaluated over the same row pair
-// at a point where both rows are available; NULL operands yield UNKNOWN and are rejected in either
-// placement. Whole-tree reference analysis prevents unsound OR/AND splitting.
+// while FALSE and UNKNOWN rows produce no accepted pair in either shape. Bound predicate leaves are
+// already type-checked, so moving a whole conjunct does not change comparison type, lexicographic
+// string behavior, or NULL handling. A comparison leaf that reads both inputs is semantically a join
+// predicate because it is evaluated over the same row pair at a point where both rows are available;
+// NULL operands yield UNKNOWN and are rejected in either placement. Whole-tree reference analysis
+// prevents unsound OR/AND splitting.
 // Preconditions: Only conjunct trees whose referenced binding identities are wholly available at
 // the target child scope move below the join. Literal-only, unknown-scope, aggregate-output, and
 // mixed-side non-leaf predicates stay residual; outer joins, volatile functions, and side effects
@@ -178,9 +181,10 @@ public:
 // once GROUP BY NULL semantics are fully specified. Filtering groups by a predicate over only those
 // keys keeps exactly groups whose key predicate is TRUE; filtering input rows by the same predicate
 // before aggregation keeps exactly the rows for those TRUE groups. FALSE and UNKNOWN key predicates
-// reject the group or input rows in both shapes. Aggregate outputs such as COUNT/SUM are computed
-// after grouping and are not available before aggregation, so predicates that reference them do not
-// move.
+// reject the group or input rows in both shapes. Bound grouping-key predicates carry their checked
+// key type, so string and int64 keys move under the same whole-conjunct argument without coercion.
+// Aggregate outputs such as COUNT/SUM are computed after grouping and are not available before
+// aggregation, so predicates that reference them do not move.
 // Preconditions: Every moved conjunct tree must reference at least one column and every referenced
 // column in every leaf must match one of `group_keys` by bound identity. The current binder
 // represents HAVING grouping-key predicates with the original input `BoundColumnRef{binding,

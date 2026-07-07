@@ -757,6 +757,67 @@ bool run_join_oracle_corpus() {
     return ok;
 }
 
+execution::Catalog make_string_catalog() {
+    storage::StringColumn s;
+    s.append("b");
+    s.append("");
+    s.append_null();
+    s.append("a");
+    storage::ColumnarBatch strings;
+    strings.add_column("s", std::move(s));
+
+    storage::StringColumn l_k;
+    l_k.append("a");
+    l_k.append_null();
+    l_k.append("b");
+    storage::Int64Column l_v;
+    for (auto value : {1, 2, 3}) {
+        l_v.append(value);
+    }
+    storage::ColumnarBatch left;
+    left.add_column("k", std::move(l_k));
+    left.add_column("v", std::move(l_v));
+
+    storage::StringColumn r_k;
+    r_k.append_null();
+    r_k.append("b");
+    r_k.append("a");
+    storage::Int64Column r_w;
+    for (auto value : {10, 11, 12}) {
+        r_w.append(value);
+    }
+    storage::ColumnarBatch right;
+    right.add_column("k", std::move(r_k));
+    right.add_column("w", std::move(r_w));
+
+    execution::Catalog catalog;
+    catalog.add_table("strings", std::move(strings));
+    catalog.add_table("string_left", std::move(left));
+    catalog.add_table("string_right", std::move(right));
+    return catalog;
+}
+
+bool run_string_oracle_guard_corpus() {
+    const auto catalog = make_string_catalog();
+    const auto table_text =
+        "string tables: strings rows=[[b],[],[NULL],[a]], string_left rows=[[a,1],[NULL,2],[b,3]], "
+        "string_right rows=[[NULL,10],[b,11],[a,12]]";
+    const std::vector<std::string> sqls{
+        "SELECT s FROM strings WHERE s = 'a' OR s = ''",
+        "SELECT s, COUNT(*) FROM strings GROUP BY s ORDER BY s ASC",
+        "SELECT MIN(s), MAX(s), COUNT(s), COUNT(*) FROM strings",
+        "SELECT l.v, r.w FROM string_left AS l JOIN string_right AS r ON l.k = r.k ORDER BY l.v ASC",
+        "SELECT DISTINCT s FROM strings ORDER BY s DESC LIMIT 3",
+        "SELECT 'x' AS literal FROM strings LIMIT 1",
+    };
+
+    bool ok = true;
+    for (const auto& sql : sqls) {
+        ok = differential::compare_engines(sql, catalog, table_text) && ok;
+    }
+    return ok;
+}
+
 std::string comparison_op_text(sql::ComparisonOp op) {
     switch (op) {
     case sql::ComparisonOp::Equal:
@@ -898,14 +959,51 @@ void assert_physical_lowering_shape() {
     assert(physical.input->input->table == "t");
 }
 
+void assert_physical_lowering_rejects_string_touching_plans() {
+    storage::StringColumn s;
+    s.append("a");
+    s.append_null();
+    storage::ColumnarBatch batch;
+    batch.add_column("s", std::move(s));
+
+    execution::Catalog catalog;
+    catalog.add_table("strings", std::move(batch));
+
+    const auto string_column_plan =
+        sql::bind_select(sql::parse_select("SELECT s FROM strings WHERE s = 'a'"), catalog);
+    bool saw_string_column_guard = false;
+    try {
+        (void)plan::lower_to_physical(string_column_plan);
+    } catch (const std::runtime_error& error) {
+        assert(std::string(error.what()) == "vectorized execution does not support VARCHAR/string plans in phase 17a");
+        saw_string_column_guard = true;
+    }
+    if (!saw_string_column_guard) {
+        throw std::logic_error("expected vectorized string column guard");
+    }
+
+    const auto int_catalog = make_golden_catalog();
+    const auto string_literal_plan =
+        sql::bind_select(sql::parse_select("SELECT 'x' AS x FROM t LIMIT 1"), int_catalog);
+    try {
+        (void)execution::execute_vectorized(string_literal_plan, int_catalog);
+    } catch (const std::runtime_error& error) {
+        assert(std::string(error.what()) == "vectorized execution does not support VARCHAR/string plans in phase 17a");
+        return;
+    }
+    throw std::logic_error("expected vectorized string guard");
+}
+
 } // namespace
 
 int main() {
     assert_physical_lowering_shape();
+    assert_physical_lowering_rejects_string_touching_plans();
 
     bool ok = true;
     ok = run_result_golden_queries() && ok;
     ok = run_join_oracle_corpus() && ok;
+    ok = run_string_oracle_guard_corpus() && ok;
     ok = run_generated_corpus() && ok;
     return ok ? 0 : 1;
 }

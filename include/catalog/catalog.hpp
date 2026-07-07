@@ -8,7 +8,7 @@
 
 namespace catalog {
 
-enum class ColumnType { Int64 };
+enum class ColumnType { Int64, String };
 
 struct ColumnSchema {
     std::string name;

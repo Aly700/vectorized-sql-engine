@@ -271,13 +271,13 @@ std::vector<CompiledColumn> compile_named_columns(const storage::ColumnarBatch& 
 
 CompiledScalar compile_scalar(const plan::BoundScalarExpr& expression, const storage::ColumnarBatch& batch) {
     CompiledScalar compiled;
-    if (const auto* column = std::get_if<plan::BoundColumnRef>(&expression)) {
+    if (const auto* column = std::get_if<plan::BoundColumnRef>(&expression.value)) {
         const auto& storage_column = batch.column(column_identity_name(*column));
         compiled.column_values = &storage_column.values();
         compiled.column_validity = storage_column.has_nulls() ? &storage_column.validity() : nullptr;
         return compiled;
     }
-    if (const auto* literal = std::get_if<sql::IntLiteral>(&expression)) {
+    if (const auto* literal = std::get_if<sql::IntLiteral>(&expression.value)) {
         compiled.literal = literal->value;
         return compiled;
     }
@@ -440,7 +440,7 @@ CompiledJoinScalar compile_join_scalar(const plan::BoundScalarExpr& expression,
                                        const storage::ColumnarBatch& left,
                                        const storage::ColumnarBatch& right) {
     CompiledJoinScalar compiled;
-    if (const auto* column = std::get_if<plan::BoundColumnRef>(&expression)) {
+    if (const auto* column = std::get_if<plan::BoundColumnRef>(&expression.value)) {
         const auto name = column_identity_name(*column);
         if (left.has_column(name)) {
             const auto& storage_column = left.column(name);
@@ -456,7 +456,7 @@ CompiledJoinScalar compile_join_scalar(const plan::BoundScalarExpr& expression,
         }
         throw std::logic_error("bound join column identity is missing from both inputs: " + name);
     }
-    if (const auto* literal = std::get_if<sql::IntLiteral>(&expression)) {
+    if (const auto* literal = std::get_if<sql::IntLiteral>(&expression.value)) {
         compiled.literal = literal->value;
         return compiled;
     }
@@ -582,8 +582,8 @@ bool try_add_equi_key(const plan::BoundPredicate& predicate,
         return false;
     }
 
-    const auto* lhs = std::get_if<plan::BoundColumnRef>(&comparison.left);
-    const auto* rhs = std::get_if<plan::BoundColumnRef>(&comparison.right);
+    const auto* lhs = std::get_if<plan::BoundColumnRef>(&comparison.left.value);
+    const auto* rhs = std::get_if<plan::BoundColumnRef>(&comparison.right.value);
     if (lhs == nullptr || rhs == nullptr) {
         return false;
     }
@@ -870,7 +870,11 @@ BatchView execute_scan(const plan::PhysicalPlan& plan, const Catalog& catalog) {
     const auto& input = catalog.table(plan.table);
     auto qualified = std::make_shared<storage::ColumnarBatch>();
     for (const auto& column_name : input.column_names()) {
-        qualified->add_column(plan.binding_name + "." + column_name, input.column(column_name));
+        if (input.column_type(column_name) == catalog::ColumnType::Int64) {
+            qualified->add_column(plan.binding_name + "." + column_name, input.column(column_name));
+        } else {
+            qualified->add_column(plan.binding_name + "." + column_name, input.string_column(column_name));
+        }
     }
 
     BatchView view;

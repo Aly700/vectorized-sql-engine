@@ -46,6 +46,16 @@ StaticSchemaCatalog make_schema_catalog() {
         {catalog::ColumnSchema{"a", catalog::ColumnType::Int64},
          catalog::ColumnSchema{"c", catalog::ColumnType::Int64}},
     });
+    catalog.add_table(catalog::TableSchema{
+        "strings",
+        {catalog::ColumnSchema{"s", catalog::ColumnType::String},
+         catalog::ColumnSchema{"i", catalog::ColumnType::Int64}},
+    });
+    catalog.add_table(catalog::TableSchema{
+        "strings2",
+        {catalog::ColumnSchema{"s", catalog::ColumnType::String},
+         catalog::ColumnSchema{"payload", catalog::ColumnType::Int64}},
+    });
     return catalog;
 }
 
@@ -417,6 +427,84 @@ void assert_ambiguous_unqualified_column_reports_candidates() {
     throw std::logic_error("expected ambiguous column bind error");
 }
 
+void assert_string_columns_and_literals_bind_types() {
+    auto catalog = make_schema_catalog();
+    const auto logical =
+        sql::bind_select(sql::parse_select("SELECT s, 'a''b' AS escaped FROM strings WHERE s = 'alpha'"), catalog);
+
+    assert(logical.kind == plan::LogicalKind::Project);
+    assert(logical.projections.size() == 2);
+    assert(logical.projections[0].type == catalog::ColumnType::String);
+    assert(logical.projections[1].type == catalog::ColumnType::String);
+    assert(logical.input != nullptr);
+    assert(logical.input->kind == plan::LogicalKind::Filter);
+    assert(logical.input->predicates.front().comparison.left.type == catalog::ColumnType::String);
+    assert(logical.input->predicates.front().comparison.right.type == catalog::ColumnType::String);
+
+    const auto printed = plan::to_string(logical);
+    assert(printed.find("Project[s=col(strings.s), escaped=lit('a''b')]") != std::string::npos);
+    assert(printed.find("Filter[col(strings.s) = lit('alpha')]") != std::string::npos);
+}
+
+void assert_string_group_order_join_and_minmax_are_legal() {
+    auto catalog = make_schema_catalog();
+    const auto logical = sql::bind_select(
+        sql::parse_select("SELECT l.s, MIN(r.s), MAX(r.s), COUNT(l.s) FROM strings AS l JOIN strings2 AS r ON l.s = r.s GROUP BY l.s ORDER BY l.s"),
+        catalog);
+
+    const auto printed = plan::to_string(logical);
+    assert(printed.find("Join[col(l.s) = col(r.s)]") != std::string::npos);
+    assert(printed.find("Aggregate[group_keys=[col(l.s)], aggregates=[MIN(r.s)=col(r.s), MAX(r.s)=col(r.s), COUNT(l.s)=col(l.s)]]") != std::string::npos);
+    assert(printed.find("Sort[col(l.s) ASC]") != std::string::npos);
+}
+
+void assert_comparison_type_mismatch_is_rejected() {
+    auto catalog = make_schema_catalog();
+    try {
+        (void)sql::bind_select(sql::parse_select("SELECT s FROM strings WHERE s = 1"), catalog);
+    } catch (const sql::BindError& error) {
+        assert(error.position() == 30);
+        assert(error.message() == "comparison operands must have the same type: string vs int64");
+        return;
+    }
+    throw std::logic_error("expected string/int comparison bind error");
+}
+
+void assert_reverse_comparison_type_mismatch_is_rejected() {
+    auto catalog = make_schema_catalog();
+    try {
+        (void)sql::bind_select(sql::parse_select("SELECT i FROM strings WHERE i = '1'"), catalog);
+    } catch (const sql::BindError& error) {
+        assert(error.position() == 30);
+        assert(error.message() == "comparison operands must have the same type: int64 vs string");
+        return;
+    }
+    throw std::logic_error("expected int/string comparison bind error");
+}
+
+void assert_sum_rejects_string_argument() {
+    auto catalog = make_schema_catalog();
+    try {
+        (void)sql::bind_select(sql::parse_select("SELECT SUM(s) FROM strings"), catalog);
+    } catch (const sql::BindError& error) {
+        assert(error.position() == 7);
+        assert(error.message() == "SUM requires int64 argument, got string");
+        return;
+    }
+    throw std::logic_error("expected SUM(string) bind error");
+}
+
+void assert_unterminated_string_literal_reports_start_position() {
+    try {
+        (void)sql::parse_select("SELECT 'abc FROM strings");
+    } catch (const sql::ParseError& error) {
+        assert(error.position() == 7);
+        assert(error.message() == "unterminated string literal");
+        return;
+    }
+    throw std::logic_error("expected unterminated string literal parse error");
+}
+
 } // namespace
 
 int main() {
@@ -448,5 +536,11 @@ int main() {
     assert_ambiguous_unqualified_column_reports_alias_candidates();
     assert_unknown_qualifier_reports_bind_error();
     assert_ambiguous_unqualified_column_reports_candidates();
+    assert_string_columns_and_literals_bind_types();
+    assert_string_group_order_join_and_minmax_are_legal();
+    assert_comparison_type_mismatch_is_rejected();
+    assert_reverse_comparison_type_mismatch_is_rejected();
+    assert_sum_rejects_string_argument();
+    assert_unterminated_string_literal_reports_start_position();
     return 0;
 }

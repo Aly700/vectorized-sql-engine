@@ -24,20 +24,28 @@ void hash_string(std::size_t& seed, const std::string& value) {
 }
 
 void hash_scalar(std::size_t& seed, const plan::BoundScalarExpr& expression) {
-    if (const auto* column = std::get_if<plan::BoundColumnRef>(&expression)) {
+    hash_combine(seed, static_cast<std::size_t>(expression.type));
+    if (const auto* column = std::get_if<plan::BoundColumnRef>(&expression.value)) {
         hash_combine(seed, 1);
         hash_string(seed, column->binding);
         hash_string(seed, column->column);
+        hash_combine(seed, static_cast<std::size_t>(column->type));
         return;
     }
 
-    if (const auto* literal = std::get_if<sql::IntLiteral>(&expression)) {
+    if (const auto* literal = std::get_if<sql::IntLiteral>(&expression.value)) {
         hash_combine(seed, 2);
         hash_combine(seed, std::hash<std::int64_t>{}(literal->value));
         return;
     }
 
-    hash_combine(seed, 3);
+    if (const auto* literal = std::get_if<sql::StringLiteral>(&expression.value)) {
+        hash_combine(seed, 3);
+        hash_string(seed, literal->value);
+        return;
+    }
+
+    hash_combine(seed, 4);
 }
 
 void hash_comparison(std::size_t& seed, const plan::BoundComparisonExpr& comparison) {
@@ -76,11 +84,13 @@ void hash_projection(std::size_t& seed, const plan::Projection& projection) {
 void hash_column(std::size_t& seed, const plan::BoundColumnRef& column) {
     hash_string(seed, column.binding);
     hash_string(seed, column.column);
+    hash_combine(seed, static_cast<std::size_t>(column.type));
 }
 
 void hash_aggregate_expression(std::size_t& seed, const plan::AggregateExpression& aggregate) {
     hash_string(seed, aggregate.output_name);
     hash_combine(seed, static_cast<std::size_t>(aggregate.function));
+    hash_combine(seed, static_cast<std::size_t>(aggregate.type));
     hash_combine(seed, aggregate.argument.has_value() ? 1 : 0);
     if (aggregate.argument.has_value()) {
         hash_column(seed, *aggregate.argument);
@@ -134,15 +144,19 @@ std::size_t structural_hash(const MemoExpression& expression) {
 }
 
 bool scalar_equal(const plan::BoundScalarExpr& left, const plan::BoundScalarExpr& right) {
-    if (left.index() != right.index()) {
+    if (left.type != right.type || left.value.index() != right.value.index()) {
         return false;
     }
-    if (const auto* left_column = std::get_if<plan::BoundColumnRef>(&left)) {
-        const auto& right_column = std::get<plan::BoundColumnRef>(right);
-        return left_column->binding == right_column.binding && left_column->column == right_column.column;
+    if (const auto* left_column = std::get_if<plan::BoundColumnRef>(&left.value)) {
+        const auto& right_column = std::get<plan::BoundColumnRef>(right.value);
+        return left_column->binding == right_column.binding && left_column->column == right_column.column &&
+               left_column->type == right_column.type;
     }
-    if (const auto* left_literal = std::get_if<sql::IntLiteral>(&left)) {
-        return left_literal->value == std::get<sql::IntLiteral>(right).value;
+    if (const auto* left_literal = std::get_if<sql::IntLiteral>(&left.value)) {
+        return left_literal->value == std::get<sql::IntLiteral>(right.value).value;
+    }
+    if (const auto* left_literal = std::get_if<sql::StringLiteral>(&left.value)) {
+        return left_literal->value == std::get<sql::StringLiteral>(right.value).value;
     }
     return true;
 }
@@ -172,16 +186,16 @@ bool predicate_equal(const plan::BoundPredicate& left, const plan::BoundPredicat
 }
 
 bool projection_equal(const plan::Projection& left, const plan::Projection& right) {
-    return left.output_name == right.output_name && scalar_equal(left.expression, right.expression);
+    return left.output_name == right.output_name && left.type == right.type && scalar_equal(left.expression, right.expression);
 }
 
 bool column_equal(const plan::BoundColumnRef& left, const plan::BoundColumnRef& right) {
-    return left.binding == right.binding && left.column == right.column;
+    return left.binding == right.binding && left.column == right.column && left.type == right.type;
 }
 
 bool aggregate_expression_equal(const plan::AggregateExpression& left, const plan::AggregateExpression& right) {
     if (left.output_name != right.output_name || left.function != right.function ||
-        left.argument.has_value() != right.argument.has_value()) {
+        left.type != right.type || left.argument.has_value() != right.argument.has_value()) {
         return false;
     }
     if (!left.argument.has_value()) {
@@ -240,14 +254,17 @@ const plan::LogicalPlan& require_right(const plan::LogicalPlan& logical) {
 }
 
 std::string expression_to_string(const plan::BoundScalarExpr& expression) {
-    if (const auto* column = std::get_if<plan::BoundColumnRef>(&expression)) {
+    if (const auto* column = std::get_if<plan::BoundColumnRef>(&expression.value)) {
         if (column->binding.empty()) {
             return "col(" + column->column + ")";
         }
         return "col(" + column->binding + "." + column->column + ")";
     }
-    if (const auto* literal = std::get_if<sql::IntLiteral>(&expression)) {
+    if (const auto* literal = std::get_if<sql::IntLiteral>(&expression.value)) {
         return "lit(" + std::to_string(literal->value) + ")";
+    }
+    if (const auto* literal = std::get_if<sql::StringLiteral>(&expression.value)) {
+        return "lit(" + sql::quote_string_literal(literal->value) + ")";
     }
     return "lit(NULL)";
 }
@@ -454,8 +471,10 @@ MemoExpression group_ref_expression(GroupId representative,
 // |L| * |R| / max(distinct(left_key), distinct(right_key)); non-equi joins use
 // the cross product. Distinct counts are heuristics derived from row counts:
 // scan columns start with distinct=row_count and later operators clamp them to
-// the estimated output rows. Estimates are clamped to finite non-negative
-// values; winner ties use exact double equality and lower expression index.
+// the estimated output rows. String columns intentionally reuse the same
+// row-count math in Phase 17a; value-width and collation-aware CPU costing are
+// future work. Estimates are clamped to finite non-negative values; winner ties
+// use exact double equality and lower expression index.
 constexpr double kMaxEstimate = 1.0e100;
 constexpr double kEqualitySelectivity = 0.10;
 constexpr double kNotEqualSelectivity = 0.90;
@@ -532,7 +551,7 @@ std::string column_key(const plan::BoundColumnRef& column) {
 }
 
 std::optional<std::int64_t> literal_value(const plan::BoundScalarExpr& expression) {
-    if (const auto* literal = std::get_if<sql::IntLiteral>(&expression)) {
+    if (const auto* literal = std::get_if<sql::IntLiteral>(&expression.value)) {
         return literal->value;
     }
     return std::nullopt;
@@ -635,8 +654,8 @@ std::optional<EquiJoinKeyEstimate> usable_equi_join_key(const plan::BoundPredica
         return std::nullopt;
     }
 
-    const auto* left_column = std::get_if<plan::BoundColumnRef>(&comparison.left);
-    const auto* right_column = std::get_if<plan::BoundColumnRef>(&comparison.right);
+    const auto* left_column = std::get_if<plan::BoundColumnRef>(&comparison.left.value);
+    const auto* right_column = std::get_if<plan::BoundColumnRef>(&comparison.right.value);
     if (left_column == nullptr || right_column == nullptr) {
         return std::nullopt;
     }
@@ -697,7 +716,7 @@ RelationEstimate project_estimate(const std::vector<plan::Projection>& projectio
     // Project is cost-neutral for join-order choice in this logical slice.
     estimate.cost = child.cost;
     for (const auto& projection : projections) {
-        if (const auto* column = std::get_if<plan::BoundColumnRef>(&projection.expression)) {
+        if (const auto* column = std::get_if<plan::BoundColumnRef>(&projection.expression.value)) {
             const auto key = column_key(*column);
             const auto it = child.distinct_by_column.find(key);
             if (it != child.distinct_by_column.end()) {
@@ -752,7 +771,7 @@ RelationEstimate distinct_estimate(RelationEstimate child, plan::OrderPermission
     if (child.plan.kind == plan::LogicalKind::Project) {
         distinct_rows = 1.0;
         for (const auto& projection : child.plan.projections) {
-            if (const auto* column = std::get_if<plan::BoundColumnRef>(&projection.expression)) {
+            if (const auto* column = std::get_if<plan::BoundColumnRef>(&projection.expression.value)) {
                 const auto it = child.distinct_by_column.find(column_key(*column));
                 distinct_rows = safe_multiply(distinct_rows, it == child.distinct_by_column.end() ? child.rows : it->second);
             } else {

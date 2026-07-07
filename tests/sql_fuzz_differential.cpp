@@ -19,6 +19,9 @@ namespace {
 
 constexpr std::size_t kDefaultSeedCount = 160;
 
+// Phase 17a deliberately keeps generated fuzz schemas int64-only. Hand-written
+// string differential cases exercise oracle rewrites plus the vectorized guard;
+// randomized string columns/literals wait for Phase 17b vectorized string kernels.
 using Cell = std::optional<std::int64_t>;
 
 struct GeneratedTable {

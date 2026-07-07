@@ -228,6 +228,31 @@ void assert_aliased_self_join_scans_remain_distinct_groups() {
     memo.assert_invariants();
 }
 
+void assert_string_literal_and_int_literal_are_distinct_memo_expressions() {
+    const auto catalog = make_catalog();
+    const auto int_literal = sql::bind_select(sql::parse_select("SELECT 1 AS x FROM t"), catalog);
+    const auto string_literal = sql::bind_select(sql::parse_select("SELECT '1' AS x FROM t"), catalog);
+
+    optimizer::Memo memo;
+    const auto int_root = memo.insert(int_literal);
+    const auto string_root = memo.insert(string_literal);
+    if (int_root == string_root) {
+        std::cerr << "typed literal memo expressions collided\n"
+                  << "int plan:\n"
+                  << plan::to_string(int_literal) << "\n"
+                  << "string plan:\n"
+                  << plan::to_string(string_literal) << "\n"
+                  << "memo dump:\n"
+                  << memo.dump();
+        std::terminate();
+    }
+
+    const auto dump = memo.dump();
+    assert(dump.find("Project[x=lit(1)]") != std::string::npos);
+    assert(dump.find("Project[x=lit('1')]") != std::string::npos);
+    memo.assert_invariants();
+}
+
 void assert_having_filter_round_trips_through_memo() {
     const auto catalog = make_catalog();
     const auto logical =
@@ -427,6 +452,7 @@ int main() {
     assert_memo_extracted_plan_matches_both_engines();
     assert_cross_group_duplicate_expression_merges_groups();
     assert_aliased_self_join_scans_remain_distinct_groups();
+    assert_string_literal_and_int_literal_are_distinct_memo_expressions();
     assert_having_filter_round_trips_through_memo();
     assert_filter_into_join_adds_pushdown_alternative();
     assert_filter_into_join_moves_one_side_or_but_not_mixed_side_or();

@@ -108,27 +108,71 @@ const TableScope& find_unqualified_scope(const ColumnRef& column, const std::vec
     return *matches.front();
 }
 
+catalog::ColumnType column_type_in_scope(const TableScope& scope, const ColumnRef& column) {
+    for (const auto& schema_column : scope.schema.columns) {
+        if (schema_column.name == column.name) {
+            return schema_column.type;
+        }
+    }
+    throw std::logic_error("resolved column is missing from scope schema");
+}
+
 plan::BoundColumnRef bind_column_ref(const ColumnRef& column, const std::vector<TableScope>& scopes) {
     const auto& scope =
         column.qualifier.has_value() ? find_qualified_scope(column, scopes) : find_unqualified_scope(column, scopes);
-    return plan::BoundColumnRef{scope.binding_name, column.name, column.position};
+    return plan::BoundColumnRef{scope.binding_name, column.name, column.position, column_type_in_scope(scope, column)};
 }
 
 plan::BoundScalarExpr bind_expression(const ScalarExpr& expression, const std::vector<TableScope>& scopes) {
     if (const auto* column = std::get_if<ColumnRef>(&expression)) {
-        return bind_column_ref(*column, scopes);
+        auto bound = bind_column_ref(*column, scopes);
+        return plan::BoundScalarExpr{bound, bound.type};
     }
     if (const auto* literal = std::get_if<IntLiteral>(&expression)) {
-        return *literal;
+        return plan::BoundScalarExpr{*literal, catalog::ColumnType::Int64};
     }
-    return std::get<NullLiteral>(expression);
+    if (const auto* literal = std::get_if<StringLiteral>(&expression)) {
+        return plan::BoundScalarExpr{*literal, catalog::ColumnType::String};
+    }
+    return plan::BoundScalarExpr{std::get<NullLiteral>(expression), catalog::ColumnType::Int64};
+}
+
+std::string type_name(catalog::ColumnType type) {
+    switch (type) {
+    case catalog::ColumnType::Int64:
+        return "int64";
+    case catalog::ColumnType::String:
+        return "string";
+    }
+    throw std::logic_error("unreachable column type");
+}
+
+bool is_null_literal(const plan::BoundScalarExpr& expression) {
+    return std::holds_alternative<NullLiteral>(expression.value);
+}
+
+void align_null_comparison_types(plan::BoundScalarExpr& left, plan::BoundScalarExpr& right) {
+    if (is_null_literal(left) && !is_null_literal(right)) {
+        left.type = right.type;
+    }
+    if (is_null_literal(right) && !is_null_literal(left)) {
+        right.type = left.type;
+    }
 }
 
 plan::BoundComparisonExpr bind_comparison(const ComparisonExpr& comparison, const std::vector<TableScope>& scopes) {
+    auto left = bind_expression(comparison.left, scopes);
+    auto right = bind_expression(comparison.right, scopes);
+    align_null_comparison_types(left, right);
+    if (left.type != right.type) {
+        throw BindError(comparison.operator_position,
+                        "comparison operands must have the same type: " + type_name(left.type) + " vs " +
+                            type_name(right.type));
+    }
     return plan::BoundComparisonExpr{
-        bind_expression(comparison.left, scopes),
+        std::move(left),
         comparison.op,
-        bind_expression(comparison.right, scopes),
+        std::move(right),
         comparison.operator_position,
     };
 }
@@ -220,11 +264,41 @@ plan::AggregateExpression bind_aggregate_call(const AggregateCall& aggregate,
         argument = bind_column_ref(*aggregate.argument, scopes);
     }
 
-    return plan::AggregateExpression{output_name(aggregate), aggregate.function, std::move(argument), aggregate.position};
+    auto output_type = catalog::ColumnType::Int64;
+    switch (aggregate.function) {
+    case AggregateFunction::Count:
+        output_type = catalog::ColumnType::Int64;
+        break;
+    case AggregateFunction::Sum:
+        if (!argument.has_value()) {
+            throw BindError(aggregate.position, "SUM requires int64 argument, got <missing>");
+        }
+        if (argument->type != catalog::ColumnType::Int64) {
+            throw BindError(aggregate.position, "SUM requires int64 argument, got " + type_name(argument->type));
+        }
+        output_type = catalog::ColumnType::Int64;
+        break;
+    case AggregateFunction::Min:
+    case AggregateFunction::Max:
+        if (!argument.has_value()) {
+            throw BindError(aggregate.position,
+                            aggregate_function_name(aggregate.function) + " requires an argument");
+        }
+        output_type = argument->type;
+        break;
+    }
+
+    return plan::AggregateExpression{
+        output_name(aggregate),
+        aggregate.function,
+        std::move(argument),
+        aggregate.position,
+        output_type,
+    };
 }
 
 plan::BoundColumnRef aggregate_output_ref(const plan::AggregateExpression& aggregate, std::size_t position) {
-    return plan::BoundColumnRef{"", aggregate.output_name, position};
+    return plan::BoundColumnRef{"", aggregate.output_name, position, aggregate.type};
 }
 
 plan::BoundColumnRef ensure_aggregate_expression(const AggregateCall& aggregate,
@@ -254,6 +328,15 @@ bool has_output_name(const std::vector<std::string>& output_names, const std::st
     return std::find(output_names.begin(), output_names.end(), name) != output_names.end();
 }
 
+catalog::ColumnType output_type_for_name(const std::vector<plan::Projection>& projections, const std::string& name) {
+    for (const auto& projection : projections) {
+        if (projection.output_name == name) {
+            return projection.type;
+        }
+    }
+    throw std::logic_error("resolved output name is missing from projections");
+}
+
 plan::BoundScalarExpr bind_having_expression(const HavingExpr& expression,
                                              const std::vector<TableScope>& scopes,
                                              const std::vector<plan::BoundColumnRef>& group_keys,
@@ -265,27 +348,34 @@ plan::BoundScalarExpr bind_having_expression(const HavingExpr& expression,
                             "HAVING column '" + output_name(*column) +
                                 "' must be a GROUP BY column or aggregate expression");
         }
-        return bound;
+        return plan::BoundScalarExpr{bound, bound.type};
     }
     if (const auto* literal = std::get_if<IntLiteral>(&expression)) {
-        return *literal;
+        return plan::BoundScalarExpr{*literal, catalog::ColumnType::Int64};
+    }
+    if (const auto* literal = std::get_if<StringLiteral>(&expression)) {
+        return plan::BoundScalarExpr{*literal, catalog::ColumnType::String};
     }
     if (const auto* literal = std::get_if<NullLiteral>(&expression)) {
-        return *literal;
+        return plan::BoundScalarExpr{*literal, catalog::ColumnType::Int64};
     }
-    return ensure_aggregate_expression(std::get<AggregateCall>(expression), scopes, aggregate_expressions);
+    auto aggregate_ref = ensure_aggregate_expression(std::get<AggregateCall>(expression), scopes, aggregate_expressions);
+    return plan::BoundScalarExpr{aggregate_ref, aggregate_ref.type};
 }
 
 plan::BoundComparisonExpr bind_having_comparison(const HavingComparisonExpr& comparison,
                                                  const std::vector<TableScope>& scopes,
                                                  const std::vector<plan::BoundColumnRef>& group_keys,
                                                  std::vector<plan::AggregateExpression>& aggregate_expressions) {
-    return plan::BoundComparisonExpr{
-        bind_having_expression(comparison.left, scopes, group_keys, aggregate_expressions),
-        comparison.op,
-        bind_having_expression(comparison.right, scopes, group_keys, aggregate_expressions),
-        comparison.operator_position,
-    };
+    auto left = bind_having_expression(comparison.left, scopes, group_keys, aggregate_expressions);
+    auto right = bind_having_expression(comparison.right, scopes, group_keys, aggregate_expressions);
+    align_null_comparison_types(left, right);
+    if (left.type != right.type) {
+        throw BindError(comparison.operator_position,
+                        "comparison operands must have the same type: " + type_name(left.type) + " vs " +
+                            type_name(right.type));
+    }
+    return plan::BoundComparisonExpr{std::move(left), comparison.op, std::move(right), comparison.operator_position};
 }
 
 plan::BoundPredicate bind_having_predicate(const HavingPredicateExpr& predicate,
@@ -339,14 +429,16 @@ std::vector<plan::SortKey> bind_order_by_keys(const std::vector<OrderByKey>& key
                                               const std::vector<plan::BoundColumnRef>& group_keys,
                                               bool aggregate_query,
                                               bool distinct_query,
-                                              const std::vector<std::string>& output_names) {
+                                              const std::vector<std::string>& output_names,
+                                              const std::vector<plan::Projection>& projections) {
     std::vector<plan::SortKey> bound;
     bound.reserve(keys.size());
     for (const auto& key : keys) {
         const auto name = output_name(key.expression);
         if (has_output_name(output_names, name)) {
-            bound.push_back(plan::SortKey{plan::BoundColumnRef{"", name, expression_position(key.expression)},
-                                          key.direction});
+            bound.push_back(plan::SortKey{
+                plan::BoundColumnRef{"", name, expression_position(key.expression), output_type_for_name(projections, name)},
+                key.direction});
             continue;
         }
 
@@ -413,7 +505,8 @@ plan::LogicalPlan bind_select(const SelectQuery& query, const catalog::Catalog& 
             const auto aggregate_ref = ensure_aggregate_expression(*aggregate, scopes, aggregate_expressions);
             projections.push_back(plan::Projection{
                 name,
-                aggregate_ref,
+                plan::BoundScalarExpr{aggregate_ref, aggregate_ref.type},
+                aggregate_ref.type,
             });
             continue;
         }
@@ -421,7 +514,7 @@ plan::LogicalPlan bind_select(const SelectQuery& query, const catalog::Catalog& 
         const auto& scalar = std::get<ScalarExpr>(item.expression);
         auto expression = bind_expression(scalar, scopes);
         if (aggregate_query) {
-            if (const auto* column = std::get_if<plan::BoundColumnRef>(&expression);
+            if (const auto* column = std::get_if<plan::BoundColumnRef>(&expression.value);
                 column != nullptr && !contains_group_key(group_keys, *column)) {
                 const auto& parsed_column = std::get<ColumnRef>(scalar);
                 throw BindError(parsed_column.position,
@@ -429,7 +522,8 @@ plan::LogicalPlan bind_select(const SelectQuery& query, const catalog::Catalog& 
                                     "' must appear in GROUP BY or be aggregated");
             }
         }
-        projections.push_back(plan::Projection{std::move(name), std::move(expression)});
+        const auto type = expression.type;
+        projections.push_back(plan::Projection{std::move(name), std::move(expression), type});
     }
 
     std::vector<plan::BoundPredicate> having_predicates;
@@ -438,7 +532,7 @@ plan::LogicalPlan bind_select(const SelectQuery& query, const catalog::Catalog& 
     }
 
     auto sort_keys =
-        bind_order_by_keys(query.order_by, scopes, group_keys, aggregate_query, query.distinct, output_name_order);
+        bind_order_by_keys(query.order_by, scopes, group_keys, aggregate_query, query.distinct, output_name_order, projections);
 
     auto plan = plan::LogicalPlan::scan(query.table, binding_name(query));
     std::vector<TableScope> visible_scopes;
