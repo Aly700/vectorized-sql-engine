@@ -379,6 +379,8 @@ std::optional<plan::LogicalPlan> rewrite_once(
     }
     case plan::LogicalKind::Scan:
         break;
+    case plan::LogicalKind::Explain:
+        throw std::invalid_argument("EXPLAIN logical plans cannot be rewritten directly");
     }
 
     for (const auto& rule : rules) {

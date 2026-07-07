@@ -382,6 +382,8 @@ inline bool contains_join(const plan::LogicalPlan& logical) {
     case plan::LogicalKind::Distinct:
     case plan::LogicalKind::Limit:
         return logical.input != nullptr && contains_join(*logical.input);
+    case plan::LogicalKind::Explain:
+        return false;
     }
     throw std::logic_error("unreachable logical plan kind");
 }
@@ -559,6 +561,28 @@ inline bool compare_engines(const std::string& sql,
     try {
         const auto parsed = sql::parse_select(sql);
         const auto logical = sql::bind_select(parsed, catalog);
+        if (logical.kind == plan::LogicalKind::Explain) {
+            const auto interpreted = run_execution_path(
+                "EXPLAIN interpreted",
+                [&] { return execution::execute_interpreted(logical, catalog); },
+                stats);
+            const auto vectorized = run_execution_path(
+                "EXPLAIN vectorized",
+                [&] { return execution::execute_vectorized(logical, catalog); },
+                stats);
+            if (interpreted.batch.has_value() && vectorized.batch.has_value() &&
+                same_batch(*interpreted.batch, *vectorized.batch)) {
+                return true;
+            }
+            std::cerr << "EXPLAIN engine divergence\n"
+                      << "sql: " << sql << "\n"
+                      << table_text << "\n"
+                      << "plan:\n"
+                      << plan::to_string(logical) << "\n"
+                      << "interpreted: " << format_outcome(interpreted) << "\n"
+                      << "vectorized:  " << format_outcome(vectorized) << "\n";
+            return false;
+        }
         const auto is_join_query = contains_join(logical);
         const auto* order_keys = root_sort_keys(logical);
         const auto limit_count = root_limit_count(logical);
@@ -583,7 +607,7 @@ inline bool compare_engines(const std::string& sql,
         optimizer::Memo memo;
         const auto root = memo.insert(logical);
         const auto explored = optimizer::explore_memo_to_fixpoint(memo, optimizer::default_memo_rules());
-        const auto alternatives = memo.extract_alternatives(root, optimizer::AlternativeExtractionOptions{64, 512});
+        const auto alternatives = memo.extract_alternatives(root, optimizer::AlternativeExtractionOptions{256, 4096});
         if (stats != nullptr) {
             stats->alternative_count = alternatives.plans.size();
             stats->max_group_expression_count = alternatives.max_group_expression_count;

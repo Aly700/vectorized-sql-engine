@@ -561,6 +561,8 @@ bool contains_join(const plan::LogicalPlan& logical) {
     case plan::LogicalKind::Distinct:
     case plan::LogicalKind::Limit:
         return logical.input != nullptr && contains_join(*logical.input);
+    case plan::LogicalKind::Explain:
+        return false;
     }
     throw std::logic_error("unreachable logical plan kind");
 }
@@ -628,6 +630,8 @@ bool run_result_golden_queries() {
         "SELECT k, v FROM nullable ORDER BY k ASC",
         "SELECT k, v FROM nullable ORDER BY k DESC",
         "SELECT COUNT(*), COUNT(b), SUM(a), MIN(b), MAX(b) FROM t",
+        "SELECT SUM(a) FROM t HAVING COUNT(*) > 0",
+        "SELECT SUM(a) FROM t HAVING COUNT(*) > 100",
         "SELECT b, COUNT(*), SUM(a), MIN(a), MAX(a) FROM t GROUP BY b",
         "SELECT b, COUNT(*) FROM t GROUP BY b ORDER BY b DESC",
         "SELECT g, COUNT(*), COUNT(x), SUM(x), MIN(x), MAX(x) FROM agg_null GROUP BY g",
@@ -819,6 +823,7 @@ bool run_vectorized_string_corpus() {
         "SELECT s FROM strings ORDER BY s ASC LIMIT 3",
         "SELECT id, s, 'x' AS literal FROM strings WHERE s IS NOT NULL ORDER BY id ASC",
         "SELECT id, s FROM strings WHERE s = '' OR s IS NULL ORDER BY id ASC",
+        "EXPLAIN SELECT id, s FROM strings WHERE s IS NULL",
     };
 
     bool ok = true;

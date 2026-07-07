@@ -896,6 +896,8 @@ RelationEstimate estimate_logical_relation(const plan::LogicalPlan& logical, con
                              estimate_logical_relation(require_left(logical), catalog),
                              estimate_logical_relation(require_right(logical), catalog),
                              logical.order_permission);
+    case plan::LogicalKind::Explain:
+        throw std::invalid_argument("EXPLAIN logical plans cannot be costed directly");
     }
     throw std::logic_error("unreachable logical plan kind");
 }
@@ -1044,6 +1046,8 @@ GroupId Memo::insert(const plan::LogicalPlan& logical) {
         expression.children.push_back(insert(require_left(logical)));
         expression.children.push_back(insert(require_right(logical)));
         return insert_expression(std::move(expression));
+    case plan::LogicalKind::Explain:
+        throw std::invalid_argument("EXPLAIN logical plans cannot be inserted into the memo");
     }
     throw std::logic_error("unreachable logical plan kind");
 }
