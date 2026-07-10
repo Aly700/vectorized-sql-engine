@@ -82,6 +82,17 @@ struct GeneratedCase {
     std::size_t right_join_count{0};
     std::size_t null_key_join_count{0};
     bool has_mixed_inner_outer_chain{false};
+    bool has_scalar_subquery{false};
+    bool has_in_subquery{false};
+    bool has_not_in_subquery{false};
+    bool has_exists_subquery{false};
+    bool has_not_exists_subquery{false};
+    bool has_nested_subquery{false};
+    bool has_subquery_join{false};
+    bool has_subquery_aggregate{false};
+    bool has_null_bearing_subquery{false};
+    bool has_empty_subquery{false};
+    bool has_or_embedded_subquery{false};
 };
 
 std::string sql_text(const ColumnRef& ref) {
@@ -188,7 +199,7 @@ bool contains_string(const std::vector<std::string>& values, const std::string& 
 
 class QueryGenerator {
 public:
-    explicit QueryGenerator(std::uint64_t seed) : rng_(seed) {}
+    explicit QueryGenerator(std::uint64_t seed) : seed_(seed), rng_(seed) {}
 
     GeneratedCase generate() {
         saw_string_join_key_ = false;
@@ -196,6 +207,7 @@ public:
         left_join_count_ = 0;
         right_join_count_ = 0;
         null_key_join_count_ = 0;
+        reset_subquery_coverage();
         auto tables = generate_tables();
         auto catalog = make_catalog(tables);
         auto ranges = choose_ranges(tables);
@@ -237,9 +249,11 @@ public:
         }
         sql << " FROM " << from_sql;
 
+        sql << " WHERE ";
         if (chance(58)) {
-            sql << " WHERE " << predicate_tree(all_columns, 2);
+            sql << predicate_tree(all_columns, 2) << " AND ";
         }
+        sql << subquery_predicate(all_columns, tables);
         if (!group_keys.empty()) {
             sql << " GROUP BY ";
             for (std::size_t i = 0; i < group_keys.size(); ++i) {
@@ -285,7 +299,18 @@ public:
                              left_join_count_,
                              right_join_count_,
                              null_key_join_count_,
-                             inner_join_count_ != 0 && (left_join_count_ != 0 || right_join_count_ != 0)};
+                             inner_join_count_ != 0 && (left_join_count_ != 0 || right_join_count_ != 0),
+                             has_scalar_subquery_,
+                             has_in_subquery_,
+                             has_not_in_subquery_,
+                             has_exists_subquery_,
+                             has_not_exists_subquery_,
+                             has_nested_subquery_,
+                             has_subquery_join_,
+                             has_subquery_aggregate_,
+                             has_null_bearing_subquery_,
+                             has_empty_subquery_,
+                             has_or_embedded_subquery_};
     }
 
 private:
@@ -570,6 +595,103 @@ private:
             return sql_text(column) + " " + op + " " + literal(column.type);
         }
         return literal(column.type) + " " + op + " " + sql_text(column);
+    }
+
+    const std::string& table_column_of_type(const GeneratedTable& table, catalog::ColumnType type) const {
+        for (std::size_t i = 0; i < table.columns.size(); ++i) {
+            if (table.types[i] == type) {
+                return table.columns[i];
+            }
+        }
+        throw std::logic_error("generated table has no column of required subquery type");
+    }
+
+    void reset_subquery_coverage() {
+        has_scalar_subquery_ = false;
+        has_in_subquery_ = false;
+        has_not_in_subquery_ = false;
+        has_exists_subquery_ = false;
+        has_not_exists_subquery_ = false;
+        has_nested_subquery_ = false;
+        has_subquery_join_ = false;
+        has_subquery_aggregate_ = false;
+        has_null_bearing_subquery_ = false;
+        has_empty_subquery_ = false;
+        has_or_embedded_subquery_ = false;
+    }
+
+    std::string subquery_predicate(const std::vector<ColumnRef>& outer_columns,
+                                   const std::vector<GeneratedTable>& tables) {
+        const auto mode = static_cast<std::size_t>((seed_ - 1) % 10);
+        const auto outer = pick(outer_columns);
+        const auto& first = pick(tables);
+        const auto& second = pick(tables);
+        const auto& first_typed_column = table_column_of_type(first, outer.type);
+        const auto& second_int_column = table_column_of_type(second, catalog::ColumnType::Int64);
+        const auto outer_text = sql_text(outer);
+        const auto ordinary = outer_text + " = " + literal(outer.type);
+
+        switch (mode) {
+        case 0:
+            has_scalar_subquery_ = true;
+            has_subquery_aggregate_ = true;
+            return outer_text + " " + comparison_op_text(random_op()) + " (SELECT MAX(sq0." +
+                   first_typed_column + ") FROM " + first.name + " AS sq0)";
+        case 1:
+            has_in_subquery_ = true;
+            return outer_text + " IN (SELECT sq0." + first_typed_column + " FROM " + first.name +
+                   " AS sq0)";
+        case 2: {
+            has_not_in_subquery_ = true;
+            has_subquery_aggregate_ = true;
+            has_null_bearing_subquery_ = true;
+            const auto outer_int = pick(columns_of_type(outer_columns, catalog::ColumnType::Int64));
+            const auto& inner_int = table_column_of_type(first, catalog::ColumnType::Int64);
+            return sql_text(outer_int) + " NOT IN (SELECT MAX(sq0." + inner_int + ") FROM " + first.name +
+                   " AS sq0 WHERE 1 = 0)";
+        }
+        case 3:
+            has_exists_subquery_ = true;
+            has_empty_subquery_ = true;
+            return "EXISTS (SELECT sq0." + first_typed_column + " FROM " + first.name +
+                   " AS sq0 WHERE 1 = 0)";
+        case 4:
+            has_not_exists_subquery_ = true;
+            has_subquery_join_ = true;
+            return "NOT EXISTS (SELECT sq0." + table_column_of_type(first, catalog::ColumnType::Int64) +
+                   " FROM " + first.name + " AS sq0 JOIN " + second.name + " AS sq1 ON sq0." +
+                   table_column_of_type(first, catalog::ColumnType::Int64) + " = sq1." + second_int_column + ")";
+        case 5:
+            has_in_subquery_ = true;
+            has_exists_subquery_ = true;
+            has_nested_subquery_ = true;
+            return outer_text + " IN (SELECT sq0." + first_typed_column + " FROM " + first.name +
+                   " AS sq0 WHERE EXISTS (SELECT sq1." + second_int_column + " FROM " + second.name +
+                   " AS sq1 WHERE 1 = 1))";
+        case 6:
+            has_in_subquery_ = true;
+            has_subquery_join_ = true;
+            return outer_text + " IN (SELECT sq0." + first_typed_column + " FROM " + first.name +
+                   " AS sq0 JOIN " + second.name + " AS sq1 ON sq0." +
+                   table_column_of_type(first, catalog::ColumnType::Int64) + " = sq1." + second_int_column + ")";
+        case 7:
+            has_scalar_subquery_ = true;
+            has_subquery_join_ = true;
+            has_subquery_aggregate_ = true;
+            return outer_text + " = (SELECT MAX(sq0." + first_typed_column + ") FROM " + first.name +
+                   " AS sq0 JOIN " + second.name + " AS sq1 ON sq0." +
+                   table_column_of_type(first, catalog::ColumnType::Int64) + " = sq1." + second_int_column + ")";
+        case 8:
+            has_in_subquery_ = true;
+            has_or_embedded_subquery_ = true;
+            return "(" + ordinary + " OR " + outer_text + " IN (SELECT sq0." + first_typed_column +
+                   " FROM " + first.name + " AS sq0))";
+        default:
+            has_exists_subquery_ = true;
+            has_or_embedded_subquery_ = true;
+            return "(" + ordinary + " OR EXISTS (SELECT sq0." + first_typed_column + " FROM " + first.name +
+                   " AS sq0))";
+        }
     }
 
     std::string having_tree(const std::vector<ColumnRef>& group_keys,
@@ -886,6 +1008,7 @@ private:
         return values[between(0, values.size() - 1)];
     }
 
+    std::uint64_t seed_{0};
     std::mt19937_64 rng_;
     std::size_t next_output_alias_{0};
     std::vector<std::string> used_output_aliases_;
@@ -895,6 +1018,17 @@ private:
     std::size_t left_join_count_{0};
     std::size_t right_join_count_{0};
     std::size_t null_key_join_count_{0};
+    bool has_scalar_subquery_{false};
+    bool has_in_subquery_{false};
+    bool has_not_in_subquery_{false};
+    bool has_exists_subquery_{false};
+    bool has_not_exists_subquery_{false};
+    bool has_nested_subquery_{false};
+    bool has_subquery_join_{false};
+    bool has_subquery_aggregate_{false};
+    bool has_null_bearing_subquery_{false};
+    bool has_empty_subquery_{false};
+    bool has_or_embedded_subquery_{false};
 };
 
 std::optional<std::uint64_t> parse_seed_arg(int argc, char** argv) {
@@ -972,6 +1106,20 @@ int main(int argc, char** argv) {
     std::size_t right_joins = 0;
     std::size_t null_key_joins = 0;
     std::size_t mixed_inner_outer_chain_queries = 0;
+    std::size_t scalar_subquery_queries = 0;
+    std::size_t in_subquery_queries = 0;
+    std::size_t not_in_subquery_queries = 0;
+    std::size_t exists_subquery_queries = 0;
+    std::size_t not_exists_subquery_queries = 0;
+    std::size_t nested_subquery_queries = 0;
+    std::size_t subquery_join_queries = 0;
+    std::size_t subquery_aggregate_queries = 0;
+    std::size_t null_bearing_subquery_queries = 0;
+    std::size_t empty_subquery_queries = 0;
+    std::size_t or_embedded_subquery_queries = 0;
+    std::size_t exists_to_semi_firings = 0;
+    std::size_t not_exists_to_anti_firings = 0;
+    std::size_t in_to_semi_firings = 0;
     std::size_t left_join_to_inner_firings = 0;
     std::size_t join_commute_firings = 0;
     std::size_t join_associate_firings = 0;
@@ -1001,6 +1149,20 @@ int main(int argc, char** argv) {
         right_joins += generated.right_join_count;
         null_key_joins += generated.null_key_join_count;
         mixed_inner_outer_chain_queries += generated.has_mixed_inner_outer_chain ? 1 : 0;
+        scalar_subquery_queries += generated.has_scalar_subquery ? 1 : 0;
+        in_subquery_queries += generated.has_in_subquery ? 1 : 0;
+        not_in_subquery_queries += generated.has_not_in_subquery ? 1 : 0;
+        exists_subquery_queries += generated.has_exists_subquery ? 1 : 0;
+        not_exists_subquery_queries += generated.has_not_exists_subquery ? 1 : 0;
+        nested_subquery_queries += generated.has_nested_subquery ? 1 : 0;
+        subquery_join_queries += generated.has_subquery_join ? 1 : 0;
+        subquery_aggregate_queries += generated.has_subquery_aggregate ? 1 : 0;
+        null_bearing_subquery_queries += generated.has_null_bearing_subquery ? 1 : 0;
+        empty_subquery_queries += generated.has_empty_subquery ? 1 : 0;
+        or_embedded_subquery_queries += generated.has_or_embedded_subquery ? 1 : 0;
+        exists_to_semi_firings += stats.exists_to_semi_firings;
+        not_exists_to_anti_firings += stats.not_exists_to_anti_firings;
+        in_to_semi_firings += stats.in_to_semi_firings;
         left_join_to_inner_firings += stats.left_join_to_inner_firings;
         join_commute_firings += stats.join_commute_firings;
         join_associate_firings += stats.join_associate_firings;
@@ -1010,13 +1172,32 @@ int main(int argc, char** argv) {
 
     if (seeds.size() == kDefaultSeedCount &&
         (left_joins == 0 || right_joins == 0 || null_key_joins == 0 || mixed_inner_outer_chain_queries == 0 ||
-         left_join_to_inner_firings == 0 || join_associate_firings == 0)) {
-        std::cerr << "default fuzz corpus missed required outer-join coverage\n"
+         left_join_to_inner_firings == 0 || join_associate_firings == 0 || scalar_subquery_queries == 0 ||
+         in_subquery_queries == 0 || not_in_subquery_queries == 0 || exists_subquery_queries == 0 ||
+         not_exists_subquery_queries == 0 || nested_subquery_queries == 0 || subquery_join_queries == 0 ||
+         subquery_aggregate_queries == 0 || null_bearing_subquery_queries == 0 || empty_subquery_queries == 0 ||
+         or_embedded_subquery_queries == 0 || exists_to_semi_firings == 0 || not_exists_to_anti_firings == 0 ||
+         in_to_semi_firings == 0)) {
+        std::cerr << "default fuzz corpus missed required outer-join or subquery coverage\n"
                   << "left_joins=" << left_joins << " right_joins=" << right_joins
                   << " null_key_joins=" << null_key_joins
                   << " mixed_inner_outer_chain_queries=" << mixed_inner_outer_chain_queries
                   << " left_join_to_inner_firings=" << left_join_to_inner_firings
-                  << " join_associate_firings=" << join_associate_firings << "\n";
+                  << " join_associate_firings=" << join_associate_firings
+                  << " scalar_subquery_queries=" << scalar_subquery_queries
+                  << " in_subquery_queries=" << in_subquery_queries
+                  << " not_in_subquery_queries=" << not_in_subquery_queries
+                  << " exists_subquery_queries=" << exists_subquery_queries
+                  << " not_exists_subquery_queries=" << not_exists_subquery_queries
+                  << " nested_subquery_queries=" << nested_subquery_queries
+                  << " subquery_join_queries=" << subquery_join_queries
+                  << " subquery_aggregate_queries=" << subquery_aggregate_queries
+                  << " null_bearing_subquery_queries=" << null_bearing_subquery_queries
+                  << " empty_subquery_queries=" << empty_subquery_queries
+                  << " or_embedded_subquery_queries=" << or_embedded_subquery_queries
+                  << " exists_to_semi_firings=" << exists_to_semi_firings
+                  << " not_exists_to_anti_firings=" << not_exists_to_anti_firings
+                  << " in_to_semi_firings=" << in_to_semi_firings << "\n";
         return 1;
     }
 
@@ -1035,6 +1216,20 @@ int main(int argc, char** argv) {
               << " right_joins=" << right_joins
               << " null_key_joins=" << null_key_joins
               << " mixed_inner_outer_chain_queries=" << mixed_inner_outer_chain_queries
+              << " scalar_subquery_queries=" << scalar_subquery_queries
+              << " in_subquery_queries=" << in_subquery_queries
+              << " not_in_subquery_queries=" << not_in_subquery_queries
+              << " exists_subquery_queries=" << exists_subquery_queries
+              << " not_exists_subquery_queries=" << not_exists_subquery_queries
+              << " nested_subquery_queries=" << nested_subquery_queries
+              << " subquery_join_queries=" << subquery_join_queries
+              << " subquery_aggregate_queries=" << subquery_aggregate_queries
+              << " null_bearing_subquery_queries=" << null_bearing_subquery_queries
+              << " empty_subquery_queries=" << empty_subquery_queries
+              << " or_embedded_subquery_queries=" << or_embedded_subquery_queries
+              << " exists_to_semi_firings=" << exists_to_semi_firings
+              << " not_exists_to_anti_firings=" << not_exists_to_anti_firings
+              << " in_to_semi_firings=" << in_to_semi_firings
               << " left_join_to_inner_firings=" << left_join_to_inner_firings
               << " join_commute_firings=" << join_commute_firings
               << " join_associate_firings=" << join_associate_firings

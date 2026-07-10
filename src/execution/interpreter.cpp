@@ -814,13 +814,19 @@ storage::ColumnarBatch execute_join(const plan::LogicalPlan& plan, ExecutionCont
     const auto right = execute_node(require_right(plan), context);
 
     std::vector<std::string> output_names = left.column_names();
-    output_names.insert(output_names.end(), right.column_names().begin(), right.column_names().end());
+    const auto emits_right_columns =
+        plan.join_kind == plan::JoinKind::Inner || plan.join_kind == plan::JoinKind::Left;
+    if (emits_right_columns) {
+        output_names.insert(output_names.end(), right.column_names().begin(), right.column_names().end());
+    }
     std::vector<OutputColumn> output_columns(output_names.size());
     for (std::size_t i = 0; i < left.column_names().size(); ++i) {
         output_columns[i].type = left.column_type(left.column_names()[i]);
     }
-    for (std::size_t i = 0; i < right.column_names().size(); ++i) {
-        output_columns[left.column_names().size() + i].type = right.column_type(right.column_names()[i]);
+    if (emits_right_columns) {
+        for (std::size_t i = 0; i < right.column_names().size(); ++i) {
+            output_columns[left.column_names().size() + i].type = right.column_type(right.column_names()[i]);
+        }
     }
 
     auto append_output_row = [&](std::size_t left_row, std::optional<std::size_t> right_row) {
@@ -828,10 +834,12 @@ storage::ColumnarBatch execute_join(const plan::LogicalPlan& plan, ExecutionCont
         for (const auto& column_name : left.column_names()) {
             output_columns[output_index++].append(cell_at(left, column_name, left_row));
         }
-        for (const auto& column_name : right.column_names()) {
-            output_columns[output_index++].append(right_row.has_value()
-                                                      ? cell_at(right, column_name, *right_row)
-                                                      : null_cell(right.column_type(column_name)));
+        if (emits_right_columns) {
+            for (const auto& column_name : right.column_names()) {
+                output_columns[output_index++].append(right_row.has_value()
+                                                          ? cell_at(right, column_name, *right_row)
+                                                          : null_cell(right.column_type(column_name)));
+            }
         }
     };
 
@@ -847,9 +855,18 @@ storage::ColumnarBatch execute_join(const plan::LogicalPlan& plan, ExecutionCont
             }
 
             matched = true;
+            if (plan.join_kind == plan::JoinKind::Semi) {
+                append_output_row(left_row, std::nullopt);
+                break;
+            }
+            if (plan.join_kind == plan::JoinKind::Anti) {
+                break;
+            }
             append_output_row(left_row, right_row);
         }
         if (!matched && plan.join_kind == plan::JoinKind::Left) {
+            append_output_row(left_row, std::nullopt);
+        } else if (!matched && plan.join_kind == plan::JoinKind::Anti) {
             append_output_row(left_row, std::nullopt);
         }
     }

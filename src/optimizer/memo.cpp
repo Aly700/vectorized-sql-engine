@@ -27,9 +27,9 @@ void hash_logical_plan(std::size_t& seed, const plan::LogicalPlan& logical);
 bool logical_plan_equal(const plan::LogicalPlan& left, const plan::LogicalPlan& right);
 
 void hash_scalar(std::size_t& seed, const plan::BoundScalarExpr& expression) {
-    // Phase 21a subplans are opaque memo fields: hash their immutable logical
-    // trees recursively for identity, but never ingest their operators as memo
-    // children or expose them to exploration rules.
+    // Embedded subplans are opaque structural fields until a proof-bearing
+    // decorrelation rule explicitly lifts one into a SEMI/ANTI right child.
+    // Hash their immutable trees recursively so residual forms retain identity.
     hash_combine(seed, static_cast<std::size_t>(expression.type));
     if (const auto* column = std::get_if<plan::BoundColumnRef>(&expression.value)) {
         hash_combine(seed, 1);
@@ -476,6 +476,10 @@ std::string join_kind_to_string(plan::JoinKind kind) {
         return "Join";
     case plan::JoinKind::Left:
         return "LeftJoin";
+    case plan::JoinKind::Semi:
+        return "SemiJoin";
+    case plan::JoinKind::Anti:
+        return "AntiJoin";
     }
     throw std::logic_error("unreachable join kind");
 }
@@ -1055,14 +1059,31 @@ RelationEstimate join_estimate(const std::vector<plan::BoundPredicate>& predicat
 
     RelationEstimate estimate;
     const auto inner_rows = safe_multiply(base_rows, residual_selectivity);
-    estimate.rows = join_kind == plan::JoinKind::Left ? std::max(inner_rows, left.rows) : inner_rows;
-    // Equi-join cost models a linear hash build+probe; without an equi key the
-    // logical alternative is costed as nested-loop work over every pair.
-    const auto local_cost = equi_key.has_value() ? safe_add(left.rows, right.rows) : cross_rows;
+    // Semi/Anti cardinality is deliberately heuristic until match-frequency
+    // statistics exist. `s=0.5` is the documented probability that a left row
+    // has at least one TRUE match; Anti uses its exact complement. Both kinds
+    // emit only left rows, never pair multiplicity.
+    constexpr double semi_match_selectivity = 0.5;
+    if (join_kind == plan::JoinKind::Semi) {
+        estimate.rows = safe_multiply(left.rows, semi_match_selectivity);
+    } else if (join_kind == plan::JoinKind::Anti) {
+        estimate.rows = safe_multiply(left.rows, 1.0 - semi_match_selectivity);
+    } else {
+        estimate.rows = join_kind == plan::JoinKind::Left ? std::max(inner_rows, left.rows) : inner_rows;
+    }
+    // Equi-joins model a linear right build plus left probe. Keyless Semi/Anti
+    // (EXISTS/NOT EXISTS) likewise materialize the right once and test only its
+    // emptiness. A residual-only join retains nested-loop pair work.
+    const auto keyless_existence =
+        (join_kind == plan::JoinKind::Semi || join_kind == plan::JoinKind::Anti) && predicates.empty();
+    const auto local_cost =
+        equi_key.has_value() || keyless_existence ? safe_add(left.rows, right.rows) : cross_rows;
     estimate.cost = safe_add(safe_add(safe_add(left.cost, right.cost), local_cost),
                              predicates_subquery_cost(predicates, catalog));
     estimate.distinct_by_column = left.distinct_by_column;
-    estimate.distinct_by_column.insert(right.distinct_by_column.begin(), right.distinct_by_column.end());
+    if (join_kind == plan::JoinKind::Inner || join_kind == plan::JoinKind::Left) {
+        estimate.distinct_by_column.insert(right.distinct_by_column.begin(), right.distinct_by_column.end());
+    }
     for (auto& [_, distinct] : estimate.distinct_by_column) {
         distinct = std::min(distinct, estimate.rows);
     }
@@ -1223,9 +1244,10 @@ private:
 } // namespace
 
 GroupId Memo::insert(const plan::LogicalPlan& logical) {
-    // Embedded subplans stay inside predicates/scalars. The structural helpers
-    // above include their full trees, while this relational ingest deliberately
-    // follows only input/left/right so Phase 21a exploration cannot enter them.
+    // Embedded subplans stay inside predicates/scalars by default. Structural
+    // helpers include their full trees, while ordinary relational ingest follows
+    // only input/left/right. Phase 21b rules explicitly call insert() only after
+    // proving a top-level EXISTS/IN leaf can be lifted to SEMI/ANTI algebra.
     MemoExpression expression;
     expression.order_permission = logical.order_permission;
     switch (logical.kind) {

@@ -22,10 +22,6 @@ namespace {
 enum class TruthValue { False, True, Unknown };
 enum class KernelDispatch { Int64Only, Typed };
 
-[[noreturn]] void throw_subquery_not_supported() {
-    throw std::invalid_argument(plan::kVectorizedSubqueryNotSupported);
-}
-
 using SelectionVector = std::vector<std::size_t>;
 using SelectionVectorPtr = std::shared_ptr<const SelectionVector>;
 
@@ -85,6 +81,54 @@ TypedCell string_cell(std::string value) {
     cell.is_null = false;
     cell.string_value = std::move(value);
     return cell;
+}
+
+struct MaterializedValueSet {
+    catalog::ColumnType type{catalog::ColumnType::Int64};
+    bool is_empty{true};
+    bool has_null{false};
+    std::unordered_set<std::int64_t> int_values;
+    std::unordered_set<std::string> string_values;
+
+    [[nodiscard]] bool contains(const TypedCell& cell) const {
+        if (cell.type != type || cell.is_null) {
+            return false;
+        }
+        return type == catalog::ColumnType::Int64 ? int_values.contains(cell.int_value)
+                                                  : string_values.contains(cell.string_value);
+    }
+};
+
+struct ExecutionContext {
+    const Catalog& catalog;
+    std::unordered_map<const plan::LogicalPlan*, storage::ColumnarBatch> subquery_results;
+    std::unordered_map<const plan::LogicalPlan*, MaterializedValueSet> subquery_value_sets;
+};
+
+const storage::ColumnarBatch& prepared_subquery(
+    const std::shared_ptr<const plan::LogicalPlan>& subquery,
+    const ExecutionContext& context) {
+    if (subquery == nullptr) {
+        throw std::invalid_argument("bound subquery is missing its logical plan");
+    }
+    const auto found = context.subquery_results.find(subquery.get());
+    if (found == context.subquery_results.end()) {
+        throw std::logic_error("vectorized subquery was not eagerly prepared");
+    }
+    return found->second;
+}
+
+const MaterializedValueSet& prepared_value_set(
+    const std::shared_ptr<const plan::LogicalPlan>& subquery,
+    const ExecutionContext& context) {
+    if (subquery == nullptr) {
+        throw std::invalid_argument("bound IN subquery is missing its logical plan");
+    }
+    const auto found = context.subquery_value_sets.find(subquery.get());
+    if (found == context.subquery_value_sets.end()) {
+        throw std::logic_error("vectorized IN subquery set was not eagerly prepared");
+    }
+    return found->second;
 }
 
 std::size_t hash_cell(const TypedCell& cell) {
@@ -247,6 +291,9 @@ struct CompiledPredicate {
     sql::PredicateKind kind{sql::PredicateKind::Comparison};
     CompiledComparison comparison;
     CompiledScalar null_check;
+    CompiledScalar in_value;
+    const MaterializedValueSet* value_set{nullptr};
+    bool exists_value{false};
     std::shared_ptr<CompiledPredicate> left;
     std::shared_ptr<CompiledPredicate> right;
 };
@@ -317,6 +364,9 @@ struct CompiledJoinPredicate {
     sql::PredicateKind kind{sql::PredicateKind::Comparison};
     CompiledJoinComparison comparison;
     CompiledJoinScalar null_check;
+    CompiledJoinScalar in_value;
+    const MaterializedValueSet* value_set{nullptr};
+    bool exists_value{false};
     std::shared_ptr<CompiledJoinPredicate> left;
     std::shared_ptr<CompiledJoinPredicate> right;
 };
@@ -422,7 +472,9 @@ std::vector<CompiledColumn> compile_named_columns(const storage::ColumnarBatch& 
     return compiled;
 }
 
-CompiledScalar compile_scalar(const plan::BoundScalarExpr& expression, const storage::ColumnarBatch& batch) {
+CompiledScalar compile_scalar(const plan::BoundScalarExpr& expression,
+                              const storage::ColumnarBatch& batch,
+                              const ExecutionContext& context) {
     CompiledScalar compiled;
     compiled.type = expression.type;
     if (const auto* column = std::get_if<plan::BoundColumnRef>(&expression.value)) {
@@ -449,8 +501,33 @@ CompiledScalar compile_scalar(const plan::BoundScalarExpr& expression, const sto
         compiled.string_literal = literal->value;
         return compiled;
     }
-    if (std::holds_alternative<plan::BoundScalarSubquery>(expression.value)) {
-        throw_subquery_not_supported();
+    if (const auto* subquery = std::get_if<plan::BoundScalarSubquery>(&expression.value)) {
+        const auto& result = prepared_subquery(subquery->plan, context);
+        if (result.row_count() > 1) {
+            throw std::runtime_error(subquery->name + " returned more than one row");
+        }
+        if (result.row_count() == 0) {
+            compiled.literal_is_null = true;
+            return compiled;
+        }
+        if (result.column_names().size() != 1 || result.column_type(result.column_names().front()) != expression.type) {
+            throw std::logic_error("scalar subquery materialization has the wrong schema");
+        }
+        const auto& name = result.column_names().front();
+        if (expression.type == catalog::ColumnType::Int64) {
+            const auto& column = result.column(name);
+            compiled.literal_is_null = column.is_null(0);
+            if (!compiled.literal_is_null) {
+                compiled.literal = column.at(0);
+            }
+        } else {
+            const auto& column = result.string_column(name);
+            compiled.literal_is_null = column.is_null(0);
+            if (!compiled.literal_is_null) {
+                compiled.string_literal = column.at(0);
+            }
+        }
+        return compiled;
     }
     compiled.literal_is_null = true;
     return compiled;
@@ -524,12 +601,33 @@ TruthValue or_truth(TruthValue left, TruthValue right) {
     return TruthValue::Unknown;
 }
 
+TruthValue not_truth(TruthValue value) {
+    if (value == TruthValue::Unknown) {
+        return TruthValue::Unknown;
+    }
+    return value == TruthValue::True ? TruthValue::False : TruthValue::True;
+}
+
+TruthValue evaluate_in_truth(const TypedCell& value, const MaterializedValueSet& set) {
+    if (set.is_empty) {
+        return TruthValue::False;
+    }
+    if (value.is_null) {
+        return TruthValue::Unknown;
+    }
+    if (set.contains(value)) {
+        return TruthValue::True;
+    }
+    return set.has_null ? TruthValue::Unknown : TruthValue::False;
+}
+
 CompiledComparison compile_comparison(const plan::BoundComparisonExpr& comparison,
-                                      const storage::ColumnarBatch& batch) {
+                                      const storage::ColumnarBatch& batch,
+                                      const ExecutionContext& context) {
     CompiledComparison compiled;
-    compiled.left = compile_scalar(comparison.left, batch);
+    compiled.left = compile_scalar(comparison.left, batch, context);
     compiled.op = comparison.op;
-    compiled.right = compile_scalar(comparison.right, batch);
+    compiled.right = compile_scalar(comparison.right, batch, context);
     return compiled;
 }
 
@@ -561,37 +659,46 @@ const CompiledPredicate& require_right_predicate(const CompiledPredicate& predic
     return *predicate.right;
 }
 
-CompiledPredicate compile_predicate(const plan::BoundPredicate& predicate, const storage::ColumnarBatch& batch) {
+CompiledPredicate compile_predicate(const plan::BoundPredicate& predicate,
+                                    const storage::ColumnarBatch& batch,
+                                    const ExecutionContext& context) {
     CompiledPredicate compiled;
     compiled.kind = predicate.kind;
     switch (predicate.kind) {
     case sql::PredicateKind::Comparison:
-        compiled.comparison = compile_comparison(predicate.comparison, batch);
+        compiled.comparison = compile_comparison(predicate.comparison, batch, context);
         return compiled;
     case sql::PredicateKind::IsNull:
     case sql::PredicateKind::IsNotNull:
-        compiled.null_check = compile_scalar(predicate.null_check, batch);
+        compiled.null_check = compile_scalar(predicate.null_check, batch, context);
         return compiled;
     case sql::PredicateKind::In:
     case sql::PredicateKind::NotIn:
+        compiled.in_value = compile_scalar(predicate.in_value, batch, context);
+        compiled.value_set = &prepared_value_set(predicate.subquery, context);
+        return compiled;
     case sql::PredicateKind::Exists:
     case sql::PredicateKind::NotExists:
-        throw_subquery_not_supported();
+        compiled.exists_value = prepared_subquery(predicate.subquery, context).row_count() != 0;
+        return compiled;
     case sql::PredicateKind::And:
     case sql::PredicateKind::Or:
-        compiled.left = std::make_shared<CompiledPredicate>(compile_predicate(require_left_predicate(predicate), batch));
-        compiled.right = std::make_shared<CompiledPredicate>(compile_predicate(require_right_predicate(predicate), batch));
+        compiled.left = std::make_shared<CompiledPredicate>(
+            compile_predicate(require_left_predicate(predicate), batch, context));
+        compiled.right = std::make_shared<CompiledPredicate>(
+            compile_predicate(require_right_predicate(predicate), batch, context));
         return compiled;
     }
     throw std::logic_error("unreachable predicate kind");
 }
 
 std::vector<CompiledPredicate> compile_predicates(const std::vector<plan::BoundPredicate>& predicates,
-                                                  const storage::ColumnarBatch& batch) {
+                                                  const storage::ColumnarBatch& batch,
+                                                  const ExecutionContext& context) {
     std::vector<CompiledPredicate> compiled;
     compiled.reserve(predicates.size());
     for (const auto& predicate : predicates) {
-        compiled.push_back(compile_predicate(predicate, batch));
+        compiled.push_back(compile_predicate(predicate, batch, context));
     }
     return compiled;
 }
@@ -846,6 +953,35 @@ void combine_or_in_place(PredicateMask& left, const PredicateMask& right) {
     }
 }
 
+PredicateMask evaluate_in_mask(const CompiledPredicate& predicate,
+                               const PredicateEvaluationDomain& domain,
+                               bool negate) {
+    if (predicate.value_set == nullptr) {
+        throw std::logic_error("compiled IN predicate is missing its value set");
+    }
+    auto mask = make_predicate_mask(domain.size);
+    for_each_domain_row(domain, [&](std::size_t position, std::size_t row) {
+        const auto value = predicate.in_value.cell(row);
+        bool is_true = false;
+        bool is_known = true;
+        if (predicate.value_set->is_empty) {
+            is_true = false;
+        } else if (value.is_null) {
+            is_known = false;
+        } else if (predicate.value_set->contains(value)) {
+            is_true = true;
+        } else if (predicate.value_set->has_null) {
+            is_known = false;
+        }
+        if (negate && is_known) {
+            is_true = !is_true;
+        }
+        mask.is_true[position] = is_true ? std::uint8_t{1} : std::uint8_t{0};
+        mask.is_known[position] = is_known ? std::uint8_t{1} : std::uint8_t{0};
+    });
+    return mask;
+}
+
 PredicateMask evaluate_predicate_mask(const CompiledPredicate& predicate, const PredicateEvaluationDomain& domain) {
     switch (predicate.kind) {
     case sql::PredicateKind::Comparison:
@@ -855,10 +991,13 @@ PredicateMask evaluate_predicate_mask(const CompiledPredicate& predicate, const 
     case sql::PredicateKind::IsNotNull:
         return evaluate_null_check_mask(predicate.null_check, domain, true);
     case sql::PredicateKind::In:
+        return evaluate_in_mask(predicate, domain, false);
     case sql::PredicateKind::NotIn:
+        return evaluate_in_mask(predicate, domain, true);
     case sql::PredicateKind::Exists:
+        return make_constant_predicate_mask(domain.size, predicate.exists_value ? 1 : 0, 1);
     case sql::PredicateKind::NotExists:
-        throw_subquery_not_supported();
+        return make_constant_predicate_mask(domain.size, predicate.exists_value ? 0 : 1, 1);
     case sql::PredicateKind::And: {
         auto left = evaluate_predicate_mask(require_left_predicate(predicate), domain);
         auto right = evaluate_predicate_mask(require_right_predicate(predicate), domain);
@@ -905,7 +1044,8 @@ SelectionVector selection_from_true_mask(const PredicateMask& mask, const Predic
 
 CompiledJoinScalar compile_join_scalar(const plan::BoundScalarExpr& expression,
                                        const storage::ColumnarBatch& left,
-                                       const storage::ColumnarBatch& right) {
+                                       const storage::ColumnarBatch& right,
+                                       const ExecutionContext& context) {
     CompiledJoinScalar compiled;
     compiled.type = expression.type;
     if (const auto* column = std::get_if<plan::BoundColumnRef>(&expression.value)) {
@@ -952,8 +1092,33 @@ CompiledJoinScalar compile_join_scalar(const plan::BoundScalarExpr& expression,
         compiled.string_literal = literal->value;
         return compiled;
     }
-    if (std::holds_alternative<plan::BoundScalarSubquery>(expression.value)) {
-        throw_subquery_not_supported();
+    if (const auto* subquery = std::get_if<plan::BoundScalarSubquery>(&expression.value)) {
+        const auto& result = prepared_subquery(subquery->plan, context);
+        if (result.row_count() > 1) {
+            throw std::runtime_error(subquery->name + " returned more than one row");
+        }
+        if (result.row_count() == 0) {
+            compiled.literal_is_null = true;
+            return compiled;
+        }
+        if (result.column_names().size() != 1 || result.column_type(result.column_names().front()) != expression.type) {
+            throw std::logic_error("scalar subquery materialization has the wrong join schema");
+        }
+        const auto& name = result.column_names().front();
+        if (expression.type == catalog::ColumnType::Int64) {
+            const auto& column = result.column(name);
+            compiled.literal_is_null = column.is_null(0);
+            if (!compiled.literal_is_null) {
+                compiled.literal = column.at(0);
+            }
+        } else {
+            const auto& column = result.string_column(name);
+            compiled.literal_is_null = column.is_null(0);
+            if (!compiled.literal_is_null) {
+                compiled.string_literal = column.at(0);
+            }
+        }
+        return compiled;
     }
     compiled.literal_is_null = true;
     return compiled;
@@ -961,11 +1126,12 @@ CompiledJoinScalar compile_join_scalar(const plan::BoundScalarExpr& expression,
 
 CompiledJoinComparison compile_join_comparison(const plan::BoundComparisonExpr& comparison,
                                                const storage::ColumnarBatch& left,
-                                               const storage::ColumnarBatch& right) {
+                                               const storage::ColumnarBatch& right,
+                                               const ExecutionContext& context) {
     CompiledJoinComparison compiled;
-    compiled.left = compile_join_scalar(comparison.left, left, right);
+    compiled.left = compile_join_scalar(comparison.left, left, right, context);
     compiled.op = comparison.op;
-    compiled.right = compile_join_scalar(comparison.right, left, right);
+    compiled.right = compile_join_scalar(comparison.right, left, right, context);
     return compiled;
 }
 
@@ -996,28 +1162,35 @@ const CompiledJoinPredicate& require_right_predicate(const CompiledJoinPredicate
 
 CompiledJoinPredicate compile_join_predicate(const plan::BoundPredicate& predicate,
                                              const storage::ColumnarBatch& left,
-                                             const storage::ColumnarBatch& right) {
+                                             const storage::ColumnarBatch& right,
+                                             const ExecutionContext& context) {
     CompiledJoinPredicate compiled;
     compiled.kind = predicate.kind;
     switch (predicate.kind) {
     case sql::PredicateKind::Comparison:
-        compiled.comparison = compile_join_comparison(predicate.comparison, left, right);
+        compiled.comparison = compile_join_comparison(predicate.comparison, left, right, context);
         return compiled;
     case sql::PredicateKind::IsNull:
     case sql::PredicateKind::IsNotNull:
-        compiled.null_check = compile_join_scalar(predicate.null_check, left, right);
+        compiled.null_check = compile_join_scalar(predicate.null_check, left, right, context);
         return compiled;
     case sql::PredicateKind::In:
     case sql::PredicateKind::NotIn:
+        compiled.in_value = compile_join_scalar(predicate.in_value, left, right, context);
+        compiled.value_set = &prepared_value_set(predicate.subquery, context);
+        return compiled;
     case sql::PredicateKind::Exists:
     case sql::PredicateKind::NotExists:
-        throw_subquery_not_supported();
+        compiled.exists_value = prepared_subquery(predicate.subquery, context).row_count() != 0;
+        return compiled;
     case sql::PredicateKind::And:
     case sql::PredicateKind::Or:
         compiled.left =
-            std::make_shared<CompiledJoinPredicate>(compile_join_predicate(require_left_predicate(predicate), left, right));
+            std::make_shared<CompiledJoinPredicate>(
+                compile_join_predicate(require_left_predicate(predicate), left, right, context));
         compiled.right =
-            std::make_shared<CompiledJoinPredicate>(compile_join_predicate(require_right_predicate(predicate), left, right));
+            std::make_shared<CompiledJoinPredicate>(
+                compile_join_predicate(require_right_predicate(predicate), left, right, context));
         return compiled;
     }
     throw std::logic_error("unreachable predicate kind");
@@ -1025,11 +1198,12 @@ CompiledJoinPredicate compile_join_predicate(const plan::BoundPredicate& predica
 
 std::vector<CompiledJoinPredicate> compile_join_predicates(const std::vector<plan::BoundPredicate>& predicates,
                                                            const storage::ColumnarBatch& left,
-                                                           const storage::ColumnarBatch& right) {
+                                                           const storage::ColumnarBatch& right,
+                                                           const ExecutionContext& context) {
     std::vector<CompiledJoinPredicate> compiled;
     compiled.reserve(predicates.size());
     for (const auto& predicate : predicates) {
-        compiled.push_back(compile_join_predicate(predicate, left, right));
+        compiled.push_back(compile_join_predicate(predicate, left, right, context));
     }
     return compiled;
 }
@@ -1045,10 +1219,19 @@ TruthValue evaluate_join_predicate(const CompiledJoinPredicate& predicate,
     case sql::PredicateKind::IsNotNull:
         return truth_from_bool(!predicate.null_check.is_null(left_row, right_row));
     case sql::PredicateKind::In:
+        if (predicate.value_set == nullptr) {
+            throw std::logic_error("compiled join IN predicate is missing its value set");
+        }
+        return evaluate_in_truth(predicate.in_value.cell(left_row, right_row), *predicate.value_set);
     case sql::PredicateKind::NotIn:
+        if (predicate.value_set == nullptr) {
+            throw std::logic_error("compiled join NOT IN predicate is missing its value set");
+        }
+        return not_truth(evaluate_in_truth(predicate.in_value.cell(left_row, right_row), *predicate.value_set));
     case sql::PredicateKind::Exists:
+        return truth_from_bool(predicate.exists_value);
     case sql::PredicateKind::NotExists:
-        throw_subquery_not_supported();
+        return truth_from_bool(!predicate.exists_value);
     case sql::PredicateKind::And: {
         const auto left_result = evaluate_join_predicate(require_left_predicate(predicate), left_row, right_row);
         const auto right_result = evaluate_join_predicate(require_right_predicate(predicate), left_row, right_row);
@@ -1344,11 +1527,101 @@ storage::ColumnarBatch finish_join_output(JoinOutputBuilder builder) {
     return out;
 }
 
+storage::ColumnarBatch materialize_left_join_rows(const BatchView& left, const SelectionVector& rows) {
+    storage::ColumnarBatch out;
+    for (const auto& name : left.batch->column_names()) {
+        const auto compiled = compile_named_column(*left.batch, name);
+        TypedColumnBuilder column(compiled.type);
+        column.reserve(rows.size());
+        for (const auto row : rows) {
+            append_cell(column, compiled.cell(row));
+        }
+        std::move(column).add_to(out, name);
+    }
+    return out;
+}
+
+template <bool EmitMatched>
+storage::ColumnarBatch execute_nested_loop_existence_join(
+    const BatchView& left,
+    const BatchView& right,
+    const std::vector<plan::BoundPredicate>& predicates,
+    const ExecutionContext& context) {
+    const auto compiled_predicates = compile_join_predicates(predicates, *left.batch, *right.batch, context);
+    SelectionVector output_rows;
+    output_rows.reserve(left.selection->size());
+    for (const auto left_row : *left.selection) {
+        bool matched = false;
+        for (const auto right_row : *right.selection) {
+            if (evaluate_join_predicates(compiled_predicates, left_row, right_row) == TruthValue::True) {
+                matched = true;
+                break;
+            }
+        }
+        if (matched == EmitMatched) {
+            output_rows.push_back(left_row);
+        }
+    }
+    return materialize_left_join_rows(left, output_rows);
+}
+
+template <bool EmitMatched>
+storage::ColumnarBatch execute_hash_existence_join(const BatchView& left,
+                                                   const BatchView& right,
+                                                   const JoinPredicateSplit& predicates,
+                                                   const ExecutionContext& context) {
+    std::vector<plan::BoundColumnRef> left_key_columns;
+    std::vector<plan::BoundColumnRef> right_key_columns;
+    left_key_columns.reserve(predicates.equi_keys.size());
+    right_key_columns.reserve(predicates.equi_keys.size());
+    for (const auto& equi_key : predicates.equi_keys) {
+        left_key_columns.push_back(equi_key.left);
+        right_key_columns.push_back(equi_key.right);
+    }
+    const auto compiled_left_keys = compile_columns(left_key_columns, *left.batch);
+    const auto compiled_right_keys = compile_columns(right_key_columns, *right.batch);
+    const auto compiled_residuals =
+        compile_join_predicates(predicates.residuals, *left.batch, *right.batch, context);
+
+    // Lookup-only discipline: the hash table is never iterated for output.
+    // Candidate vectors retain right input order for residual evaluation.
+    std::unordered_map<HashKey, std::vector<std::size_t>, HashKeyHash> right_rows_by_key;
+    for (const auto right_row : *right.selection) {
+        auto key = make_non_null_key(right_row, compiled_right_keys);
+        if (key.has_value()) {
+            right_rows_by_key[*key].push_back(right_row);
+        }
+    }
+
+    SelectionVector output_rows;
+    output_rows.reserve(left.selection->size());
+    for (const auto left_row : *left.selection) {
+        bool matched = false;
+        auto key = make_non_null_key(left_row, compiled_left_keys);
+        if (key.has_value()) {
+            const auto candidates = right_rows_by_key.find(*key);
+            if (candidates != right_rows_by_key.end()) {
+                for (const auto right_row : candidates->second) {
+                    if (evaluate_join_predicates(compiled_residuals, left_row, right_row) == TruthValue::True) {
+                        matched = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if (matched == EmitMatched) {
+            output_rows.push_back(left_row);
+        }
+    }
+    return materialize_left_join_rows(left, output_rows);
+}
+
 template <bool EmitUnmatchedLeft>
 storage::ColumnarBatch execute_nested_loop_join(const BatchView& left,
                                                 const BatchView& right,
-                                                const std::vector<plan::BoundPredicate>& predicates) {
-    const auto compiled_predicates = compile_join_predicates(predicates, *left.batch, *right.batch);
+                                                const std::vector<plan::BoundPredicate>& predicates,
+                                                const ExecutionContext& context) {
+    const auto compiled_predicates = compile_join_predicates(predicates, *left.batch, *right.batch, context);
     auto builder = make_join_output_builder(*left.batch, *right.batch);
     for (auto left_row : *left.selection) {
         bool matched = false;
@@ -1372,7 +1645,8 @@ storage::ColumnarBatch execute_nested_loop_join(const BatchView& left,
 template <bool EmitUnmatchedLeft>
 storage::ColumnarBatch execute_hash_join(const BatchView& left,
                                          const BatchView& right,
-                                         const JoinPredicateSplit& predicates) {
+                                         const JoinPredicateSplit& predicates,
+                                         const ExecutionContext& context) {
     std::vector<plan::BoundColumnRef> left_key_columns;
     std::vector<plan::BoundColumnRef> right_key_columns;
     left_key_columns.reserve(predicates.equi_keys.size());
@@ -1383,7 +1657,8 @@ storage::ColumnarBatch execute_hash_join(const BatchView& left,
     }
     const auto compiled_left_key_columns = compile_columns(left_key_columns, *left.batch);
     const auto compiled_right_key_columns = compile_columns(right_key_columns, *right.batch);
-    const auto compiled_residuals = compile_join_predicates(predicates.residuals, *left.batch, *right.batch);
+    const auto compiled_residuals =
+        compile_join_predicates(predicates.residuals, *left.batch, *right.batch, context);
 
     // Lookup-only hash table: output order must come exclusively from probing
     // left rows in order and from each per-key right-row vector's insertion order.
@@ -1422,8 +1697,8 @@ storage::ColumnarBatch execute_hash_join(const BatchView& left,
     return finish_join_output(std::move(builder));
 }
 
-BatchView execute_scan(const plan::PhysicalPlan& plan, const Catalog& catalog) {
-    const auto& input = catalog.table(plan.table);
+BatchView execute_scan(const plan::PhysicalPlan& plan, ExecutionContext& context) {
+    const auto& input = context.catalog.table(plan.table);
     auto qualified = std::make_shared<storage::ColumnarBatch>();
     for (const auto& column_name : input.column_names()) {
         if (input.column_type(column_name) == catalog::ColumnType::Int64) {
@@ -1442,32 +1717,32 @@ BatchView execute_scan(const plan::PhysicalPlan& plan, const Catalog& catalog) {
     return view;
 }
 
-BatchView execute_filter(const plan::PhysicalPlan& plan, const Catalog& catalog);
-BatchView execute_join(const plan::PhysicalPlan& plan, const Catalog& catalog);
-BatchView execute_project(const plan::PhysicalPlan& plan, const Catalog& catalog);
-BatchView execute_aggregate(const plan::PhysicalPlan& plan, const Catalog& catalog);
-BatchView execute_distinct(const plan::PhysicalPlan& plan, const Catalog& catalog);
-BatchView execute_sort(const plan::PhysicalPlan& plan, const Catalog& catalog);
-BatchView execute_limit(const plan::PhysicalPlan& plan, const Catalog& catalog);
+BatchView execute_filter(const plan::PhysicalPlan& plan, ExecutionContext& context);
+BatchView execute_join(const plan::PhysicalPlan& plan, ExecutionContext& context);
+BatchView execute_project(const plan::PhysicalPlan& plan, ExecutionContext& context);
+BatchView execute_aggregate(const plan::PhysicalPlan& plan, ExecutionContext& context);
+BatchView execute_distinct(const plan::PhysicalPlan& plan, ExecutionContext& context);
+BatchView execute_sort(const plan::PhysicalPlan& plan, ExecutionContext& context);
+BatchView execute_limit(const plan::PhysicalPlan& plan, ExecutionContext& context);
 
-BatchView execute_to_view(const plan::PhysicalPlan& plan, const Catalog& catalog) {
+BatchView execute_to_view(const plan::PhysicalPlan& plan, ExecutionContext& context) {
     switch (plan.kind) {
     case plan::PhysicalKind::Scan:
-        return execute_scan(plan, catalog);
+        return execute_scan(plan, context);
     case plan::PhysicalKind::Join:
-        return execute_join(plan, catalog);
+        return execute_join(plan, context);
     case plan::PhysicalKind::Filter:
-        return execute_filter(plan, catalog);
+        return execute_filter(plan, context);
     case plan::PhysicalKind::Project:
-        return execute_project(plan, catalog);
+        return execute_project(plan, context);
     case plan::PhysicalKind::Aggregate:
-        return execute_aggregate(plan, catalog);
+        return execute_aggregate(plan, context);
     case plan::PhysicalKind::Distinct:
-        return execute_distinct(plan, catalog);
+        return execute_distinct(plan, context);
     case plan::PhysicalKind::Sort:
-        return execute_sort(plan, catalog);
+        return execute_sort(plan, context);
     case plan::PhysicalKind::Limit:
-        return execute_limit(plan, catalog);
+        return execute_limit(plan, context);
     }
     throw std::logic_error("unreachable physical plan kind");
 }
@@ -1500,11 +1775,11 @@ const plan::PhysicalPlan& require_right(const plan::PhysicalPlan& plan) {
     return *plan.right;
 }
 
-BatchView execute_filter(const plan::PhysicalPlan& plan, const Catalog& catalog) {
-    auto input = execute_to_view(require_input(plan), catalog);
+BatchView execute_filter(const plan::PhysicalPlan& plan, ExecutionContext& context) {
+    auto input = execute_to_view(require_input(plan), context);
     validate_view(input);
 
-    const auto predicates = compile_predicates(plan.predicates, *input.batch);
+    const auto predicates = compile_predicates(plan.predicates, *input.batch, context);
     const auto domain = make_predicate_domain(input);
     auto rows = selection_from_true_mask(evaluate_predicates_mask(predicates, domain), domain);
 
@@ -1514,20 +1789,32 @@ BatchView execute_filter(const plan::PhysicalPlan& plan, const Catalog& catalog)
     return input;
 }
 
-BatchView execute_join(const plan::PhysicalPlan& plan, const Catalog& catalog) {
-    auto left = execute_to_view(require_left(plan), catalog);
-    auto right = execute_to_view(require_right(plan), catalog);
+BatchView execute_join(const plan::PhysicalPlan& plan, ExecutionContext& context) {
+    auto left = execute_to_view(require_left(plan), context);
+    auto right = execute_to_view(require_right(plan), context);
     validate_view(left);
     validate_view(right);
 
     const auto predicates = split_join_predicates(plan.predicates, *left.batch, *right.batch);
     const auto materialized_batch = [&] {
-        if (plan.join_kind == plan::JoinKind::Left) {
-            return predicates.equi_keys.empty() ? execute_nested_loop_join<true>(left, right, predicates.residuals)
-                                                : execute_hash_join<true>(left, right, predicates);
+        if (plan.join_kind == plan::JoinKind::Semi) {
+            return predicates.equi_keys.empty()
+                       ? execute_nested_loop_existence_join<true>(left, right, predicates.residuals, context)
+                       : execute_hash_existence_join<true>(left, right, predicates, context);
         }
-        return predicates.equi_keys.empty() ? execute_nested_loop_join<false>(left, right, predicates.residuals)
-                                            : execute_hash_join<false>(left, right, predicates);
+        if (plan.join_kind == plan::JoinKind::Anti) {
+            return predicates.equi_keys.empty()
+                       ? execute_nested_loop_existence_join<false>(left, right, predicates.residuals, context)
+                       : execute_hash_existence_join<false>(left, right, predicates, context);
+        }
+        if (plan.join_kind == plan::JoinKind::Left) {
+            return predicates.equi_keys.empty()
+                       ? execute_nested_loop_join<true>(left, right, predicates.residuals, context)
+                       : execute_hash_join<true>(left, right, predicates, context);
+        }
+        return predicates.equi_keys.empty()
+                   ? execute_nested_loop_join<false>(left, right, predicates.residuals, context)
+                   : execute_hash_join<false>(left, right, predicates, context);
     }();
     auto materialized = std::make_shared<const storage::ColumnarBatch>(std::move(materialized_batch));
 
@@ -1540,13 +1827,16 @@ BatchView execute_join(const plan::PhysicalPlan& plan, const Catalog& catalog) {
     return view;
 }
 
-storage::ColumnarBatch materialize_projection(const plan::PhysicalPlan& plan, const BatchView& input) {
+storage::ColumnarBatch materialize_projection(const plan::PhysicalPlan& plan,
+                                              const BatchView& input,
+                                              const ExecutionContext& context) {
     validate_view(input);
 
     std::vector<CompiledProjection> projections;
     projections.reserve(plan.projections.size());
     for (const auto& projection : plan.projections) {
-        projections.push_back(CompiledProjection{projection.output_name, compile_scalar(projection.expression, *input.batch)});
+        projections.push_back(
+            CompiledProjection{projection.output_name, compile_scalar(projection.expression, *input.batch, context)});
     }
 
     storage::ColumnarBatch out;
@@ -1592,8 +1882,9 @@ void add_missing_sort_key_columns(storage::ColumnarBatch& sort_input,
 
 storage::ColumnarBatch materialize_project_sort_input(const plan::PhysicalPlan& project,
                                                       const BatchView& source,
-                                                      const std::vector<plan::SortKey>& sort_keys) {
-    auto sort_input = materialize_projection(project, source);
+                                                      const std::vector<plan::SortKey>& sort_keys,
+                                                      const ExecutionContext& context) {
+    auto sort_input = materialize_projection(project, source, context);
     add_missing_sort_key_columns(sort_input, source, sort_keys);
     return sort_input;
 }
@@ -1691,9 +1982,10 @@ SelectionVectorPtr sort_selection(const std::vector<plan::SortKey>& sort_keys, c
     return make_selection(std::move(rows));
 }
 
-BatchView execute_project(const plan::PhysicalPlan& plan, const Catalog& catalog) {
-    auto input = execute_to_view(require_input(plan), catalog);
-    auto materialized = std::make_shared<const storage::ColumnarBatch>(materialize_projection(plan, input));
+BatchView execute_project(const plan::PhysicalPlan& plan, ExecutionContext& context) {
+    auto input = execute_to_view(require_input(plan), context);
+    auto materialized =
+        std::make_shared<const storage::ColumnarBatch>(materialize_projection(plan, input, context));
 
     BatchView view;
     view.owned_batch = materialized;
@@ -1760,8 +2052,8 @@ storage::ColumnarBatch materialize_aggregate(const plan::PhysicalPlan& plan, con
     return out;
 }
 
-BatchView execute_aggregate(const plan::PhysicalPlan& plan, const Catalog& catalog) {
-    auto input = execute_to_view(require_input(plan), catalog);
+BatchView execute_aggregate(const plan::PhysicalPlan& plan, ExecutionContext& context) {
+    auto input = execute_to_view(require_input(plan), context);
     auto materialized = std::make_shared<const storage::ColumnarBatch>(materialize_aggregate(plan, input));
 
     BatchView view;
@@ -1773,8 +2065,8 @@ BatchView execute_aggregate(const plan::PhysicalPlan& plan, const Catalog& catal
     return view;
 }
 
-BatchView execute_distinct(const plan::PhysicalPlan& plan, const Catalog& catalog) {
-    auto input = execute_to_view(require_input(plan), catalog);
+BatchView execute_distinct(const plan::PhysicalPlan& plan, ExecutionContext& context) {
+    auto input = execute_to_view(require_input(plan), context);
     validate_view(input);
 
     const auto output_columns = compile_named_columns(*input.batch, input.batch->column_names());
@@ -1797,12 +2089,13 @@ BatchView execute_distinct(const plan::PhysicalPlan& plan, const Catalog& catalo
     return input;
 }
 
-BatchView execute_sort(const plan::PhysicalPlan& plan, const Catalog& catalog) {
+BatchView execute_sort(const plan::PhysicalPlan& plan, ExecutionContext& context) {
     const auto& input_plan = require_input(plan);
     if (input_plan.kind == plan::PhysicalKind::Project) {
-        auto source = execute_to_view(require_input(input_plan), catalog);
+        auto source = execute_to_view(require_input(input_plan), context);
         auto sort_input =
-            std::make_shared<const storage::ColumnarBatch>(materialize_project_sort_input(input_plan, source, plan.sort_keys));
+            std::make_shared<const storage::ColumnarBatch>(
+                materialize_project_sort_input(input_plan, source, plan.sort_keys, context));
 
         BatchView sort_view;
         sort_view.owned_batch = sort_input;
@@ -1824,15 +2117,15 @@ BatchView execute_sort(const plan::PhysicalPlan& plan, const Catalog& catalog) {
         return view;
     }
 
-    auto input = execute_to_view(input_plan, catalog);
+    auto input = execute_to_view(input_plan, context);
     input.selection = sort_selection(plan.sort_keys, input);
     input.selection_rows_match_positions = false;
     validate_view(input);
     return input;
 }
 
-BatchView execute_limit(const plan::PhysicalPlan& plan, const Catalog& catalog) {
-    auto input = execute_to_view(require_input(plan), catalog);
+BatchView execute_limit(const plan::PhysicalPlan& plan, ExecutionContext& context) {
+    auto input = execute_to_view(require_input(plan), context);
     validate_view(input);
 
     const auto count = std::min(plan.limit_count, input.selection->size());
@@ -1864,9 +2157,6 @@ storage::ColumnarBatch materialize_view(const BatchView& view) {
 }
 
 bool scalar_requires_typed_dispatch(const plan::BoundScalarExpr& expression) {
-    if (std::holds_alternative<plan::BoundScalarSubquery>(expression.value)) {
-        throw_subquery_not_supported();
-    }
     return expression.type == catalog::ColumnType::String;
 }
 
@@ -1880,9 +2170,10 @@ bool predicate_requires_typed_dispatch(const plan::BoundPredicate& predicate) {
         return scalar_requires_typed_dispatch(predicate.null_check);
     case sql::PredicateKind::In:
     case sql::PredicateKind::NotIn:
+        return scalar_requires_typed_dispatch(predicate.in_value);
     case sql::PredicateKind::Exists:
     case sql::PredicateKind::NotExists:
-        throw_subquery_not_supported();
+        return false;
     case sql::PredicateKind::And:
     case sql::PredicateKind::Or:
         if (predicate.left == nullptr || predicate.right == nullptr) {
@@ -1957,23 +2248,161 @@ KernelDispatch select_kernel_dispatch(const plan::PhysicalPlan& plan, const Cata
     return plan_requires_typed_dispatch(plan, catalog) ? KernelDispatch::Typed : KernelDispatch::Int64Only;
 }
 
+storage::ColumnarBatch execute_prepared_physical(const plan::PhysicalPlan& plan, ExecutionContext& context) {
+    switch (select_kernel_dispatch(plan, context.catalog)) {
+    case KernelDispatch::Int64Only:
+    case KernelDispatch::Typed:
+        return materialize_view(execute_to_view(plan, context));
+    }
+    throw std::logic_error("unreachable vectorized kernel dispatch");
+}
+
+void prepare_subqueries(const plan::LogicalPlan& plan, ExecutionContext& context);
+
+const storage::ColumnarBatch& materialize_subquery(
+    const std::shared_ptr<const plan::LogicalPlan>& subquery,
+    ExecutionContext& context) {
+    if (subquery == nullptr) {
+        throw std::invalid_argument("bound subquery is missing its logical plan");
+    }
+    if (const auto found = context.subquery_results.find(subquery.get());
+        found != context.subquery_results.end()) {
+        return found->second;
+    }
+
+    prepare_subqueries(*subquery, context);
+    auto result = execute_prepared_physical(plan::lower_to_physical(*subquery), context);
+    const auto [inserted, _] = context.subquery_results.emplace(subquery.get(), std::move(result));
+    return inserted->second;
+}
+
+void prepare_scalar_subquery(const plan::BoundScalarExpr& expression, ExecutionContext& context) {
+    const auto* subquery = std::get_if<plan::BoundScalarSubquery>(&expression.value);
+    if (subquery == nullptr) {
+        return;
+    }
+    const auto& result = materialize_subquery(subquery->plan, context);
+    if (result.row_count() > 1) {
+        throw std::runtime_error(subquery->name + " returned more than one row");
+    }
+}
+
+void prepare_value_set(const std::shared_ptr<const plan::LogicalPlan>& subquery, ExecutionContext& context) {
+    if (subquery == nullptr) {
+        throw std::invalid_argument("bound IN subquery is missing its logical plan");
+    }
+    if (context.subquery_value_sets.contains(subquery.get())) {
+        return;
+    }
+    const auto& result = materialize_subquery(subquery, context);
+    if (result.column_names().size() != 1) {
+        throw std::logic_error("IN subquery materialization must have exactly one column");
+    }
+    const auto& name = result.column_names().front();
+    MaterializedValueSet set;
+    set.type = result.column_type(name);
+    set.is_empty = result.row_count() == 0;
+    if (set.type == catalog::ColumnType::Int64) {
+        const auto& column = result.column(name);
+        for (std::size_t row = 0; row < result.row_count(); ++row) {
+            if (column.is_null(row)) {
+                set.has_null = true;
+            } else {
+                set.int_values.insert(column.at(row));
+            }
+        }
+    } else {
+        const auto& column = result.string_column(name);
+        for (std::size_t row = 0; row < result.row_count(); ++row) {
+            if (column.is_null(row)) {
+                set.has_null = true;
+            } else {
+                set.string_values.insert(column.at(row));
+            }
+        }
+    }
+    context.subquery_value_sets.emplace(subquery.get(), std::move(set));
+}
+
+void prepare_predicate_subqueries(const plan::BoundPredicate& predicate, ExecutionContext& context) {
+    switch (predicate.kind) {
+    case sql::PredicateKind::Comparison:
+        prepare_scalar_subquery(predicate.comparison.left, context);
+        prepare_scalar_subquery(predicate.comparison.right, context);
+        return;
+    case sql::PredicateKind::IsNull:
+    case sql::PredicateKind::IsNotNull:
+        prepare_scalar_subquery(predicate.null_check, context);
+        return;
+    case sql::PredicateKind::In:
+    case sql::PredicateKind::NotIn:
+        prepare_scalar_subquery(predicate.in_value, context);
+        prepare_value_set(predicate.subquery, context);
+        return;
+    case sql::PredicateKind::Exists:
+    case sql::PredicateKind::NotExists:
+        (void)materialize_subquery(predicate.subquery, context);
+        return;
+    case sql::PredicateKind::And:
+    case sql::PredicateKind::Or:
+        prepare_predicate_subqueries(require_left_predicate(predicate), context);
+        prepare_predicate_subqueries(require_right_predicate(predicate), context);
+        return;
+    }
+    throw std::logic_error("unreachable predicate kind");
+}
+
+template <typename Plan>
+void prepare_owned_expressions(const Plan& plan, ExecutionContext& context) {
+    for (const auto& projection : plan.projections) {
+        prepare_scalar_subquery(projection.expression, context);
+    }
+    for (const auto& predicate : plan.predicates) {
+        prepare_predicate_subqueries(predicate, context);
+    }
+}
+
+void prepare_subqueries(const plan::LogicalPlan& plan, ExecutionContext& context) {
+    prepare_owned_expressions(plan, context);
+    if (plan.input != nullptr) {
+        prepare_subqueries(*plan.input, context);
+    }
+    if (plan.left != nullptr) {
+        prepare_subqueries(*plan.left, context);
+    }
+    if (plan.right != nullptr) {
+        prepare_subqueries(*plan.right, context);
+    }
+}
+
+void prepare_subqueries(const plan::PhysicalPlan& plan, ExecutionContext& context) {
+    prepare_owned_expressions(plan, context);
+    if (plan.input != nullptr) {
+        prepare_subqueries(*plan.input, context);
+    }
+    if (plan.left != nullptr) {
+        prepare_subqueries(*plan.left, context);
+    }
+    if (plan.right != nullptr) {
+        prepare_subqueries(*plan.right, context);
+    }
+}
+
 } // namespace
 
 storage::ColumnarBatch execute_vectorized(const plan::LogicalPlan& plan, const Catalog& catalog) {
     if (plan.kind == plan::LogicalKind::Explain) {
         return optimizer::explain(require_logical_input(plan), catalog);
     }
-    return execute_vectorized(plan::lower_to_physical(plan), catalog);
+    ExecutionContext context{catalog, {}, {}};
+    prepare_subqueries(plan, context);
+    return execute_prepared_physical(plan::lower_to_physical(plan), context);
 }
 
 storage::ColumnarBatch execute_vectorized(const plan::PhysicalPlan& plan, const Catalog& catalog) {
-    switch (select_kernel_dispatch(plan, catalog)) {
-    case KernelDispatch::Int64Only:
-        return materialize_view(execute_to_view(plan, catalog));
-    case KernelDispatch::Typed:
-        return materialize_view(execute_to_view(plan, catalog));
-    }
-    throw std::logic_error("unreachable vectorized kernel dispatch");
+    ExecutionContext context{catalog, {}, {}};
+    prepare_subqueries(plan, context);
+    return execute_prepared_physical(plan, context);
 }
 
 } // namespace execution

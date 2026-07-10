@@ -545,6 +545,166 @@ bool contains_plan_text(const std::vector<plan::LogicalPlan>& alternatives, cons
     return false;
 }
 
+void assert_top_level_subquery_decorrelation_rules_and_guards() {
+    const auto catalog = make_catalog();
+    struct PositiveCase {
+        std::string sql;
+        std::string rule;
+        std::string join_text;
+    };
+    const std::vector<PositiveCase> positive_cases{
+        {"SELECT a FROM t WHERE EXISTS (SELECT a FROM t1)", "ExistsToSemiJoinRule", "SemiJoin[]"},
+        {"SELECT a FROM t WHERE NOT EXISTS (SELECT a FROM t1 WHERE a = 999)",
+         "NotExistsToAntiJoinRule",
+         "AntiJoin[]"},
+        {"SELECT a FROM t WHERE a IN (SELECT a FROM t1)",
+         "InToSemiJoinRule",
+         "SemiJoin[col(t.a) = col(a)]"},
+    };
+
+    for (const auto& test : positive_cases) {
+        const auto logical = sql::bind_select(sql::parse_select(test.sql), catalog);
+        optimizer::Memo memo;
+        const auto root = memo.insert(logical);
+        const auto explored = optimizer::explore_memo_to_fixpoint(memo, optimizer::default_memo_rules());
+        const auto alternatives =
+            memo.extract_alternatives(root, optimizer::AlternativeExtractionOptions{128, 1024});
+        const auto expected = format_batch(execution::execute_interpreted(logical, catalog));
+        if (!trace_contains(explored.fired_rules, test.rule) ||
+            !contains_plan_text(alternatives.plans, test.join_text)) {
+            std::cerr << "decorrelation rule did not produce its guarded join alternative\n"
+                      << "sql: " << test.sql << "\n"
+                      << "expected rule: " << test.rule << "\n"
+                      << "memo dump:\n" << memo.dump();
+            std::terminate();
+        }
+        for (const auto& alternative : alternatives.plans) {
+            if (format_batch(execution::execute_interpreted(alternative, catalog)) != expected) {
+                std::cerr << "decorrelated memo alternative changed oracle results\n"
+                          << "sql: " << test.sql << "\n"
+                          << "alternative:\n" << plan::to_string(alternative) << "\n"
+                          << "memo dump:\n" << memo.dump();
+                std::terminate();
+            }
+        }
+        memo.assert_invariants();
+    }
+
+    const std::vector<std::string> blocked_sqls{
+        "SELECT a FROM t WHERE a = 1 OR EXISTS (SELECT a FROM t1)",
+        "SELECT a FROM t WHERE a = 1 OR a IN (SELECT a FROM t1)",
+        "SELECT a FROM t WHERE a NOT IN (SELECT a FROM t1)",
+        "SELECT a FROM t WHERE a = (SELECT MAX(a) FROM t1)",
+    };
+    for (const auto& sql_text : blocked_sqls) {
+        const auto logical = sql::bind_select(sql::parse_select(sql_text), catalog);
+        optimizer::Memo memo;
+        const auto root = memo.insert(logical);
+        const auto explored = optimizer::explore_memo_to_fixpoint(memo, optimizer::default_memo_rules());
+        const auto alternatives =
+            memo.extract_alternatives(root, optimizer::AlternativeExtractionOptions{128, 1024});
+        if (trace_contains(explored.fired_rules, "ExistsToSemiJoinRule") ||
+            trace_contains(explored.fired_rules, "NotExistsToAntiJoinRule") ||
+            trace_contains(explored.fired_rules, "InToSemiJoinRule") ||
+            contains_plan_text(alternatives.plans, "SemiJoin[") ||
+            contains_plan_text(alternatives.plans, "AntiJoin[")) {
+            std::cerr << "blocked subquery form was decorrelated\n"
+                      << "sql: " << sql_text << "\n"
+                      << "memo dump:\n" << memo.dump();
+            std::terminate();
+        }
+    }
+
+    const auto residual_sql =
+        "SELECT a FROM t WHERE a > 1 AND EXISTS (SELECT a FROM t1)";
+    const auto residual = sql::bind_select(sql::parse_select(residual_sql), catalog);
+    optimizer::Memo residual_memo;
+    const auto residual_root = residual_memo.insert(residual);
+    const auto residual_explored =
+        optimizer::explore_memo_to_fixpoint(residual_memo, optimizer::default_memo_rules());
+    const auto residual_alternatives = residual_memo.extract_alternatives(
+        residual_root, optimizer::AlternativeExtractionOptions{128, 1024});
+    if (!trace_contains(residual_explored.fired_rules, "ExistsToSemiJoinRule") ||
+        !trace_contains(residual_explored.fired_rules, "FilterIntoJoinRule") ||
+        !contains_plan_text(residual_alternatives.plans,
+                            "SemiJoin[]\n    Filter[col(t.a) > lit(1)]")) {
+        std::cerr << "left-only residual did not push into the preserved side of SemiJoin\n"
+                  << "sql: " << residual_sql << "\n"
+                  << "memo dump:\n" << residual_memo.dump();
+        std::terminate();
+    }
+    if (trace_contains(residual_explored.fired_rules, "JoinCommuteRule") ||
+        trace_contains(residual_explored.fired_rules, "JoinAssociateRule") ||
+        trace_contains(residual_explored.fired_rules, "LeftJoinToInnerRule")) {
+        std::cerr << "SemiJoin crossed a forbidden join transform guard\n"
+                  << "memo dump:\n" << residual_memo.dump();
+        std::terminate();
+    }
+
+    const auto anti_sql =
+        "SELECT a FROM t WHERE a > 1 AND NOT EXISTS (SELECT a FROM t1 WHERE a = 999)";
+    const auto anti = sql::bind_select(sql::parse_select(anti_sql), catalog);
+    optimizer::Memo anti_memo;
+    const auto anti_root = anti_memo.insert(anti);
+    const auto anti_explored =
+        optimizer::explore_memo_to_fixpoint(anti_memo, optimizer::default_memo_rules());
+    const auto anti_alternatives =
+        anti_memo.extract_alternatives(anti_root, optimizer::AlternativeExtractionOptions{128, 1024});
+    if (!trace_contains(anti_explored.fired_rules, "NotExistsToAntiJoinRule") ||
+        !trace_contains(anti_explored.fired_rules, "FilterIntoJoinRule") ||
+        !contains_plan_text(anti_alternatives.plans,
+                            "AntiJoin[]\n    Filter[col(t.a) > lit(1)]") ||
+        trace_contains(anti_explored.fired_rules, "JoinCommuteRule") ||
+        trace_contains(anti_explored.fired_rules, "JoinAssociateRule") ||
+        trace_contains(anti_explored.fired_rules, "LeftJoinToInnerRule")) {
+        std::cerr << "AntiJoin transform guards or preserved-side pushdown failed\n"
+                  << "sql: " << anti_sql << "\n"
+                  << "memo dump:\n" << anti_memo.dump();
+        std::terminate();
+    }
+
+    const auto right_only = plan::BoundPredicate::comparison_expr(plan::BoundComparisonExpr{
+        plan::BoundColumnRef{"t2", "c", 0},
+        sql::ComparisonOp::Greater,
+        sql::IntLiteral{200, 0},
+        0,
+    });
+    const auto mixed = plan::BoundPredicate::comparison_expr(plan::BoundComparisonExpr{
+        plan::BoundColumnRef{"t1", "a", 0},
+        sql::ComparisonOp::Equal,
+        plan::BoundColumnRef{"t2", "a", 0},
+        0,
+    });
+    const auto empty_reference = plan::BoundPredicate::null_check_expr(
+        sql::PredicateKind::IsNull, plan::BoundScalarExpr{sql::IntLiteral{1, 0}}, 0);
+    for (const auto kind : {plan::JoinKind::Semi, plan::JoinKind::Anti}) {
+        for (const auto& pinned : {right_only, mixed, empty_reference}) {
+            const auto logical = plan::LogicalPlan::filter(
+                {pinned},
+                plan::LogicalPlan::join({},
+                                        plan::LogicalPlan::scan("t1"),
+                                        plan::LogicalPlan::scan("t2"),
+                                        kind));
+            optimizer::Memo guard_memo;
+            const auto guard_root = guard_memo.insert(logical);
+            const auto guard_explored =
+                optimizer::explore_memo_to_fixpoint(guard_memo, optimizer::default_memo_rules());
+            const auto guard_alternatives = guard_memo.extract_alternatives(
+                guard_root, optimizer::AlternativeExtractionOptions{128, 1024});
+            if (trace_contains(guard_explored.fired_rules, "FilterIntoJoinRule") ||
+                trace_contains(guard_explored.fired_rules, "JoinCommuteRule") ||
+                trace_contains(guard_explored.fired_rules, "JoinAssociateRule") ||
+                trace_contains(guard_explored.fired_rules, "LeftJoinToInnerRule") ||
+                guard_alternatives.plans.size() != 1) {
+                std::cerr << "non-left-only predicate crossed a Semi/Anti transform guard\n"
+                          << "plan:\n" << plan::to_string(logical) << "\n"
+                          << "memo dump:\n" << guard_memo.dump();
+                std::terminate();
+            }
+        }
+    }
+}
+
 void assert_filter_through_aggregate_pushes_only_group_keys() {
     const auto catalog = make_catalog();
     const auto sql =
@@ -657,6 +817,25 @@ void assert_subquery_subplans_are_structural_but_opaque_memo_fields() {
     memo.assert_invariants();
 }
 
+void assert_semi_anti_join_kinds_are_distinct_memo_identity() {
+    const auto semi = plan::LogicalPlan::join(
+        {}, plan::LogicalPlan::scan("t1"), plan::LogicalPlan::scan("t2"), plan::JoinKind::Semi);
+    const auto anti = plan::LogicalPlan::join(
+        {}, plan::LogicalPlan::scan("t1"), plan::LogicalPlan::scan("t2"), plan::JoinKind::Anti);
+
+    optimizer::Memo memo;
+    const auto semi_root = memo.insert(semi);
+    const auto anti_root = memo.insert(anti);
+    assert(semi_root != anti_root);
+    assert(memo.group_count() == 4);
+    assert(memo.extract(semi_root).join_kind == plan::JoinKind::Semi);
+    assert(memo.extract(anti_root).join_kind == plan::JoinKind::Anti);
+    const auto dump = memo.dump();
+    assert(dump.find("SemiJoin[]") != std::string::npos);
+    assert(dump.find("AntiJoin[]") != std::string::npos);
+    memo.assert_invariants();
+}
+
 void assert_subquery_conjunct_moves_using_only_outer_references() {
     const auto catalog = make_catalog();
     const auto sql =
@@ -715,6 +894,8 @@ int main() {
     assert_left_join_to_inner_unlocks_guarded_transforms();
     assert_filter_through_aggregate_pushes_only_group_keys();
     assert_filter_through_aggregate_moves_group_key_or_but_pins_aggregate_or();
+    assert_semi_anti_join_kinds_are_distinct_memo_identity();
+    assert_top_level_subquery_decorrelation_rules_and_guards();
     assert_subquery_subplans_are_structural_but_opaque_memo_fields();
     assert_subquery_conjunct_moves_using_only_outer_references();
     assert_explain_indents_opaque_subplans_under_owner();

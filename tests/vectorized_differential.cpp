@@ -992,40 +992,67 @@ bool run_generated_corpus() {
     return ok;
 }
 
-bool run_subquery_oracle_corpus() {
+bool run_subquery_execution_corpus() {
     const auto catalog = make_golden_catalog();
     const std::string table_text = "phase21a deterministic subquery catalog";
     bool ok = true;
-    ok = differential::compare_subquery_oracle_paths(
+    ok = differential::compare_engines(
              "SELECT a FROM t WHERE a = (SELECT MAX(a) FROM t1)", catalog, table_text) &&
          ok;
-    ok = differential::compare_subquery_oracle_paths(
+    ok = differential::compare_engines(
              "SELECT a FROM t WHERE a NOT IN (SELECT k FROM nullable)", catalog, table_text) &&
          ok;
-    ok = differential::compare_subquery_oracle_paths(
+    ok = differential::compare_engines(
              "SELECT a FROM t WHERE NOT EXISTS (SELECT a FROM t LIMIT 0)", catalog, table_text) &&
          ok;
-    ok = differential::compare_subquery_oracle_paths(
+    ok = differential::compare_engines(
              "SELECT a FROM t WHERE a IN "
              "(SELECT t1.a FROM t1 JOIN t2 ON t1.a = t2.a WHERE EXISTS (SELECT a FROM empty))",
              catalog,
              table_text) &&
          ok;
+    ok = differential::compare_engines(
+             "SELECT a FROM t WHERE a = 4 OR a IN (SELECT k FROM nullable)", catalog, table_text) &&
+         ok;
+    ok = differential::compare_engines(
+             "SELECT a FROM t WHERE a = 4 OR EXISTS (SELECT a FROM empty)", catalog, table_text) &&
+         ok;
+    ok = differential::compare_engines(
+             "SELECT a FROM t WHERE a = 4 OR a = (SELECT MAX(a) FROM t1)", catalog, table_text) &&
+         ok;
+    ok = differential::compare_engines(
+             "SELECT a FROM t WHERE a NOT IN (SELECT k FROM nullable) OR a = 4", catalog, table_text) &&
+         ok;
 
     differential::ComparisonStats error_stats;
-    ok = differential::compare_subquery_oracle_paths(
+    ok = differential::compare_engines(
              "SELECT a FROM t WHERE (SELECT a FROM t) = a", catalog, table_text, &error_stats) &&
          ok;
     if (error_stats.accepted_error_path_count != error_stats.execution_path_count) {
-        std::cerr << "scalar subquery cardinality error was not equivalent across every oracle path\n"
+        std::cerr << "scalar subquery cardinality error was not equivalent across every execution path\n"
                   << "accepted errors: " << error_stats.accepted_error_path_count << "\n"
-                  << "oracle paths: " << error_stats.execution_path_count << "\n";
+                  << "execution paths: " << error_stats.execution_path_count << "\n";
+        ok = false;
+    }
+
+    differential::ComparisonStats empty_outer_error_stats;
+    ok = differential::compare_engines(
+             "SELECT a FROM empty WHERE (SELECT a FROM t) = a",
+             catalog,
+             table_text,
+             &empty_outer_error_stats) &&
+         ok;
+    if (empty_outer_error_stats.accepted_error_path_count !=
+        empty_outer_error_stats.execution_path_count) {
+        std::cerr << "empty outer input suppressed an eager scalar subquery cardinality error\n"
+                  << "accepted errors: " << empty_outer_error_stats.accepted_error_path_count << "\n"
+                  << "execution paths: " << empty_outer_error_stats.execution_path_count << "\n";
         ok = false;
     }
 
 
     differential::ComparisonStats folded_error_stats;
-    ok = differential::compare_subquery_oracle_paths(
+    ok = differential::compare_engines(
              "SELECT a FROM t WHERE 1 = 0 AND (SELECT a FROM t) = a",
              catalog,
              table_text,
@@ -1093,25 +1120,57 @@ void assert_outer_join_physical_lowering_preserves_kind() {
     assert(physical.input->join_kind == plan::JoinKind::Left);
 }
 
-void assert_subquery_physical_lowering_has_one_exact_guard() {
+plan::BoundPredicate equi_join_predicate(std::string left_binding,
+                                         std::string left_column,
+                                         std::string right_binding,
+                                         std::string right_column) {
+    return plan::BoundPredicate::comparison_expr(plan::BoundComparisonExpr{
+        plan::BoundColumnRef{std::move(left_binding), std::move(left_column), 0},
+        sql::ComparisonOp::Equal,
+        plan::BoundColumnRef{std::move(right_binding), std::move(right_column), 0},
+        0,
+    });
+}
+
+void assert_interpreted_semi_anti_join_contract() {
+    const auto catalog = make_golden_catalog();
+
+    const auto semi = plan::LogicalPlan::join(
+        {equi_join_predicate("t1", "a", "t2", "a")},
+        plan::LogicalPlan::scan("t1"),
+        plan::LogicalPlan::scan("t2"),
+        plan::JoinKind::Semi);
+    const auto semi_result = execution::execute_interpreted(semi, catalog);
+    const auto semi_vectorized = execution::execute_vectorized(semi, catalog);
+    assert(format_batch(semi_result) == "columns=[t1.a,t1.b]; rows=[[2,20],[2,30]]");
+    assert(differential::same_batch(semi_result, semi_vectorized));
+    assert(plan::to_string(semi).find("SemiJoin[") == 0);
+    assert(plan::lower_to_physical(semi).join_kind == plan::JoinKind::Semi);
+
+    const auto anti = plan::LogicalPlan::join(
+        {equi_join_predicate("j1", "k", "j2", "k")},
+        plan::LogicalPlan::scan("j1"),
+        plan::LogicalPlan::scan("j2"),
+        plan::JoinKind::Anti);
+    const auto anti_result = execution::execute_interpreted(anti, catalog);
+    const auto anti_vectorized = execution::execute_vectorized(anti, catalog);
+    assert(format_batch(anti_result) == "columns=[j1.k,j1.v]; rows=[[NULL,20],[NULL,40]]");
+    assert(differential::same_batch(anti_result, anti_vectorized));
+    assert(plan::to_string(anti).find("AntiJoin[") == 0);
+    assert(plan::lower_to_physical(anti).join_kind == plan::JoinKind::Anti);
+}
+
+void assert_subquery_physical_lowering_and_vectorized_execution_are_supported() {
     const auto catalog = make_golden_catalog();
     const auto logical =
         sql::bind_select(sql::parse_select("SELECT a FROM t WHERE a IN (SELECT a FROM t1)"), catalog);
-    constexpr auto expected = "vectorized physical lowering does not support subqueries";
-
-    try {
-        (void)plan::lower_to_physical(logical);
-    } catch (const std::invalid_argument& error) {
-        assert(std::string(error.what()) == expected);
-        try {
-            (void)execution::execute_vectorized(logical, catalog);
-        } catch (const std::invalid_argument& execution_error) {
-            assert(std::string(execution_error.what()) == expected);
-            return;
-        }
-        throw std::logic_error("expected vectorized execution subquery guard");
-    }
-    throw std::logic_error("expected physical lowering subquery guard");
+    const auto physical = plan::lower_to_physical(logical);
+    assert(physical.kind == plan::PhysicalKind::Project);
+    const auto interpreted = execution::execute_interpreted(logical, catalog);
+    const auto vectorized = execution::execute_vectorized(logical, catalog);
+    const auto physical_vectorized = execution::execute_vectorized(physical, catalog);
+    assert(differential::same_batch(interpreted, vectorized));
+    assert(differential::same_batch(interpreted, physical_vectorized));
 }
 
 } // namespace
@@ -1120,14 +1179,15 @@ int main() {
     assert_physical_lowering_shape();
     assert_physical_lowering_accepts_string_touching_plans();
     assert_outer_join_physical_lowering_preserves_kind();
-    assert_subquery_physical_lowering_has_one_exact_guard();
+    assert_interpreted_semi_anti_join_contract();
+    assert_subquery_physical_lowering_and_vectorized_execution_are_supported();
 
     bool ok = true;
     ok = run_result_golden_queries() && ok;
     ok = run_join_oracle_corpus() && ok;
     ok = run_outer_join_corpus() && ok;
     ok = run_vectorized_string_corpus() && ok;
-    ok = run_subquery_oracle_corpus() && ok;
+    ok = run_subquery_execution_corpus() && ok;
     ok = run_generated_corpus() && ok;
     return ok ? 0 : 1;
 }
