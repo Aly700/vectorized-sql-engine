@@ -404,6 +404,143 @@ int main() {
     const auto catalog = make_catalog();
     const std::vector<GoldenQuery> tests{
         GoldenQuery{
+            "ranking windows preserve input order and use stable tie breaks",
+            "SELECT a, ROW_NUMBER() OVER (ORDER BY b DESC) AS rn, "
+            "RANK() OVER (ORDER BY b) AS r, DENSE_RANK() OVER (ORDER BY b) AS dr FROM t",
+            ExpectedResult{{"a", "rn", "r", "dr"},
+                           {{1, 4, 1, 1}, {2, 2, 2, 2}, {3, 3, 2, 2}, {4, 1, 4, 3}}},
+        },
+        GoldenQuery{
+            "NULL partition and order keys use distinct equality and NULL largest",
+            "SELECT g, h, x, ROW_NUMBER() OVER (PARTITION BY g ORDER BY x) AS rn, "
+            "RANK() OVER (PARTITION BY g ORDER BY x) AS r, "
+            "DENSE_RANK() OVER (PARTITION BY g ORDER BY x) AS dr FROM agg_null",
+            ExpectedResult{{"g", "h", "x", "rn", "r", "dr"},
+                           {{std::nullopt, 1, std::nullopt, 3, 3, 3},
+                            {std::nullopt, 1, 10, 1, 1, 1},
+                            {1, 1, std::nullopt, 2, 2, 2},
+                            {1, 2, 5, 1, 1, 1},
+                            {2, 1, std::nullopt, 1, 1, 1},
+                            {2, 1, std::nullopt, 2, 1, 1},
+                            {std::nullopt, 2, 20, 2, 2, 2}}},
+        },
+        GoldenQuery{
+            "whole-partition aggregate windows replicate NULL-aware results",
+            "SELECT g, x, SUM(x) OVER (PARTITION BY g) AS s, "
+            "COUNT(x) OVER (PARTITION BY g) AS n, COUNT(*) OVER (PARTITION BY g) AS all_n, "
+            "MIN(x) OVER (PARTITION BY g) AS lo, MAX(x) OVER (PARTITION BY g) AS hi FROM agg_null",
+            ExpectedResult{{"g", "x", "s", "n", "all_n", "lo", "hi"},
+                           {{std::nullopt, std::nullopt, 30, 2, 3, 10, 20},
+                            {std::nullopt, 10, 30, 2, 3, 10, 20},
+                            {1, std::nullopt, 5, 1, 2, 5, 5},
+                            {1, 5, 5, 1, 2, 5, 5},
+                            {2, std::nullopt, std::nullopt, 0, 2, std::nullopt, std::nullopt},
+                            {2, std::nullopt, std::nullopt, 0, 2, std::nullopt, std::nullopt},
+                            {std::nullopt, 20, 30, 2, 3, 10, 20}}},
+        },
+        GoldenQuery{
+            "empty input keeps window output schema",
+            "SELECT ROW_NUMBER() OVER () AS rn, SUM(a) OVER () AS s FROM empty",
+            ExpectedResult{{"rn", "s"}, {}},
+        },
+        GoldenQuery{
+            "one-row partitions and unordered ranks are pinned",
+            "SELECT a, ROW_NUMBER() OVER (PARTITION BY a) AS rn, "
+            "RANK() OVER (PARTITION BY a) AS r, DENSE_RANK() OVER (PARTITION BY a) AS dr FROM t",
+            ExpectedResult{{"a", "rn", "r", "dr"}, {{1, 1, 1, 1}, {2, 1, 1, 1}, {3, 1, 1, 1}, {4, 1, 1, 1}}},
+        },
+        GoldenQuery{
+            "ranking without ORDER BY treats one partition as one peer group",
+            "SELECT a, ROW_NUMBER() OVER () AS rn, RANK() OVER () AS r, "
+            "DENSE_RANK() OVER () AS dr FROM t",
+            ExpectedResult{{"a", "rn", "r", "dr"}, {{1, 1, 1, 1}, {2, 2, 1, 1}, {3, 3, 1, 1}, {4, 4, 1, 1}}},
+        },
+        GoldenQuery{
+            "multiple windows evaluate independently in one node",
+            "SELECT g, h, ROW_NUMBER() OVER (PARTITION BY g ORDER BY h) AS by_g, "
+            "COUNT(*) OVER (PARTITION BY h) AS by_h FROM agg_null",
+            ExpectedResult{{"g", "h", "by_g", "by_h"},
+                           {{std::nullopt, 1, 1, 5},
+                            {std::nullopt, 1, 2, 5},
+                            {1, 1, 1, 5},
+                            {1, 2, 2, 2},
+                            {2, 1, 1, 5},
+                            {2, 1, 2, 5},
+                            {std::nullopt, 2, 3, 2}}},
+        },
+        GoldenQuery{
+            "windows consume joined grouped and HAVING-filtered rows",
+            "SELECT t.a AS key, SUM(t2.c) AS group_sum, "
+            "RANK() OVER (ORDER BY SUM(t2.c) DESC) AS r, "
+            "SUM(SUM(t2.c)) OVER () AS total FROM t JOIN t2 ON t.a = t2.a "
+            "GROUP BY t.a HAVING SUM(t2.c) > 0",
+            ExpectedResult{{"key", "group_sum", "r", "total"}, {{2, 401, 1, 701}, {3, 300, 2, 701}}},
+        },
+        GoldenQuery{
+            "final ORDER BY may use a window output alias",
+            "SELECT a, RANK() OVER (ORDER BY b) AS r FROM t ORDER BY r DESC",
+            ExpectedResult{{"a", "r"}, {{4, 4}, {2, 2}, {3, 2}, {1, 1}}},
+        },
+        GoldenQuery{
+            "string partition aggregate windows preserve typed NULLs",
+            "SELECT s, MIN(s) OVER () AS lo, MAX(s) OVER () AS hi, COUNT(s) OVER () AS n FROM strings",
+            ExpectedResult{{"s", "lo", "hi", "n"},
+                           {{"beta", "", "beta", 4},
+                            {"", "", "beta", 4},
+                            {std::nullopt, "", "beta", 4},
+                            {"alpha", "", "beta", 4},
+                            {"a'b", "", "beta", 4}}},
+        },
+        GoldenQuery{
+            "window SUM overflow fails loudly",
+            "SELECT SUM(v) OVER () FROM overflow",
+            ExpectedResult{},
+            true,
+            ExpectedError{ErrorKind::Runtime, 0, "SUM(v) OVER () overflowed int64"},
+        },
+        GoldenQuery{
+            "aggregate window ORDER BY rejects running-frame semantics",
+            "SELECT SUM(a) OVER (ORDER BY b) FROM t",
+            ExpectedResult{},
+            true,
+            ExpectedError{ErrorKind::Parse, 20, "aggregate window ORDER BY is unsupported (running frames)"},
+        },
+        GoldenQuery{
+            "explicit window frame is unsupported at the frame token",
+            "SELECT RANK() OVER (ORDER BY a ROWS BETWEEN 1 AND 2) FROM t",
+            ExpectedResult{},
+            true,
+            ExpectedError{ErrorKind::Parse, 31, "window frames are unsupported"},
+        },
+        GoldenQuery{
+            "window function in WHERE has positioned SELECT-item-only error",
+            "SELECT a FROM t WHERE ROW_NUMBER() OVER () = 1",
+            ExpectedResult{},
+            true,
+            ExpectedError{ErrorKind::Parse, 22, "window functions are only supported as whole SELECT items"},
+        },
+        GoldenQuery{
+            "window function in GROUP BY has positioned SELECT-item-only error",
+            "SELECT a FROM t GROUP BY ROW_NUMBER() OVER ()",
+            ExpectedResult{},
+            true,
+            ExpectedError{ErrorKind::Parse, 25, "window functions are only supported as whole SELECT items"},
+        },
+        GoldenQuery{
+            "window function in HAVING has positioned SELECT-item-only error",
+            "SELECT a FROM t GROUP BY a HAVING RANK() OVER () = 1",
+            ExpectedResult{},
+            true,
+            ExpectedError{ErrorKind::Parse, 34, "window functions are only supported as whole SELECT items"},
+        },
+        GoldenQuery{
+            "nested window expression is rejected at its function",
+            "SELECT SUM(ROW_NUMBER() OVER ()) FROM t",
+            ExpectedResult{},
+            true,
+            ExpectedError{ErrorKind::Parse, 11, "window expressions must be whole SELECT items"},
+        },
+        GoldenQuery{
             "multi projection literal and AND comparisons",
             "SELECT a, b, 99 FROM t WHERE a >= 2 AND b <> 40",
             ExpectedResult{{"a", "b", "99"}, {{2, 20, 99}, {3, 20, 99}}},

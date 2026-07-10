@@ -388,6 +388,7 @@ inline bool contains_join(const plan::LogicalPlan& logical) {
     case plan::LogicalKind::Filter:
     case plan::LogicalKind::Project:
     case plan::LogicalKind::Aggregate:
+    case plan::LogicalKind::Window:
     case plan::LogicalKind::Sort:
     case plan::LogicalKind::Distinct:
     case plan::LogicalKind::Limit:

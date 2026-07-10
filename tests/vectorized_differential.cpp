@@ -557,6 +557,7 @@ bool contains_join(const plan::LogicalPlan& logical) {
     case plan::LogicalKind::Filter:
     case plan::LogicalKind::Project:
     case plan::LogicalKind::Aggregate:
+    case plan::LogicalKind::Window:
     case plan::LogicalKind::Sort:
     case plan::LogicalKind::Distinct:
     case plan::LogicalKind::Limit:
@@ -1232,6 +1233,42 @@ void assert_correlated_scalar_error_is_equivalent_on_every_oracle_path() {
     assert_guard(best);
 }
 
+void assert_window_oracle_paths_and_vectorized_guard() {
+    const auto catalog = make_golden_catalog();
+    const auto sql_text =
+        "SELECT t1.b, t2.c, RANK() OVER (ORDER BY t2.c) AS r "
+        "FROM t1 JOIN t2 ON t1.a = t2.a ORDER BY t2.c, t1.b";
+    const auto logical = sql::bind_select(sql::parse_select(sql_text), catalog);
+    const auto expected = execution::execute_interpreted(logical, catalog);
+    const auto guard_message = "vectorized execution does not support window functions";
+
+    const auto assert_path = [&](const plan::LogicalPlan& candidate) {
+        const auto oracle = execution::execute_interpreted(candidate, catalog);
+        assert(differential::same_batch(expected, oracle));
+        try {
+            (void)execution::execute_vectorized(candidate, catalog);
+        } catch (const std::runtime_error& error) {
+            assert(std::string(error.what()) == guard_message);
+            return;
+        }
+        throw std::logic_error("expected window vectorized-lowering guard");
+    };
+
+    assert_path(logical);
+    const auto rewritten = optimizer::rewrite_to_fixpoint(logical, optimizer::default_rules());
+    assert_path(rewritten.plan);
+
+    optimizer::Memo memo;
+    const auto root = memo.insert(logical);
+    (void)optimizer::explore_memo_to_fixpoint(memo, optimizer::default_memo_rules());
+    const auto alternatives = memo.extract_alternatives(root);
+    assert(alternatives.plans.size() > 1);
+    for (const auto& alternative : alternatives.plans) {
+        assert_path(alternative);
+    }
+    assert_path(memo.extract_best(root, catalog));
+}
+
 } // namespace
 
 int main() {
@@ -1242,6 +1279,7 @@ int main() {
     assert_subquery_physical_lowering_and_vectorized_execution_are_supported();
     assert_residual_correlated_subquery_is_rejected_at_physical_lowering();
     assert_correlated_scalar_error_is_equivalent_on_every_oracle_path();
+    assert_window_oracle_paths_and_vectorized_guard();
 
     bool ok = true;
     ok = run_result_golden_queries() && ok;

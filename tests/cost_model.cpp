@@ -703,6 +703,26 @@ void assert_semi_anti_costs_use_complementary_selectivity_and_linear_probe_work(
     assert(anti_estimate.cost == 2004.0);
 }
 
+void assert_window_cost_is_row_preserving_and_charges_each_specification() {
+    const auto catalog = make_skewed_catalog();
+    const auto logical = sql::bind_select(
+        sql::parse_select(
+            "SELECT k, ROW_NUMBER() OVER (ORDER BY k) AS rn, COUNT(*) OVER () AS n FROM tiny"),
+        catalog);
+    const auto estimate = optimizer::estimate_cost(logical, catalog);
+    // Scan=2. Window charges two linear passes (4) plus one ordered
+    // whole-input upper-bound sort (2*log2(2)=2). Project is cost-neutral.
+    assert(estimate.rows == 2.0);
+    assert(estimate.cost == 8.0);
+
+    optimizer::GroupId root = 0;
+    auto memo = explored_memo_for(logical, root);
+    const auto best = memo.extract_best(root, catalog);
+    const auto best_estimate = optimizer::estimate_cost(best, catalog);
+    assert(best_estimate.rows == 2.0);
+    assert(best_estimate.cost == 8.0);
+}
+
 } // namespace
 
 int main() {
@@ -725,5 +745,6 @@ int main() {
     assert_subquery_cost_is_added_once_to_owning_filter();
     assert_correlated_subquery_cost_scales_by_outer_rows_and_decorrelation_wins();
     assert_semi_anti_costs_use_complementary_selectivity_and_linear_probe_work();
+    assert_window_cost_is_row_preserving_and_charges_each_specification();
     return 0;
 }

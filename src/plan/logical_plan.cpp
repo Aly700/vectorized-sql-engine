@@ -339,6 +339,19 @@ void append_plan(std::ostringstream& out,
         out << "\n";
         append_plan(out, require_input(logical), depth + 1, annotation);
         return;
+    case LogicalKind::Window:
+        out << "Window[";
+        for (std::size_t i = 0; i < logical.window_expressions.size(); ++i) {
+            if (i != 0) {
+                out << ", ";
+            }
+            out << logical.window_expressions[i].output_name;
+        }
+        out << "]";
+        append_annotation(out, logical, annotation);
+        out << "\n";
+        append_plan(out, require_input(logical), depth + 1, annotation);
+        return;
     case LogicalKind::Distinct:
         out << "Distinct";
         append_annotation(out, logical, annotation);

@@ -49,9 +49,31 @@ struct AggregateCall {
     bool nested_aggregate{false};
     AggregateFunction nested_function{AggregateFunction::Count};
     std::size_t nested_position{0};
+    std::shared_ptr<AggregateCall> nested_call;
 };
 
-using SelectExpr = std::variant<ScalarExpr, AggregateCall>;
+enum class SortDirection { Asc, Desc };
+
+enum class WindowFunction { RowNumber, Rank, DenseRank, Count, Sum, Min, Max };
+
+using WindowInputExpr = std::variant<ColumnRef, AggregateCall>;
+
+struct WindowOrderKey {
+    WindowInputExpr expression;
+    SortDirection direction{SortDirection::Asc};
+};
+
+struct WindowCall {
+    WindowFunction function{WindowFunction::RowNumber};
+    std::size_t position{0};
+    std::size_t over_position{0};
+    bool count_star{false};
+    std::optional<WindowInputExpr> argument;
+    std::vector<WindowInputExpr> partition_by;
+    std::vector<WindowOrderKey> order_by;
+};
+
+using SelectExpr = std::variant<ScalarExpr, AggregateCall, WindowCall>;
 using HavingExpr = std::variant<ColumnRef, IntLiteral, StringLiteral, NullLiteral, ScalarSubquery, AggregateCall>;
 using OrderByExpr = std::variant<ColumnRef, AggregateCall>;
 
@@ -201,8 +223,6 @@ struct HavingClause {
     std::vector<HavingPredicateExpr> conjuncts;
 };
 
-enum class SortDirection { Asc, Desc };
-
 struct OrderByKey {
     OrderByExpr expression;
     SortDirection direction{SortDirection::Asc};
@@ -264,7 +284,10 @@ inline std::size_t expression_position(const SelectExpr& expression) {
     if (const auto* scalar = std::get_if<ScalarExpr>(&expression)) {
         return expression_position(*scalar);
     }
-    return std::get<AggregateCall>(expression).position;
+    if (const auto* aggregate = std::get_if<AggregateCall>(&expression)) {
+        return aggregate->position;
+    }
+    return std::get<WindowCall>(expression).position;
 }
 
 inline std::size_t expression_position(const HavingExpr& expression) {
@@ -305,6 +328,26 @@ inline std::string aggregate_function_name(AggregateFunction function) {
         return "MAX";
     }
     return "<unknown aggregate>";
+}
+
+inline std::string window_function_name(WindowFunction function) {
+    switch (function) {
+    case WindowFunction::RowNumber:
+        return "ROW_NUMBER";
+    case WindowFunction::Rank:
+        return "RANK";
+    case WindowFunction::DenseRank:
+        return "DENSE_RANK";
+    case WindowFunction::Count:
+        return "COUNT";
+    case WindowFunction::Sum:
+        return "SUM";
+    case WindowFunction::Min:
+        return "MIN";
+    case WindowFunction::Max:
+        return "MAX";
+    }
+    return "<unknown window function>";
 }
 
 inline std::string quote_string_literal(const std::string& value) {
@@ -351,8 +394,51 @@ inline std::string output_name(const AggregateCall& aggregate) {
         name += "*";
     } else if (aggregate.argument.has_value()) {
         name += output_name(*aggregate.argument);
+    } else if (aggregate.nested_call != nullptr) {
+        name += output_name(*aggregate.nested_call);
     } else if (aggregate.nested_aggregate) {
         name += aggregate_function_name(aggregate.nested_function) + "(...)";
+    }
+    name += ")";
+    return name;
+}
+
+inline std::string window_input_output_name(const WindowInputExpr& expression) {
+    if (const auto* column = std::get_if<ColumnRef>(&expression)) {
+        return output_name(*column);
+    }
+    return output_name(std::get<AggregateCall>(expression));
+}
+
+inline std::string output_name(const WindowCall& window) {
+    auto name = window_function_name(window.function) + "(";
+    if (window.count_star) {
+        name += "*";
+    } else if (window.argument.has_value()) {
+        name += window_input_output_name(*window.argument);
+    }
+    name += ") OVER (";
+    if (!window.partition_by.empty()) {
+        name += "PARTITION BY ";
+        for (std::size_t i = 0; i < window.partition_by.size(); ++i) {
+            if (i != 0) {
+                name += ", ";
+            }
+            name += window_input_output_name(window.partition_by[i]);
+        }
+    }
+    if (!window.order_by.empty()) {
+        if (!window.partition_by.empty()) {
+            name += " ";
+        }
+        name += "ORDER BY ";
+        for (std::size_t i = 0; i < window.order_by.size(); ++i) {
+            if (i != 0) {
+                name += ", ";
+            }
+            name += window_input_output_name(window.order_by[i].expression);
+            name += window.order_by[i].direction == SortDirection::Asc ? " ASC" : " DESC";
+        }
     }
     name += ")";
     return name;
@@ -362,7 +448,10 @@ inline std::string output_name(const SelectExpr& expression) {
     if (const auto* scalar = std::get_if<ScalarExpr>(&expression)) {
         return output_name(*scalar);
     }
-    return output_name(std::get<AggregateCall>(expression));
+    if (const auto* aggregate = std::get_if<AggregateCall>(&expression)) {
+        return output_name(*aggregate);
+    }
+    return output_name(std::get<WindowCall>(expression));
 }
 
 inline std::string output_name(const HavingExpr& expression) {

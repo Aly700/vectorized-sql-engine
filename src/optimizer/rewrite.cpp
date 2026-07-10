@@ -249,6 +249,21 @@ bool plan_references_outer_owner(const plan::LogicalPlan& logical) {
             return true;
         }
     }
+    for (const auto& window : logical.window_expressions) {
+        if (window.argument.has_value() && window.argument->outer_depth != 0) {
+            return true;
+        }
+        for (const auto& key : window.partition_keys) {
+            if (key.outer_depth != 0) {
+                return true;
+            }
+        }
+        for (const auto& key : window.order_keys) {
+            if (key.column.outer_depth != 0) {
+                return true;
+            }
+        }
+    }
     for (const auto& key : logical.sort_keys) {
         if (key.column.outer_depth != 0) {
             return true;
@@ -621,6 +636,7 @@ std::vector<std::string> output_tables_for_expression(const Memo& memo,
     case MemoExpressionKind::Filter:
     case MemoExpressionKind::Project:
     case MemoExpressionKind::Aggregate:
+    case MemoExpressionKind::Window:
     case MemoExpressionKind::Distinct:
     case MemoExpressionKind::Sort:
     case MemoExpressionKind::Limit:
@@ -676,6 +692,7 @@ std::optional<plan::LogicalPlan> rewrite_once(
     switch (logical.kind) {
     case plan::LogicalKind::Project:
     case plan::LogicalKind::Aggregate:
+    case plan::LogicalKind::Window:
     case plan::LogicalKind::Distinct:
     case plan::LogicalKind::Sort:
     case plan::LogicalKind::Limit:
