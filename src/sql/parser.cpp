@@ -5,6 +5,7 @@
 #include <cctype>
 #include <cstdint>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -380,12 +381,27 @@ private:
         expect_keyword("BY", "expected BY after GROUP");
 
         std::vector<ColumnRef> keys;
-        keys.push_back(parse_column_ref("expected GROUP BY column name"));
+        keys.push_back(parse_group_by_key());
         while (current_.kind == TokenKind::Comma) {
             advance();
-            keys.push_back(parse_column_ref("expected GROUP BY column name"));
+            keys.push_back(parse_group_by_key());
         }
         return keys;
+    }
+
+    ColumnRef parse_group_by_key() {
+        if (is_ranking_window_function()) {
+            throw ParseError(current_.position, "window functions are only supported as whole SELECT items");
+        }
+        if (is_aggregate_function()) {
+            const auto position = current_.position;
+            (void)parse_aggregate_call();
+            if (is_keyword("OVER")) {
+                throw ParseError(position, "window functions are only supported as whole SELECT items");
+            }
+            throw ParseError(position, "expected GROUP BY column name");
+        }
+        return parse_column_ref("expected GROUP BY column name");
     }
 
     OrderByKey parse_order_by_key() {
@@ -696,6 +712,17 @@ private:
     }
 
     ScalarExpr parse_scalar_expr(const std::string& message, bool allow_subquery = false) {
+        if (is_ranking_window_function()) {
+            throw ParseError(current_.position, "window functions are only supported as whole SELECT items");
+        }
+        if (is_aggregate_function()) {
+            const auto position = current_.position;
+            (void)parse_aggregate_call();
+            if (is_keyword("OVER")) {
+                throw ParseError(position, "window functions are only supported as whole SELECT items");
+            }
+            throw ParseError(position, message);
+        }
         if (allow_subquery && current_.kind == TokenKind::LeftParen && next_is_keyword("SELECT")) {
             return parse_subquery(message);
         }
@@ -736,7 +763,15 @@ private:
             return parse_subquery(message);
         }
         if (is_aggregate_function()) {
-            return parse_aggregate_call();
+            auto aggregate = parse_aggregate_call();
+            if (is_keyword("OVER")) {
+                throw ParseError(aggregate.position,
+                                 "window functions are only supported as whole SELECT items");
+            }
+            return aggregate;
+        }
+        if (is_ranking_window_function()) {
+            throw ParseError(current_.position, "window functions are only supported as whole SELECT items");
         }
         if (is_keyword("NULL")) {
             auto literal = NullLiteral{current_.position};
@@ -768,20 +803,162 @@ private:
 
     OrderByExpr parse_order_by_expr() {
         if (is_aggregate_function()) {
-            return parse_aggregate_call();
+            auto aggregate = parse_aggregate_call();
+            if (is_keyword("OVER")) {
+                throw ParseError(aggregate.position,
+                                 "window functions are only supported as whole SELECT items");
+            }
+            return aggregate;
+        }
+        if (is_ranking_window_function()) {
+            throw ParseError(current_.position, "window functions are only supported as whole SELECT items");
         }
         return parse_column_ref("expected ORDER BY column name");
     }
 
     SelectExpr parse_select_expr(const std::string& message) {
         if (is_aggregate_function()) {
-            return parse_aggregate_call();
+            auto aggregate = parse_aggregate_call();
+            if (is_keyword("OVER")) {
+                return parse_aggregate_window_call(std::move(aggregate));
+            }
+            return aggregate;
+        }
+        if (is_ranking_window_function()) {
+            return parse_ranking_window_call();
         }
         return parse_scalar_expr(message);
     }
 
     bool is_aggregate_function() const {
         return is_keyword("COUNT") || is_keyword("SUM") || is_keyword("MIN") || is_keyword("MAX");
+    }
+
+    bool is_ranking_window_function() const {
+        if (!(is_keyword("ROW_NUMBER") || is_keyword("RANK") || is_keyword("DENSE_RANK"))) {
+            return false;
+        }
+        return lexer_.peek().kind == TokenKind::LeftParen;
+    }
+
+    bool is_window_frame_keyword() const {
+        return is_keyword("ROWS") || is_keyword("RANGE") || is_keyword("BETWEEN");
+    }
+
+    static bool is_ranking_window_function(WindowFunction function) {
+        return function == WindowFunction::RowNumber || function == WindowFunction::Rank ||
+               function == WindowFunction::DenseRank;
+    }
+
+    WindowInputExpr parse_window_input_expr(const std::string& message) {
+        if (is_ranking_window_function()) {
+            throw ParseError(current_.position, "window expressions must be whole SELECT items");
+        }
+        if (is_aggregate_function()) {
+            auto aggregate = parse_aggregate_call();
+            if (is_keyword("OVER")) {
+                throw ParseError(aggregate.position, "window expressions must be whole SELECT items");
+            }
+            return aggregate;
+        }
+        return parse_column_ref(message);
+    }
+
+    WindowOrderKey parse_window_order_key() {
+        auto expression = parse_window_input_expr("expected window ORDER BY expression");
+        auto direction = SortDirection::Asc;
+        if (is_keyword("ASC")) {
+            advance();
+        } else if (is_keyword("DESC")) {
+            direction = SortDirection::Desc;
+            advance();
+        }
+        return WindowOrderKey{std::move(expression), direction};
+    }
+
+    WindowCall parse_window_specification(WindowCall window) {
+        window.over_position = current_.position;
+        expect_keyword("OVER", "expected OVER after window function");
+        expect_token(TokenKind::LeftParen, "expected '(' after OVER");
+
+        if (is_keyword("PARTITION")) {
+            advance();
+            expect_keyword("BY", "expected BY after PARTITION");
+            window.partition_by.push_back(parse_window_input_expr("expected window PARTITION BY expression"));
+            while (current_.kind == TokenKind::Comma) {
+                advance();
+                window.partition_by.push_back(parse_window_input_expr("expected window PARTITION BY expression"));
+            }
+        }
+
+        if (is_keyword("ORDER")) {
+            const auto order_position = current_.position;
+            if (!is_ranking_window_function(window.function)) {
+                throw ParseError(order_position,
+                                 "aggregate window ORDER BY is unsupported (running frames)");
+            }
+            advance();
+            expect_keyword("BY", "expected BY after ORDER");
+            window.order_by.push_back(parse_window_order_key());
+            while (current_.kind == TokenKind::Comma) {
+                advance();
+                window.order_by.push_back(parse_window_order_key());
+            }
+        }
+
+        if (is_window_frame_keyword()) {
+            throw ParseError(current_.position, "window frames are unsupported");
+        }
+        expect_token(TokenKind::RightParen, "expected ')' after window specification");
+        return window;
+    }
+
+    WindowCall parse_ranking_window_call() {
+        WindowCall window;
+        window.position = current_.position;
+        if (is_keyword("ROW_NUMBER")) {
+            window.function = WindowFunction::RowNumber;
+        } else if (is_keyword("RANK")) {
+            window.function = WindowFunction::Rank;
+        } else if (is_keyword("DENSE_RANK")) {
+            window.function = WindowFunction::DenseRank;
+        } else {
+            throw ParseError(current_.position, "expected ranking window function");
+        }
+        advance();
+        expect_token(TokenKind::LeftParen, "expected '(' after window function");
+        expect_token(TokenKind::RightParen, "ranking window functions do not accept arguments");
+        if (!is_keyword("OVER")) {
+            throw ParseError(current_.position, "expected OVER after window function");
+        }
+        return parse_window_specification(std::move(window));
+    }
+
+    static WindowFunction aggregate_window_function(AggregateFunction function) {
+        switch (function) {
+        case AggregateFunction::Count:
+            return WindowFunction::Count;
+        case AggregateFunction::Sum:
+            return WindowFunction::Sum;
+        case AggregateFunction::Min:
+            return WindowFunction::Min;
+        case AggregateFunction::Max:
+            return WindowFunction::Max;
+        }
+        throw std::logic_error("unreachable aggregate window function");
+    }
+
+    WindowCall parse_aggregate_window_call(AggregateCall aggregate) {
+        WindowCall window;
+        window.function = aggregate_window_function(aggregate.function);
+        window.position = aggregate.position;
+        window.count_star = aggregate.count_star;
+        if (aggregate.nested_call != nullptr) {
+            window.argument = *aggregate.nested_call;
+        } else if (aggregate.argument.has_value()) {
+            window.argument = *aggregate.argument;
+        }
+        return parse_window_specification(std::move(window));
     }
 
     AggregateFunction parse_aggregate_function() {
@@ -826,9 +1003,15 @@ private:
 
         if (is_aggregate_function()) {
             const auto nested = parse_aggregate_call();
+            if (is_keyword("OVER")) {
+                throw ParseError(nested.position, "window expressions must be whole SELECT items");
+            }
             aggregate.nested_aggregate = true;
             aggregate.nested_function = nested.function;
             aggregate.nested_position = nested.position;
+            aggregate.nested_call = std::make_shared<AggregateCall>(nested);
+        } else if (is_ranking_window_function()) {
+            throw ParseError(current_.position, "window expressions must be whole SELECT items");
         } else {
             aggregate.argument = parse_column_ref("expected aggregate argument column");
         }

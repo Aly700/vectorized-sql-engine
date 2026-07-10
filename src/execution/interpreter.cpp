@@ -1018,6 +1018,185 @@ storage::ColumnarBatch execute_aggregate(const plan::LogicalPlan& plan, Executio
     return out;
 }
 
+sql::AggregateFunction aggregate_function_for_window(sql::WindowFunction function) {
+    switch (function) {
+    case sql::WindowFunction::Count:
+        return sql::AggregateFunction::Count;
+    case sql::WindowFunction::Sum:
+        return sql::AggregateFunction::Sum;
+    case sql::WindowFunction::Min:
+        return sql::AggregateFunction::Min;
+    case sql::WindowFunction::Max:
+        return sql::AggregateFunction::Max;
+    case sql::WindowFunction::RowNumber:
+    case sql::WindowFunction::Rank:
+    case sql::WindowFunction::DenseRank:
+        break;
+    }
+    throw std::logic_error("ranking window is not an aggregate");
+}
+
+plan::AggregateExpression aggregate_expression_for_window(const plan::WindowExpression& window) {
+    return plan::AggregateExpression{window.output_name,
+                                     aggregate_function_for_window(window.function),
+                                     window.argument,
+                                     window.position,
+                                     window.type};
+}
+
+Cell window_key_value(const plan::BoundColumnRef& key,
+                      const storage::ColumnarBatch& input,
+                      std::size_t row,
+                      ExecutionContext& context) {
+    return key.outer_depth == 0 ? cell_at(input, column_identity_name(key), row) : outer_cell_at(key, context);
+}
+
+bool window_row_less(const std::vector<plan::SortKey>& keys,
+                     const storage::ColumnarBatch& input,
+                     std::size_t left,
+                     std::size_t right,
+                     ExecutionContext& context) {
+    for (const auto& key : keys) {
+        const auto left_value = window_key_value(key.column, input, left, context);
+        const auto right_value = window_key_value(key.column, input, right, context);
+        if (left_value == right_value) {
+            continue;
+        }
+        if (left_value.is_null || right_value.is_null) {
+            // NULL is the largest key value. Direction reversal therefore
+            // gives NULLS LAST for ASC and NULLS FIRST for DESC.
+            return key.direction == sql::SortDirection::Asc ? right_value.is_null : left_value.is_null;
+        }
+        return key.direction == sql::SortDirection::Asc ? left_value < right_value : right_value < left_value;
+    }
+    return false;
+}
+
+bool window_rows_are_peers(const std::vector<plan::SortKey>& keys,
+                           const storage::ColumnarBatch& input,
+                           std::size_t left,
+                           std::size_t right,
+                           ExecutionContext& context) {
+    for (const auto& key : keys) {
+        if (!(window_key_value(key.column, input, left, context) ==
+              window_key_value(key.column, input, right, context))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::int64_t checked_window_ordinal(std::size_t ordinal, const std::string& output_name) {
+    if (ordinal > static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max())) {
+        throw std::runtime_error(output_name + " overflowed int64");
+    }
+    return static_cast<std::int64_t>(ordinal);
+}
+
+struct WindowPartition {
+    std::vector<std::size_t> rows;
+};
+
+std::vector<WindowPartition> build_window_partitions(const plan::WindowExpression& window,
+                                                     const storage::ColumnarBatch& input,
+                                                     ExecutionContext& context) {
+    std::map<std::vector<Cell>, std::size_t> partition_index_by_key;
+    std::vector<WindowPartition> partitions;
+    for (std::size_t row = 0; row < input.row_count(); ++row) {
+        std::vector<Cell> key;
+        key.reserve(window.partition_keys.size());
+        for (const auto& partition_key : window.partition_keys) {
+            key.push_back(window_key_value(partition_key, input, row, context));
+        }
+        const auto found = partition_index_by_key.find(key);
+        if (found == partition_index_by_key.end()) {
+            const auto index = partitions.size();
+            partition_index_by_key.emplace(std::move(key), index);
+            partitions.push_back(WindowPartition{});
+            partitions.back().rows.push_back(row);
+        } else {
+            partitions.at(found->second).rows.push_back(row);
+        }
+    }
+    return partitions;
+}
+
+OutputColumn evaluate_window(const plan::WindowExpression& window,
+                             const storage::ColumnarBatch& input,
+                             ExecutionContext& context) {
+    OutputColumn output;
+    output.type = window.type;
+    output.reserve(input.row_count());
+    std::vector<Cell> values(input.row_count(), null_cell(window.type));
+    auto partitions = build_window_partitions(window, input, context);
+
+    for (auto& partition : partitions) {
+        switch (window.function) {
+        case sql::WindowFunction::RowNumber:
+        case sql::WindowFunction::Rank:
+        case sql::WindowFunction::DenseRank: {
+            auto ordered_rows = partition.rows;
+            std::stable_sort(ordered_rows.begin(), ordered_rows.end(), [&](std::size_t left, std::size_t right) {
+                return window_row_less(window.order_keys, input, left, right, context);
+            });
+
+            std::size_t rank = 1;
+            std::size_t dense_rank = 1;
+            for (std::size_t index = 0; index < ordered_rows.size(); ++index) {
+                if (index != 0 &&
+                    !window_rows_are_peers(
+                        window.order_keys, input, ordered_rows[index - 1], ordered_rows[index], context)) {
+                    rank = index + 1;
+                    ++dense_rank;
+                }
+                const auto ordinal = window.function == sql::WindowFunction::RowNumber
+                                         ? index + 1
+                                         : (window.function == sql::WindowFunction::Rank ? rank : dense_rank);
+                values.at(ordered_rows[index]) = int64_cell(checked_window_ordinal(ordinal, window.output_name));
+            }
+            break;
+        }
+        case sql::WindowFunction::Count:
+        case sql::WindowFunction::Sum:
+        case sql::WindowFunction::Min:
+        case sql::WindowFunction::Max: {
+            const auto aggregate = aggregate_expression_for_window(window);
+            AggregateValue state;
+            for (const auto row : partition.rows) {
+                update_aggregate(state, aggregate, input, row, context);
+            }
+            const auto value = finalize_aggregate(state, aggregate);
+            for (const auto row : partition.rows) {
+                values.at(row) = value;
+            }
+            break;
+        }
+        }
+    }
+
+    for (auto& value : values) {
+        output.append(std::move(value));
+    }
+    return output;
+}
+
+storage::ColumnarBatch execute_window(const plan::LogicalPlan& plan, ExecutionContext& context) {
+    const auto input = execute_node(require_input(plan), context);
+    storage::ColumnarBatch out;
+    for (const auto& name : input.column_names()) {
+        if (input.column_type(name) == catalog::ColumnType::Int64) {
+            out.add_column(name, input.column(name));
+        } else {
+            out.add_column(name, input.string_column(name));
+        }
+    }
+    for (const auto& window : plan.window_expressions) {
+        auto column = evaluate_window(window, input, context);
+        std::move(column).add_to(out, window.output_name);
+    }
+    return out;
+}
+
 storage::ColumnarBatch execute_sort(const plan::LogicalPlan& plan, ExecutionContext& context) {
     const auto& input_plan = require_input(plan);
     if (input_plan.kind == plan::LogicalKind::Project) {
@@ -1079,6 +1258,8 @@ storage::ColumnarBatch execute_node(const plan::LogicalPlan& plan, ExecutionCont
     }
     case plan::LogicalKind::Aggregate:
         return execute_aggregate(plan, context);
+    case plan::LogicalKind::Window:
+        return execute_window(plan, context);
     case plan::LogicalKind::Distinct:
         return execute_distinct(plan, context);
     case plan::LogicalKind::Sort:

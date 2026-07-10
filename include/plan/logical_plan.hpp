@@ -16,7 +16,7 @@ namespace plan {
 
 struct LogicalPlan;
 
-enum class LogicalKind { Scan, Join, Filter, Project, Aggregate, Distinct, Sort, Limit, Explain };
+enum class LogicalKind { Scan, Join, Filter, Project, Aggregate, Window, Distinct, Sort, Limit, Explain };
 enum class OrderPermission { Deterministic, Arbitrary };
 enum class JoinKind { Inner, Left, Semi, Anti };
 
@@ -149,6 +149,17 @@ struct AggregateExpression {
     catalog::ColumnType type{catalog::ColumnType::Int64};
 };
 
+struct WindowExpression {
+    std::string output_name;
+    sql::WindowFunction function{sql::WindowFunction::RowNumber};
+    bool count_star{false};
+    std::optional<BoundColumnRef> argument;
+    std::vector<BoundColumnRef> partition_keys;
+    std::vector<SortKey> order_keys;
+    std::size_t position{0};
+    catalog::ColumnType type{catalog::ColumnType::Int64};
+};
+
 struct LogicalPlan {
     LogicalKind kind{LogicalKind::Scan};
     OrderPermission order_permission{OrderPermission::Deterministic};
@@ -159,6 +170,7 @@ struct LogicalPlan {
     std::vector<Projection> projections;
     std::vector<BoundColumnRef> group_keys;
     std::vector<AggregateExpression> aggregate_expressions;
+    std::vector<WindowExpression> window_expressions;
     std::vector<SortKey> sort_keys;
     std::vector<BoundPredicate> predicates;
     // Set only on a bound subplan root. Empty is the structural Phase 21a
@@ -224,6 +236,14 @@ struct LogicalPlan {
         p.kind = LogicalKind::Aggregate;
         p.group_keys = std::move(group_keys);
         p.aggregate_expressions = std::move(aggregate_expressions);
+        p.input = std::make_shared<LogicalPlan>(std::move(child));
+        return p;
+    }
+
+    static LogicalPlan window(std::vector<WindowExpression> window_expressions, LogicalPlan child) {
+        LogicalPlan p;
+        p.kind = LogicalKind::Window;
+        p.window_expressions = std::move(window_expressions);
         p.input = std::make_shared<LogicalPlan>(std::move(child));
         return p;
     }

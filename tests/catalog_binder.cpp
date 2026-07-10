@@ -710,6 +710,184 @@ missing_select:
     throw std::logic_error("expected IN subquery parse error");
 }
 
+void assert_window_functions_bind_between_having_and_project() {
+    auto catalog = make_schema_catalog();
+    const auto logical = sql::bind_select(
+        sql::parse_select(
+            "SELECT a, ROW_NUMBER() OVER (PARTITION BY a ORDER BY b DESC) AS rn, "
+            "RANK() OVER (ORDER BY b) AS r, DENSE_RANK() OVER () AS dr, "
+            "SUM(b) OVER (PARTITION BY a) AS partition_sum, COUNT(*) OVER () AS total "
+            "FROM t ORDER BY rn"),
+        catalog);
+
+    const auto expected =
+        std::string("Sort[col(rn) ASC]\n") +
+        "  Project[a=col(t.a), rn=col(ROW_NUMBER() OVER (PARTITION BY a ORDER BY b DESC)), "
+        "r=col(RANK() OVER (ORDER BY b ASC)), dr=col(DENSE_RANK() OVER ()), "
+        "partition_sum=col(SUM(b) OVER (PARTITION BY a)), total=col(COUNT(*) OVER ())]\n"
+        "    Window[ROW_NUMBER() OVER (PARTITION BY a ORDER BY b DESC), "
+        "RANK() OVER (ORDER BY b ASC), DENSE_RANK() OVER (), "
+        "SUM(b) OVER (PARTITION BY a), COUNT(*) OVER ()]\n"
+        "      Scan[t]";
+    const auto printed = plan::to_string(logical);
+    if (printed != expected) {
+        throw std::logic_error("window plan shape mismatch:\n" + printed);
+    }
+}
+
+void assert_grouped_windows_consume_post_having_rows() {
+    auto catalog = make_schema_catalog();
+    const auto logical = sql::bind_select(
+        sql::parse_select(
+            "SELECT a, SUM(b), SUM(SUM(b)) OVER (PARTITION BY a) AS grouped_sum, "
+            "RANK() OVER (ORDER BY SUM(b) DESC) AS grouped_rank "
+            "FROM t GROUP BY a HAVING SUM(b) > 10"),
+        catalog);
+
+    const auto expected =
+        std::string("Project[a=col(t.a), SUM(b)=col(SUM(b)), ") +
+        "grouped_sum=col(SUM(SUM(b)) OVER (PARTITION BY a)), "
+        "grouped_rank=col(RANK() OVER (ORDER BY SUM(b) DESC))]\n"
+        "  Window[SUM(SUM(b)) OVER (PARTITION BY a), RANK() OVER (ORDER BY SUM(b) DESC)]\n"
+        "    Filter[col(SUM(b)) > lit(10)]\n"
+        "      Aggregate[group_keys=[col(t.a)], aggregates=[SUM(b)=col(t.b)]]\n"
+        "        Scan[t]";
+    const auto printed = plan::to_string(logical);
+    if (printed != expected) {
+        throw std::logic_error("grouped window placement mismatch:\n" + printed);
+    }
+}
+
+void assert_window_parse_errors_are_positioned_and_named() {
+    const std::string running = "SELECT SUM(a) OVER (ORDER BY b) FROM t";
+    try {
+        (void)sql::parse_select(running);
+    } catch (const sql::ParseError& error) {
+        assert(error.position() == running.find("ORDER"));
+        assert(error.message() == "aggregate window ORDER BY is unsupported (running frames)");
+        goto frame;
+    }
+    throw std::logic_error("expected aggregate running-window parse error");
+
+frame:
+    const std::string framed =
+        "SELECT RANK() OVER (ORDER BY a ROWS BETWEEN 1 AND 2) FROM t";
+    try {
+        (void)sql::parse_select(framed);
+    } catch (const sql::ParseError& error) {
+        assert(error.position() == framed.find("ROWS"));
+        assert(error.message() == "window frames are unsupported");
+        goto nested;
+    }
+    throw std::logic_error("expected window-frame parse error");
+
+nested:
+    const std::string nested = "SELECT SUM(ROW_NUMBER() OVER ()) FROM t";
+    try {
+        (void)sql::parse_select(nested);
+    } catch (const sql::ParseError& error) {
+        assert(error.position() == nested.find("ROW_NUMBER"));
+        assert(error.message() == "window expressions must be whole SELECT items");
+        return;
+    }
+    throw std::logic_error("expected nested-window parse error");
+}
+
+void assert_window_misplacement_errors_are_positioned() {
+    const std::string where = "SELECT a FROM t WHERE ROW_NUMBER() OVER () = 1";
+    try {
+        (void)sql::parse_select(where);
+    } catch (const sql::ParseError& error) {
+        assert(error.position() == where.find("ROW_NUMBER"));
+        assert(error.message() == "window functions are only supported as whole SELECT items");
+        goto group_by;
+    }
+    throw std::logic_error("expected WHERE window parse error");
+
+group_by:
+    const std::string group = "SELECT a FROM t GROUP BY ROW_NUMBER() OVER ()";
+    try {
+        (void)sql::parse_select(group);
+    } catch (const sql::ParseError& error) {
+        assert(error.position() == group.find("ROW_NUMBER"));
+        assert(error.message() == "window functions are only supported as whole SELECT items");
+        goto having;
+    }
+    throw std::logic_error("expected GROUP BY window parse error");
+
+having:
+    const std::string having = "SELECT a FROM t GROUP BY a HAVING RANK() OVER () = 1";
+    try {
+        (void)sql::parse_select(having);
+    } catch (const sql::ParseError& error) {
+        assert(error.position() == having.find("RANK"));
+        assert(error.message() == "window functions are only supported as whole SELECT items");
+        return;
+    }
+    throw std::logic_error("expected HAVING window parse error");
+}
+
+void assert_aggregate_window_in_group_by_has_window_misplacement_error() {
+    const std::string group = "SELECT a FROM t GROUP BY SUM(b) OVER ()";
+    try {
+        (void)sql::parse_select(group);
+    } catch (const sql::ParseError& error) {
+        assert(error.position() == group.find("SUM"));
+        assert(error.message() == "window functions are only supported as whole SELECT items");
+        return;
+    }
+    throw std::logic_error("expected aggregate window GROUP BY parse error");
+}
+
+void assert_aggregate_window_nested_in_window_key_is_positioned() {
+    const std::string nested =
+        "SELECT RANK() OVER (PARTITION BY SUM(a) OVER ()) FROM t";
+    try {
+        (void)sql::parse_select(nested);
+    } catch (const sql::ParseError& error) {
+        assert(error.position() == nested.find("SUM"));
+        assert(error.message() == "window expressions must be whole SELECT items");
+        return;
+    }
+    throw std::logic_error("expected nested aggregate window key parse error");
+}
+
+void assert_window_binding_enforces_grouped_scope_types_and_names() {
+    auto catalog = make_schema_catalog();
+    const std::string grouped =
+        "SELECT a, SUM(b), SUM(b) OVER (PARTITION BY a) FROM t GROUP BY a";
+    try {
+        (void)sql::bind_select(sql::parse_select(grouped), catalog);
+    } catch (const sql::BindError& error) {
+        assert(error.position() == grouped.find("b) OVER"));
+        assert(error.message() == "window column 'b' must appear in GROUP BY or be aggregated");
+        goto type;
+    }
+    throw std::logic_error("expected grouped window input bind error");
+
+type:
+    const std::string string_sum = "SELECT SUM(s) OVER () FROM strings";
+    try {
+        (void)sql::bind_select(sql::parse_select(string_sum), catalog);
+    } catch (const sql::BindError& error) {
+        assert(error.position() == string_sum.find("SUM"));
+        assert(error.message() == "SUM requires int64 argument, got string");
+        goto duplicate;
+    }
+    throw std::logic_error("expected string window SUM bind error");
+
+duplicate:
+    const std::string duplicate = "SELECT ROW_NUMBER() OVER (), ROW_NUMBER() OVER () FROM t";
+    try {
+        (void)sql::bind_select(sql::parse_select(duplicate), catalog);
+    } catch (const sql::BindError& error) {
+        assert(error.position() == duplicate.rfind("ROW_NUMBER"));
+        assert(error.message() == "duplicate output name 'ROW_NUMBER() OVER ()'");
+        return;
+    }
+    throw std::logic_error("expected duplicate canonical window output bind error");
+}
+
 } // namespace
 
 int main() {
@@ -757,5 +935,12 @@ int main() {
     assert_inner_level_ambiguity_does_not_fall_back_to_outer_scope();
     assert_nested_subquery_records_grandparent_dependency();
     assert_subquery_parse_errors_are_positioned();
+    assert_window_functions_bind_between_having_and_project();
+    assert_grouped_windows_consume_post_having_rows();
+    assert_window_parse_errors_are_positioned_and_named();
+    assert_window_misplacement_errors_are_positioned();
+    assert_aggregate_window_in_group_by_has_window_misplacement_error();
+    assert_aggregate_window_nested_in_window_key_is_positioned();
+    assert_window_binding_enforces_grouped_scope_types_and_names();
     return 0;
 }

@@ -133,6 +133,25 @@ void hash_sort_key(std::size_t& seed, const plan::SortKey& key) {
     hash_combine(seed, static_cast<std::size_t>(key.direction));
 }
 
+void hash_window_expression(std::size_t& seed, const plan::WindowExpression& window) {
+    hash_string(seed, window.output_name);
+    hash_combine(seed, static_cast<std::size_t>(window.function));
+    hash_combine(seed, window.count_star ? 1 : 0);
+    hash_combine(seed, static_cast<std::size_t>(window.type));
+    hash_combine(seed, window.argument.has_value() ? 1 : 0);
+    if (window.argument.has_value()) {
+        hash_column(seed, *window.argument);
+    }
+    hash_combine(seed, window.partition_keys.size());
+    for (const auto& key : window.partition_keys) {
+        hash_column(seed, key);
+    }
+    hash_combine(seed, window.order_keys.size());
+    for (const auto& key : window.order_keys) {
+        hash_sort_key(seed, key);
+    }
+}
+
 void hash_logical_child(std::size_t& seed, const std::shared_ptr<plan::LogicalPlan>& child) {
     hash_combine(seed, child == nullptr ? 0 : 1);
     if (child != nullptr) {
@@ -163,6 +182,10 @@ void hash_logical_plan(std::size_t& seed, const plan::LogicalPlan& logical) {
     hash_combine(seed, logical.aggregate_expressions.size());
     for (const auto& aggregate : logical.aggregate_expressions) {
         hash_aggregate_expression(seed, aggregate);
+    }
+    hash_combine(seed, logical.window_expressions.size());
+    for (const auto& window : logical.window_expressions) {
+        hash_window_expression(seed, window);
     }
     hash_combine(seed, logical.sort_keys.size());
     for (const auto& key : logical.sort_keys) {
@@ -199,6 +222,11 @@ std::size_t structural_hash(const MemoExpression& expression) {
     hash_combine(seed, expression.aggregate_expressions.size());
     for (const auto& aggregate : expression.aggregate_expressions) {
         hash_aggregate_expression(seed, aggregate);
+    }
+
+    hash_combine(seed, expression.window_expressions.size());
+    for (const auto& window : expression.window_expressions) {
+        hash_window_expression(seed, window);
     }
 
     hash_combine(seed, expression.sort_keys.size());
@@ -309,6 +337,32 @@ bool sort_key_equal(const plan::SortKey& left, const plan::SortKey& right) {
     return column_equal(left.column, right.column) && left.direction == right.direction;
 }
 
+bool window_expression_equal(const plan::WindowExpression& left, const plan::WindowExpression& right) {
+    if (left.output_name != right.output_name || left.function != right.function ||
+        left.count_star != right.count_star || left.type != right.type ||
+        left.argument.has_value() != right.argument.has_value()) {
+        return false;
+    }
+    if (left.argument.has_value() && !column_equal(*left.argument, *right.argument)) {
+        return false;
+    }
+    if (left.partition_keys.size() != right.partition_keys.size() ||
+        left.order_keys.size() != right.order_keys.size()) {
+        return false;
+    }
+    for (std::size_t i = 0; i < left.partition_keys.size(); ++i) {
+        if (!column_equal(left.partition_keys[i], right.partition_keys[i])) {
+            return false;
+        }
+    }
+    for (std::size_t i = 0; i < left.order_keys.size(); ++i) {
+        if (!sort_key_equal(left.order_keys[i], right.order_keys[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
 template <typename T, typename Equal>
 bool vector_equal(const std::vector<T>& left, const std::vector<T>& right, Equal equal) {
     if (left.size() != right.size()) {
@@ -337,6 +391,7 @@ bool logical_plan_equal(const plan::LogicalPlan& left, const plan::LogicalPlan& 
            vector_equal(left.projections, right.projections, projection_equal) &&
            vector_equal(left.group_keys, right.group_keys, column_equal) &&
            vector_equal(left.aggregate_expressions, right.aggregate_expressions, aggregate_expression_equal) &&
+           vector_equal(left.window_expressions, right.window_expressions, window_expression_equal) &&
            vector_equal(left.sort_keys, right.sort_keys, sort_key_equal) &&
            vector_equal(left.correlation_columns, right.correlation_columns, column_equal) &&
            vector_equal(left.predicates, right.predicates, predicate_equal) &&
@@ -350,6 +405,7 @@ bool structural_equal(const MemoExpression& left, const MemoExpression& right) {
            vector_equal(left.projections, right.projections, projection_equal) &&
            vector_equal(left.group_keys, right.group_keys, column_equal) &&
            vector_equal(left.aggregate_expressions, right.aggregate_expressions, aggregate_expression_equal) &&
+           vector_equal(left.window_expressions, right.window_expressions, window_expression_equal) &&
            vector_equal(left.sort_keys, right.sort_keys, sort_key_equal) &&
            vector_equal(left.predicates, right.predicates, predicate_equal) && left.limit_count == right.limit_count &&
            left.children == right.children;
@@ -579,6 +635,17 @@ std::string memo_expression_to_string(const MemoExpression& expression) {
         out << "], aggregates=[";
         append_aggregate_expressions(out, expression.aggregate_expressions);
         out << "]]";
+        append_children(out, expression.children);
+        return out.str();
+    case MemoExpressionKind::Window:
+        out << "Window[";
+        for (std::size_t i = 0; i < expression.window_expressions.size(); ++i) {
+            if (i != 0) {
+                out << ", ";
+            }
+            out << expression.window_expressions[i].output_name;
+        }
+        out << "]";
         append_children(out, expression.children);
         return out.str();
     case MemoExpressionKind::Distinct:
@@ -1004,6 +1071,33 @@ RelationEstimate aggregate_estimate(const std::vector<plan::BoundColumnRef>& gro
     return estimate;
 }
 
+RelationEstimate window_estimate(const std::vector<plan::WindowExpression>& window_expressions,
+                                 RelationEstimate child,
+                                 plan::OrderPermission order_permission) {
+    RelationEstimate estimate;
+    estimate.rows = child.rows;
+    estimate.cost = child.cost;
+    // Each definition is evaluated independently over the same input and pays
+    // one linear partition/emit pass. Ordered ranking definitions additionally
+    // pay n*log2(n) over the whole input: a deterministic conservative upper
+    // bound for the sum of per-partition stable sorts.
+    const auto linear_pass = safe_multiply(child.rows, static_cast<double>(window_expressions.size()));
+    estimate.cost = safe_add(estimate.cost, linear_pass);
+    const auto sort_cost = child.rows <= 1.0 ? 0.0 : clamp_estimate(child.rows * std::log2(child.rows));
+    for (const auto& window : window_expressions) {
+        if (!window.order_keys.empty()) {
+            estimate.cost = safe_add(estimate.cost, sort_cost);
+        }
+    }
+    estimate.distinct_by_column = std::move(child.distinct_by_column);
+    for (const auto& window : window_expressions) {
+        estimate.distinct_by_column[column_key("", window.output_name)] = estimate.rows;
+    }
+    estimate.plan = plan::LogicalPlan::window(window_expressions, std::move(child.plan));
+    estimate.plan.order_permission = order_permission;
+    return estimate;
+}
+
 RelationEstimate distinct_estimate(RelationEstimate child, plan::OrderPermission order_permission) {
     RelationEstimate estimate;
     double distinct_rows = child.rows;
@@ -1143,6 +1237,10 @@ RelationEstimate estimate_logical_relation(const plan::LogicalPlan& logical, con
                                   logical.aggregate_expressions,
                                   estimate_logical_relation(require_input(logical), catalog),
                                   logical.order_permission);
+    case plan::LogicalKind::Window:
+        return window_estimate(logical.window_expressions,
+                               estimate_logical_relation(require_input(logical), catalog),
+                               logical.order_permission);
     case plan::LogicalKind::Distinct:
         return distinct_estimate(estimate_logical_relation(require_input(logical), catalog), logical.order_permission);
     case plan::LogicalKind::Sort:
@@ -1238,6 +1336,10 @@ private:
                                       expression.aggregate_expressions,
                                       best_for_group(expression.children.at(0), stack).estimate,
                                       expression.order_permission);
+        case MemoExpressionKind::Window:
+            return window_estimate(expression.window_expressions,
+                                   best_for_group(expression.children.at(0), stack).estimate,
+                                   expression.order_permission);
         case MemoExpressionKind::Distinct:
             return distinct_estimate(best_for_group(expression.children.at(0), stack).estimate,
                                      expression.order_permission);
@@ -1296,6 +1398,11 @@ GroupId Memo::insert(const plan::LogicalPlan& logical) {
         expression.kind = MemoExpressionKind::Aggregate;
         expression.group_keys = logical.group_keys;
         expression.aggregate_expressions = logical.aggregate_expressions;
+        expression.children.push_back(insert(require_input(logical)));
+        return insert_expression(std::move(expression));
+    case plan::LogicalKind::Window:
+        expression.kind = MemoExpressionKind::Window;
+        expression.window_expressions = logical.window_expressions;
         expression.children.push_back(insert(require_input(logical)));
         return insert_expression(std::move(expression));
     case plan::LogicalKind::Distinct:
@@ -1627,6 +1734,12 @@ plan::LogicalPlan Memo::extract_expression(const MemoExpression& expression, std
         result.order_permission = expression.order_permission;
         return result;
     }
+    case MemoExpressionKind::Window: {
+        auto result =
+            plan::LogicalPlan::window(expression.window_expressions, extract(expression.children.at(0), stack));
+        result.order_permission = expression.order_permission;
+        return result;
+    }
     case MemoExpressionKind::Distinct: {
         auto result = plan::LogicalPlan::distinct(extract(expression.children.at(0), stack));
         result.order_permission = expression.order_permission;
@@ -1667,63 +1780,80 @@ void Memo::validate_expression(const MemoExpression& expression) const {
     switch (expression.kind) {
     case MemoExpressionKind::Scan:
         if (expression.table.empty() || expression.binding_name.empty() || !expression.projections.empty() ||
-            !expression.group_keys.empty() || !expression.aggregate_expressions.empty() || !expression.sort_keys.empty() ||
+            !expression.group_keys.empty() || !expression.aggregate_expressions.empty() ||
+            !expression.window_expressions.empty() || !expression.sort_keys.empty() ||
             !expression.predicates.empty() || expression.limit_count != 0 || !expression.children.empty()) {
             throw std::logic_error("malformed memo scan expression");
         }
         return;
     case MemoExpressionKind::Filter:
         if (!expression.table.empty() || !expression.binding_name.empty() || !expression.projections.empty() ||
-            !expression.group_keys.empty() || !expression.aggregate_expressions.empty() || !expression.sort_keys.empty() ||
+            !expression.group_keys.empty() || !expression.aggregate_expressions.empty() ||
+            !expression.window_expressions.empty() || !expression.sort_keys.empty() ||
             expression.predicates.empty() || expression.limit_count != 0 || expression.children.size() != 1) {
             throw std::logic_error("malformed memo filter expression");
         }
         return;
     case MemoExpressionKind::Project:
         if (!expression.table.empty() || !expression.binding_name.empty() || expression.projections.empty() ||
-            !expression.group_keys.empty() || !expression.aggregate_expressions.empty() || !expression.sort_keys.empty() ||
+            !expression.group_keys.empty() || !expression.aggregate_expressions.empty() ||
+            !expression.window_expressions.empty() || !expression.sort_keys.empty() ||
             !expression.predicates.empty() || expression.limit_count != 0 || expression.children.size() != 1) {
             throw std::logic_error("malformed memo project expression");
         }
         return;
     case MemoExpressionKind::Aggregate:
         if (!expression.table.empty() || !expression.binding_name.empty() || !expression.projections.empty() ||
-            (expression.group_keys.empty() && expression.aggregate_expressions.empty()) || !expression.sort_keys.empty() ||
+            (expression.group_keys.empty() && expression.aggregate_expressions.empty()) ||
+            !expression.window_expressions.empty() || !expression.sort_keys.empty() ||
             !expression.predicates.empty() || expression.limit_count != 0 || expression.children.size() != 1) {
             throw std::logic_error("malformed memo aggregate expression");
         }
         return;
+    case MemoExpressionKind::Window:
+        if (!expression.table.empty() || !expression.binding_name.empty() || !expression.projections.empty() ||
+            !expression.group_keys.empty() || !expression.aggregate_expressions.empty() ||
+            expression.window_expressions.empty() || !expression.sort_keys.empty() ||
+            !expression.predicates.empty() || expression.limit_count != 0 || expression.children.size() != 1) {
+            throw std::logic_error("malformed memo window expression");
+        }
+        return;
     case MemoExpressionKind::Distinct:
         if (!expression.table.empty() || !expression.binding_name.empty() || !expression.projections.empty() ||
-            !expression.group_keys.empty() || !expression.aggregate_expressions.empty() || !expression.sort_keys.empty() ||
+            !expression.group_keys.empty() || !expression.aggregate_expressions.empty() ||
+            !expression.window_expressions.empty() || !expression.sort_keys.empty() ||
             !expression.predicates.empty() || expression.limit_count != 0 || expression.children.size() != 1) {
             throw std::logic_error("malformed memo distinct expression");
         }
         return;
     case MemoExpressionKind::Sort:
         if (!expression.table.empty() || !expression.binding_name.empty() || !expression.projections.empty() ||
-            !expression.group_keys.empty() || !expression.aggregate_expressions.empty() || expression.sort_keys.empty() ||
+            !expression.group_keys.empty() || !expression.aggregate_expressions.empty() ||
+            !expression.window_expressions.empty() || expression.sort_keys.empty() ||
             !expression.predicates.empty() || expression.limit_count != 0 || expression.children.size() != 1) {
             throw std::logic_error("malformed memo sort expression");
         }
         return;
     case MemoExpressionKind::Limit:
         if (!expression.table.empty() || !expression.binding_name.empty() || !expression.projections.empty() ||
-            !expression.group_keys.empty() || !expression.aggregate_expressions.empty() || !expression.sort_keys.empty() ||
+            !expression.group_keys.empty() || !expression.aggregate_expressions.empty() ||
+            !expression.window_expressions.empty() || !expression.sort_keys.empty() ||
             !expression.predicates.empty() || expression.children.size() != 1) {
             throw std::logic_error("malformed memo limit expression");
         }
         return;
     case MemoExpressionKind::Join:
         if (!expression.table.empty() || !expression.binding_name.empty() || !expression.projections.empty() ||
-            !expression.group_keys.empty() || !expression.aggregate_expressions.empty() || !expression.sort_keys.empty() ||
+            !expression.group_keys.empty() || !expression.aggregate_expressions.empty() ||
+            !expression.window_expressions.empty() || !expression.sort_keys.empty() ||
             expression.limit_count != 0 || expression.children.size() != 2) {
             throw std::logic_error("malformed memo join expression");
         }
         return;
     case MemoExpressionKind::GroupRef:
         if (!expression.table.empty() || !expression.binding_name.empty() || !expression.projections.empty() ||
-            !expression.group_keys.empty() || !expression.aggregate_expressions.empty() || !expression.sort_keys.empty() ||
+            !expression.group_keys.empty() || !expression.aggregate_expressions.empty() ||
+            !expression.window_expressions.empty() || !expression.sort_keys.empty() ||
             !expression.predicates.empty() || expression.limit_count != 0 || expression.children.size() != 1) {
             throw std::logic_error("malformed memo group reference expression");
         }
@@ -1985,6 +2115,21 @@ std::vector<plan::LogicalPlan> Memo::extract_alternatives_for_expression(
                 plan::LogicalPlan::aggregate(expression.group_keys, expression.aggregate_expressions, std::move(child));
             aggregate.order_permission = expression.order_permission;
             alternatives.push_back(std::move(aggregate));
+        }
+        return alternatives;
+    }
+    case MemoExpressionKind::Window: {
+        auto children = extract_alternatives_for_group(expression.children.at(0), options, result, stack);
+        std::vector<plan::LogicalPlan> alternatives;
+        alternatives.reserve(children.size());
+        for (auto& child : children) {
+            if (alternatives.size() >= options.max_plans) {
+                result.hit_plan_bound = true;
+                break;
+            }
+            auto window = plan::LogicalPlan::window(expression.window_expressions, std::move(child));
+            window.order_permission = expression.order_permission;
+            alternatives.push_back(std::move(window));
         }
         return alternatives;
     }

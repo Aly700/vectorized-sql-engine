@@ -961,6 +961,102 @@ void assert_explain_indents_opaque_subplans_under_owner() {
     assert(report.find("          Scan[t1]") != std::string::npos);
 }
 
+void assert_window_round_trips_and_is_a_filter_pushdown_barrier() {
+    const auto catalog = make_catalog();
+    const auto sql =
+        "SELECT t1.b, t2.c, RANK() OVER (PARTITION BY t1.b ORDER BY t2.c) AS r "
+        "FROM t1 JOIN t2 ON t1.a = t2.a";
+    const auto logical = sql::bind_select(sql::parse_select(sql), catalog);
+
+    optimizer::Memo memo;
+    const auto root = memo.insert(logical);
+    assert(memo.insert(logical) == root);
+    const auto different = sql::bind_select(
+        sql::parse_select(
+            "SELECT t1.b, t2.c, RANK() OVER (PARTITION BY t1.b ORDER BY t2.c DESC) AS r "
+            "FROM t1 JOIN t2 ON t1.a = t2.a"),
+        catalog);
+    assert(memo.insert(different) != root);
+    const auto explored = optimizer::explore_memo_to_fixpoint(memo, optimizer::default_memo_rules());
+    const auto extracted = memo.extract(root);
+    assert(plan::to_string(extracted) == plan::to_string(logical));
+    const auto dump = memo.dump();
+    assert(dump.find("Window[RANK() OVER (PARTITION BY t1.b ORDER BY t2.c ASC)]") != std::string::npos);
+    assert(trace_contains(explored.fired_rules, "JoinCommuteRule"));
+
+    const auto window = *logical.input;
+    const auto rank_ref = plan::BoundScalarExpr{
+        plan::BoundColumnRef{"", "RANK() OVER (PARTITION BY t1.b ORDER BY t2.c ASC)", 0},
+        catalog::ColumnType::Int64};
+    const auto one = plan::BoundScalarExpr{sql::IntLiteral{1, 0}};
+    const auto filtered = plan::LogicalPlan::filter(
+        {plan::BoundPredicate::comparison_expr(
+            plan::BoundComparisonExpr{rank_ref, sql::ComparisonOp::Greater, one, 0})},
+        window);
+
+    optimizer::Memo barrier_memo;
+    const auto barrier_root = barrier_memo.insert(filtered);
+    const auto barrier_trace =
+        optimizer::explore_memo_to_fixpoint(barrier_memo, optimizer::default_memo_rules());
+    assert(barrier_memo.group(barrier_root).expressions.size() == 1);
+    assert(barrier_memo.group(barrier_root).expressions.front().expression.kind ==
+           optimizer::MemoExpressionKind::Filter);
+    assert(!trace_contains(barrier_trace.fired_rules, "FilterIntoJoinRule"));
+    assert(trace_contains(barrier_trace.fired_rules, "JoinCommuteRule"));
+    barrier_memo.assert_invariants();
+}
+
+void assert_window_explain_contains_costed_node() {
+    const auto catalog = make_catalog();
+    const auto logical = sql::bind_select(
+        sql::parse_select("EXPLAIN SELECT a, ROW_NUMBER() OVER (ORDER BY b) AS rn FROM t"), catalog);
+    const auto explained = execution::execute_interpreted(logical, catalog);
+    std::string report;
+    const auto& lines = explained.string_column("plan");
+    for (std::size_t row = 0; row < explained.row_count(); ++row) {
+        report += lines.at(row) + "\n";
+    }
+    assert(report.find("Window[ROW_NUMBER() OVER (ORDER BY b ASC)]") != std::string::npos);
+    assert(report.find("Window[ROW_NUMBER() OVER (ORDER BY b ASC)] rows=") != std::string::npos);
+}
+
+void assert_order_sensitive_windows_pin_order_changing_join_transforms() {
+    const auto catalog = make_catalog();
+    const auto logical = sql::bind_select(
+        sql::parse_select(
+            "SELECT t1.b, t2.c, ROW_NUMBER() OVER () AS rn "
+            "FROM t1 JOIN t2 ON t1.a = t2.a"),
+        catalog);
+    assert(logical.input != nullptr && logical.input->kind == plan::LogicalKind::Window);
+    assert(logical.input->input != nullptr && logical.input->input->kind == plan::LogicalKind::Join);
+    assert(logical.input->input->order_permission == plan::OrderPermission::Deterministic);
+
+    optimizer::Memo memo;
+    const auto root = memo.insert(logical);
+    const auto trace = optimizer::explore_memo_to_fixpoint(memo, optimizer::default_memo_rules());
+    const auto alternatives = memo.extract_alternatives(root);
+    assert(!trace_contains(trace.fired_rules, "JoinCommuteRule"));
+    assert(!trace_contains(trace.fired_rules, "JoinAssociateRule"));
+    assert(alternatives.plans.size() == 1);
+    memo.assert_invariants();
+
+    const auto sum_logical = sql::bind_select(
+        sql::parse_select(
+            "SELECT t1.b, t2.c, SUM(t1.b) OVER () AS total "
+            "FROM t1 JOIN t2 ON t1.a = t2.a"),
+        catalog);
+    assert(sum_logical.input != nullptr && sum_logical.input->kind == plan::LogicalKind::Window);
+    assert(sum_logical.input->input != nullptr && sum_logical.input->input->kind == plan::LogicalKind::Join);
+    assert(sum_logical.input->input->order_permission == plan::OrderPermission::Deterministic);
+
+    optimizer::Memo sum_memo;
+    const auto sum_root = sum_memo.insert(sum_logical);
+    const auto sum_trace = optimizer::explore_memo_to_fixpoint(sum_memo, optimizer::default_memo_rules());
+    assert(!trace_contains(sum_trace.fired_rules, "JoinCommuteRule"));
+    assert(sum_memo.extract_alternatives(sum_root).plans.size() == 1);
+    sum_memo.assert_invariants();
+}
+
 } // namespace
 
 int main() {
@@ -983,5 +1079,8 @@ int main() {
     assert_subquery_subplans_are_structural_but_opaque_memo_fields();
     assert_subquery_conjunct_moves_using_only_outer_references();
     assert_explain_indents_opaque_subplans_under_owner();
+    assert_window_round_trips_and_is_a_filter_pushdown_barrier();
+    assert_window_explain_contains_costed_node();
+    assert_order_sensitive_windows_pin_order_changing_join_transforms();
     return 0;
 }

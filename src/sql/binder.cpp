@@ -170,6 +170,7 @@ const std::vector<plan::Projection>& output_projections(const plan::LogicalPlan&
     case plan::LogicalKind::Join:
     case plan::LogicalKind::Filter:
     case plan::LogicalKind::Aggregate:
+    case plan::LogicalKind::Window:
         break;
     }
     throw std::logic_error("bound subquery is missing its final projection");
@@ -383,9 +384,34 @@ bool select_item_is_aggregate(const SelectItem& item) {
     return std::holds_alternative<AggregateCall>(item.expression);
 }
 
+bool window_input_is_aggregate(const WindowInputExpr& expression) {
+    return std::holds_alternative<AggregateCall>(expression);
+}
+
+bool window_has_input_aggregate(const WindowCall& window) {
+    if (window.argument.has_value() && window_input_is_aggregate(*window.argument)) {
+        return true;
+    }
+    for (const auto& key : window.partition_by) {
+        if (window_input_is_aggregate(key)) {
+            return true;
+        }
+    }
+    for (const auto& key : window.order_by) {
+        if (window_input_is_aggregate(key.expression)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool query_has_aggregate(const SelectQuery& query) {
     for (const auto& item : query.projection) {
         if (select_item_is_aggregate(item)) {
+            return true;
+        }
+        if (const auto* window = std::get_if<WindowCall>(&item.expression);
+            window != nullptr && window_has_input_aggregate(*window)) {
             return true;
         }
     }
@@ -466,6 +492,109 @@ plan::BoundColumnRef ensure_aggregate_expression(const AggregateCall& aggregate,
     const auto ref = aggregate_output_ref(bound, aggregate.position);
     aggregate_expressions.push_back(std::move(bound));
     return ref;
+}
+
+plan::BoundColumnRef bind_window_input(const WindowInputExpr& expression,
+                                       const std::vector<TableScope>& scopes,
+                                       const std::vector<plan::BoundColumnRef>& group_keys,
+                                       bool aggregate_query,
+                                       std::vector<plan::AggregateExpression>& aggregate_expressions,
+                                       bool inside_subquery) {
+    if (const auto* aggregate = std::get_if<AggregateCall>(&expression)) {
+        return ensure_aggregate_expression(*aggregate, scopes, aggregate_expressions, inside_subquery);
+    }
+
+    const auto& column = std::get<ColumnRef>(expression);
+    auto bound = bind_column_ref(column, scopes, inside_subquery);
+    if (aggregate_query && bound.outer_depth == 0 && !contains_group_key(group_keys, bound)) {
+        throw BindError(column.position,
+                        "window column '" + output_name(column) +
+                            "' must appear in GROUP BY or be aggregated");
+    }
+    return bound;
+}
+
+catalog::ColumnType bind_window_output_type(const WindowCall& window,
+                                            const std::optional<plan::BoundColumnRef>& argument) {
+    switch (window.function) {
+    case WindowFunction::RowNumber:
+    case WindowFunction::Rank:
+    case WindowFunction::DenseRank:
+    case WindowFunction::Count:
+        return catalog::ColumnType::Int64;
+    case WindowFunction::Sum:
+        if (!argument.has_value()) {
+            throw BindError(window.position, "SUM requires int64 argument, got <missing>");
+        }
+        if (argument->type != catalog::ColumnType::Int64) {
+            throw BindError(window.position, "SUM requires int64 argument, got " + type_name(argument->type));
+        }
+        return catalog::ColumnType::Int64;
+    case WindowFunction::Min:
+    case WindowFunction::Max:
+        if (!argument.has_value()) {
+            throw BindError(window.position,
+                            window_function_name(window.function) + " requires an argument");
+        }
+        return argument->type;
+    }
+    throw std::logic_error("unreachable window function");
+}
+
+plan::BoundColumnRef ensure_window_expression(const WindowCall& window,
+                                              const std::vector<TableScope>& scopes,
+                                              const std::vector<plan::BoundColumnRef>& group_keys,
+                                              bool aggregate_query,
+                                              std::vector<plan::AggregateExpression>& aggregate_expressions,
+                                              std::vector<plan::WindowExpression>& window_expressions,
+                                              bool inside_subquery) {
+    std::optional<plan::BoundColumnRef> argument;
+    if (window.argument.has_value()) {
+        argument = bind_window_input(*window.argument,
+                                     scopes,
+                                     group_keys,
+                                     aggregate_query,
+                                     aggregate_expressions,
+                                     inside_subquery);
+    }
+
+    std::vector<plan::BoundColumnRef> partition_keys;
+    partition_keys.reserve(window.partition_by.size());
+    for (const auto& key : window.partition_by) {
+        partition_keys.push_back(bind_window_input(
+            key, scopes, group_keys, aggregate_query, aggregate_expressions, inside_subquery));
+    }
+
+    std::vector<plan::SortKey> order_keys;
+    order_keys.reserve(window.order_by.size());
+    for (const auto& key : window.order_by) {
+        order_keys.push_back(plan::SortKey{
+            bind_window_input(key.expression,
+                              scopes,
+                              group_keys,
+                              aggregate_query,
+                              aggregate_expressions,
+                              inside_subquery),
+            key.direction});
+    }
+
+    const auto name = output_name(window);
+    const auto type = bind_window_output_type(window, argument);
+    for (const auto& existing : window_expressions) {
+        if (existing.output_name == name) {
+            return plan::BoundColumnRef{"", existing.output_name, window.position, existing.type};
+        }
+    }
+
+    window_expressions.push_back(plan::WindowExpression{name,
+                                                        window.function,
+                                                        window.count_star,
+                                                        std::move(argument),
+                                                        std::move(partition_keys),
+                                                        std::move(order_keys),
+                                                        window.position,
+                                                        type});
+    return plan::BoundColumnRef{"", name, window.position, type};
 }
 
 std::string select_item_output_name(const SelectItem& item) {
@@ -781,6 +910,17 @@ void collect_plan_correlations(const plan::LogicalPlan& logical,
             add_correlation(correlations, *aggregate.argument);
         }
     }
+    for (const auto& window : logical.window_expressions) {
+        if (window.argument.has_value()) {
+            add_correlation(correlations, *window.argument);
+        }
+        for (const auto& key : window.partition_keys) {
+            add_correlation(correlations, key);
+        }
+        for (const auto& key : window.order_keys) {
+            add_correlation(correlations, key.column);
+        }
+    }
     for (const auto& key : logical.sort_keys) {
         add_correlation(correlations, key.column);
     }
@@ -817,6 +957,50 @@ void mark_arbitrary_order(plan::LogicalPlan& logical) {
     }
 }
 
+void mark_deterministic_order(plan::LogicalPlan& logical) {
+    logical.order_permission = plan::OrderPermission::Deterministic;
+    if (logical.input != nullptr) {
+        mark_deterministic_order(*logical.input);
+    }
+    if (logical.left != nullptr) {
+        mark_deterministic_order(*logical.left);
+    }
+    if (logical.right != nullptr) {
+        mark_deterministic_order(*logical.right);
+    }
+}
+
+bool window_requires_deterministic_input(const plan::LogicalPlan& logical) {
+    return logical.kind == plan::LogicalKind::Window &&
+           std::any_of(logical.window_expressions.begin(), logical.window_expressions.end(), [](const auto& window) {
+               return window.function == WindowFunction::RowNumber || window.function == WindowFunction::Sum;
+           });
+}
+
+void protect_order_sensitive_window_inputs(plan::LogicalPlan& logical) {
+    if (window_requires_deterministic_input(logical)) {
+        if (logical.input == nullptr) {
+            throw std::logic_error("Window logical plan is missing its input");
+        }
+        // ROW_NUMBER exposes stable child order whenever OVER keys tie. SUM's
+        // checked intermediate overflow can likewise depend on accumulation
+        // order even when the mathematical total is representable. Without a
+        // uniqueness or order-independent overflow proof, order-changing join
+        // commute/associate rules must fail closed throughout this child.
+        mark_deterministic_order(*logical.input);
+        return;
+    }
+    if (logical.input != nullptr) {
+        protect_order_sensitive_window_inputs(*logical.input);
+    }
+    if (logical.left != nullptr) {
+        protect_order_sensitive_window_inputs(*logical.left);
+    }
+    if (logical.right != nullptr) {
+        protect_order_sensitive_window_inputs(*logical.right);
+    }
+}
+
 plan::JoinKind bound_join_kind(JoinKind parsed) {
     switch (parsed) {
     case JoinKind::Inner:
@@ -840,6 +1024,7 @@ plan::LogicalPlan bind_select_impl(const SelectQuery& query,
     std::vector<std::string> output_name_order;
     std::vector<plan::Projection> projections;
     std::vector<plan::AggregateExpression> aggregate_expressions;
+    std::vector<plan::WindowExpression> window_expressions;
     projections.reserve(query.projection.size());
     output_name_order.reserve(query.projection.size());
     for (const auto& item : query.projection) {
@@ -857,6 +1042,22 @@ plan::LogicalPlan bind_select_impl(const SelectQuery& query,
                 name,
                 plan::BoundScalarExpr{aggregate_ref, aggregate_ref.type},
                 aggregate_ref.type,
+            });
+            continue;
+        }
+
+        if (const auto* window = std::get_if<WindowCall>(&item.expression)) {
+            const auto window_ref = ensure_window_expression(*window,
+                                                             scopes,
+                                                             group_keys,
+                                                             aggregate_query,
+                                                             aggregate_expressions,
+                                                             window_expressions,
+                                                             inside_subquery);
+            projections.push_back(plan::Projection{
+                name,
+                plan::BoundScalarExpr{window_ref, window_ref.type},
+                window_ref.type,
             });
             continue;
         }
@@ -927,11 +1128,15 @@ plan::LogicalPlan bind_select_impl(const SelectQuery& query,
     if (!having_predicates.empty()) {
         plan = plan::LogicalPlan::filter(std::move(having_predicates), std::move(plan));
     }
+    if (!window_expressions.empty()) {
+        plan = plan::LogicalPlan::window(std::move(window_expressions), std::move(plan));
+    }
     auto bound = plan::LogicalPlan::project(std::move(projections), std::move(plan));
     if (query.distinct) {
         bound = plan::LogicalPlan::distinct(std::move(bound));
     }
     mark_arbitrary_order(bound);
+    protect_order_sensitive_window_inputs(bound);
     if (!sort_keys.empty()) {
         bound = plan::LogicalPlan::sort(std::move(sort_keys), std::move(bound));
     }
