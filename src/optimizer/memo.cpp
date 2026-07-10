@@ -36,6 +36,7 @@ void hash_scalar(std::size_t& seed, const plan::BoundScalarExpr& expression) {
         hash_string(seed, column->binding);
         hash_string(seed, column->column);
         hash_combine(seed, static_cast<std::size_t>(column->type));
+        hash_combine(seed, column->outer_depth);
         return;
     }
 
@@ -114,6 +115,7 @@ void hash_column(std::size_t& seed, const plan::BoundColumnRef& column) {
     hash_string(seed, column.binding);
     hash_string(seed, column.column);
     hash_combine(seed, static_cast<std::size_t>(column.type));
+    hash_combine(seed, column.outer_depth);
 }
 
 void hash_aggregate_expression(std::size_t& seed, const plan::AggregateExpression& aggregate) {
@@ -145,6 +147,10 @@ void hash_logical_plan(std::size_t& seed, const plan::LogicalPlan& logical) {
     hash_string(seed, logical.table);
     hash_string(seed, logical.binding_name);
     hash_combine(seed, logical.limit_count);
+    hash_combine(seed, logical.correlation_columns.size());
+    for (const auto& column : logical.correlation_columns) {
+        hash_column(seed, column);
+    }
 
     hash_combine(seed, logical.projections.size());
     for (const auto& projection : logical.projections) {
@@ -221,7 +227,7 @@ bool scalar_equal(const plan::BoundScalarExpr& left, const plan::BoundScalarExpr
     if (const auto* left_column = std::get_if<plan::BoundColumnRef>(&left.value)) {
         const auto& right_column = std::get<plan::BoundColumnRef>(right.value);
         return left_column->binding == right_column.binding && left_column->column == right_column.column &&
-               left_column->type == right_column.type;
+               left_column->type == right_column.type && left_column->outer_depth == right_column.outer_depth;
     }
     if (const auto* left_literal = std::get_if<sql::IntLiteral>(&left.value)) {
         return left_literal->value == std::get<sql::IntLiteral>(right.value).value;
@@ -284,7 +290,8 @@ bool projection_equal(const plan::Projection& left, const plan::Projection& righ
 }
 
 bool column_equal(const plan::BoundColumnRef& left, const plan::BoundColumnRef& right) {
-    return left.binding == right.binding && left.column == right.column && left.type == right.type;
+    return left.binding == right.binding && left.column == right.column && left.type == right.type &&
+           left.outer_depth == right.outer_depth;
 }
 
 bool aggregate_expression_equal(const plan::AggregateExpression& left, const plan::AggregateExpression& right) {
@@ -331,6 +338,7 @@ bool logical_plan_equal(const plan::LogicalPlan& left, const plan::LogicalPlan& 
            vector_equal(left.group_keys, right.group_keys, column_equal) &&
            vector_equal(left.aggregate_expressions, right.aggregate_expressions, aggregate_expression_equal) &&
            vector_equal(left.sort_keys, right.sort_keys, sort_key_equal) &&
+           vector_equal(left.correlation_columns, right.correlation_columns, column_equal) &&
            vector_equal(left.predicates, right.predicates, predicate_equal) &&
            logical_child_equal(left.input, right.input) && logical_child_equal(left.left, right.left) &&
            logical_child_equal(left.right, right.right);
@@ -651,7 +659,20 @@ double safe_add(double left, double right) {
     return clamp_estimate(left + right);
 }
 
-double scalar_subquery_cost(const plan::BoundScalarExpr& expression, const catalog::Catalog& catalog) {
+double safe_multiply(double left, double right);
+
+double materialized_subquery_cost(const plan::LogicalPlan& subquery,
+                                  const catalog::Catalog& catalog,
+                                  double owner_rows) {
+    const auto cost = estimate_logical_relation(subquery, catalog).cost;
+    // Empty correlation is the byte-identical Phase 21a once-per-query model.
+    // A correlated subplan is the honest per-owner-row oracle model.
+    return subquery.correlation_columns.empty() ? cost : safe_multiply(cost, owner_rows);
+}
+
+double scalar_subquery_cost(const plan::BoundScalarExpr& expression,
+                            const catalog::Catalog& catalog,
+                            double owner_rows) {
     const auto* subquery = std::get_if<plan::BoundScalarSubquery>(&expression.value);
     if (subquery == nullptr) {
         return 0.0;
@@ -659,55 +680,59 @@ double scalar_subquery_cost(const plan::BoundScalarExpr& expression, const catal
     if (subquery->plan == nullptr) {
         throw std::logic_error("bound scalar subquery is missing its logical plan");
     }
-    return estimate_logical_relation(*subquery->plan, catalog).cost;
+    return materialized_subquery_cost(*subquery->plan, catalog, owner_rows);
 }
 
-double predicate_subquery_cost(const plan::BoundPredicate& predicate, const catalog::Catalog& catalog) {
+double predicate_subquery_cost(const plan::BoundPredicate& predicate,
+                               const catalog::Catalog& catalog,
+                               double owner_rows) {
     switch (predicate.kind) {
     case sql::PredicateKind::Comparison:
-        return safe_add(scalar_subquery_cost(predicate.comparison.left, catalog),
-                        scalar_subquery_cost(predicate.comparison.right, catalog));
+        return safe_add(scalar_subquery_cost(predicate.comparison.left, catalog, owner_rows),
+                        scalar_subquery_cost(predicate.comparison.right, catalog, owner_rows));
     case sql::PredicateKind::IsNull:
     case sql::PredicateKind::IsNotNull:
-        return scalar_subquery_cost(predicate.null_check, catalog);
+        return scalar_subquery_cost(predicate.null_check, catalog, owner_rows);
     case sql::PredicateKind::In:
     case sql::PredicateKind::NotIn:
         if (predicate.subquery == nullptr) {
             throw std::logic_error("bound IN predicate is missing its subquery");
         }
-        return safe_add(scalar_subquery_cost(predicate.in_value, catalog),
-                        estimate_logical_relation(*predicate.subquery, catalog).cost);
+        return safe_add(scalar_subquery_cost(predicate.in_value, catalog, owner_rows),
+                        materialized_subquery_cost(*predicate.subquery, catalog, owner_rows));
     case sql::PredicateKind::Exists:
     case sql::PredicateKind::NotExists:
         if (predicate.subquery == nullptr) {
             throw std::logic_error("bound EXISTS predicate is missing its subquery");
         }
-        return estimate_logical_relation(*predicate.subquery, catalog).cost;
+        return materialized_subquery_cost(*predicate.subquery, catalog, owner_rows);
     case sql::PredicateKind::And:
     case sql::PredicateKind::Or:
         if (predicate.left == nullptr || predicate.right == nullptr) {
             throw std::logic_error("bound predicate is missing a child");
         }
-        return safe_add(predicate_subquery_cost(*predicate.left, catalog),
-                        predicate_subquery_cost(*predicate.right, catalog));
+        return safe_add(predicate_subquery_cost(*predicate.left, catalog, owner_rows),
+                        predicate_subquery_cost(*predicate.right, catalog, owner_rows));
     }
     throw std::logic_error("unreachable predicate kind");
 }
 
 double predicates_subquery_cost(const std::vector<plan::BoundPredicate>& predicates,
-                                const catalog::Catalog& catalog) {
+                                const catalog::Catalog& catalog,
+                                double owner_rows) {
     double cost = 0.0;
     for (const auto& predicate : predicates) {
-        cost = safe_add(cost, predicate_subquery_cost(predicate, catalog));
+        cost = safe_add(cost, predicate_subquery_cost(predicate, catalog, owner_rows));
     }
     return cost;
 }
 
 double projections_subquery_cost(const std::vector<plan::Projection>& projections,
-                                 const catalog::Catalog& catalog) {
+                                 const catalog::Catalog& catalog,
+                                 double owner_rows) {
     double cost = 0.0;
     for (const auto& projection : projections) {
-        cost = safe_add(cost, scalar_subquery_cost(projection.expression, catalog));
+        cost = safe_add(cost, scalar_subquery_cost(projection.expression, catalog, owner_rows));
     }
     return cost;
 }
@@ -911,7 +936,8 @@ RelationEstimate filter_estimate(const std::vector<plan::BoundPredicate>& predic
     estimate.rows = safe_multiply(child.rows, selectivity);
     // An uncorrelated embedded subplan is materialized once by the owning
     // operator, never once per input row and never as a memo child.
-    estimate.cost = safe_add(safe_add(child.cost, child.rows), predicates_subquery_cost(predicates, catalog));
+    estimate.cost = safe_add(
+        safe_add(child.cost, child.rows), predicates_subquery_cost(predicates, catalog, child.rows));
     for (const auto& [column, distinct] : child.distinct_by_column) {
         estimate.distinct_by_column[column] = std::min(safe_multiply(distinct, selectivity), estimate.rows);
     }
@@ -927,7 +953,7 @@ RelationEstimate project_estimate(const std::vector<plan::Projection>& projectio
     RelationEstimate estimate;
     estimate.rows = child.rows;
     // Project is cost-neutral for join-order choice in this logical slice.
-    estimate.cost = safe_add(child.cost, projections_subquery_cost(projections, catalog));
+    estimate.cost = safe_add(child.cost, projections_subquery_cost(projections, catalog, child.rows));
     for (const auto& projection : projections) {
         if (const auto* column = std::get_if<plan::BoundColumnRef>(&projection.expression.value)) {
             const auto key = column_key(*column);
@@ -1079,7 +1105,7 @@ RelationEstimate join_estimate(const std::vector<plan::BoundPredicate>& predicat
     const auto local_cost =
         equi_key.has_value() || keyless_existence ? safe_add(left.rows, right.rows) : cross_rows;
     estimate.cost = safe_add(safe_add(safe_add(left.cost, right.cost), local_cost),
-                             predicates_subquery_cost(predicates, catalog));
+                             predicates_subquery_cost(predicates, catalog, cross_rows));
     estimate.distinct_by_column = left.distinct_by_column;
     if (join_kind == plan::JoinKind::Inner || join_kind == plan::JoinKind::Left) {
         estimate.distinct_by_column.insert(right.distinct_by_column.begin(), right.distinct_by_column.end());

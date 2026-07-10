@@ -705,6 +705,89 @@ void assert_top_level_subquery_decorrelation_rules_and_guards() {
     }
 }
 
+void assert_correlated_subquery_decorrelation_rules_and_guards() {
+    const auto catalog = make_catalog();
+    struct PositiveCase {
+        std::string sql;
+        std::string rule;
+        std::string join_text;
+    };
+    const std::vector<PositiveCase> positive_cases{
+        {"SELECT a FROM t WHERE EXISTS (SELECT t1.b FROM t1 WHERE t1.a = t.a)",
+         "CorrelatedExistsToSemiJoinRule", "SemiJoin["},
+        {"SELECT a FROM t WHERE NOT EXISTS (SELECT t1.b FROM t1 WHERE t1.a = t.a)",
+         "CorrelatedNotExistsToAntiJoinRule", "AntiJoin["},
+        {"SELECT b FROM t WHERE b IN (SELECT t1.b FROM t1 WHERE t1.a = t.a)",
+         "CorrelatedInToSemiJoinRule", "SemiJoin["},
+        {"SELECT a FROM t WHERE EXISTS (SELECT t1.b FROM t1 WHERE t1.a = t.a AND t1.b > 10)",
+         "CorrelatedExistsToSemiJoinRule", "Filter[col(t1.b) > lit(10)]"},
+    };
+
+    for (const auto& test : positive_cases) {
+        const auto logical = sql::bind_select(sql::parse_select(test.sql), catalog);
+        optimizer::Memo memo;
+        const auto root = memo.insert(logical);
+        const auto explored = optimizer::explore_memo_to_fixpoint(memo, optimizer::default_memo_rules());
+        const auto alternatives = memo.extract_alternatives(root, optimizer::AlternativeExtractionOptions{128, 2048});
+        const auto expected = format_batch(execution::execute_interpreted(logical, catalog));
+        if (!trace_contains(explored.fired_rules, test.rule) ||
+            !contains_plan_text(alternatives.plans, test.join_text)) {
+            std::cerr << "correlated decorrelation rule did not produce its join alternative\n"
+                      << "sql: " << test.sql << "\nexpected rule: " << test.rule
+                      << "\nmemo dump:\n" << memo.dump();
+            std::terminate();
+        }
+        bool checked_vectorized = false;
+        for (const auto& alternative : alternatives.plans) {
+            const auto text = plan::to_string(alternative);
+            if (text.find(test.join_text) == std::string::npos || text.find("correlation=[") != std::string::npos) {
+                continue;
+            }
+            const auto interpreted = execution::execute_interpreted(alternative, catalog);
+            const auto vectorized = execution::execute_vectorized(alternative, catalog);
+            if (format_batch(interpreted) != expected || format_batch(vectorized) != expected) {
+                std::cerr << "correlated decorrelated alternative changed results\n"
+                          << "sql: " << test.sql << "\nalternative:\n" << text << "\n";
+                std::terminate();
+            }
+            checked_vectorized = true;
+        }
+        assert(checked_vectorized);
+        memo.assert_invariants();
+    }
+
+    const std::vector<std::string> blocked_sqls{
+        "SELECT a FROM t WHERE EXISTS (SELECT t1.a FROM t1 WHERE t1.a > t.a)",
+        "SELECT a FROM t WHERE EXISTS (SELECT t1.a FROM t1 WHERE t1.a = t.a OR t1.b = 999)",
+        "SELECT a FROM t WHERE EXISTS (SELECT t.a FROM t1)",
+        "SELECT a FROM t WHERE a = (SELECT MAX(t.a) FROM t1)",
+        "SELECT a FROM t WHERE EXISTS (SELECT t1.a FROM t1 GROUP BY t1.a HAVING t1.a = t.a)",
+        "SELECT a FROM t WHERE EXISTS (SELECT t1.a FROM t1 JOIN t2 ON t1.a = t2.a AND t2.a = t.a)",
+        "SELECT a FROM t WHERE EXISTS (SELECT t1.a FROM t1 ORDER BY t.a LIMIT 1)",
+        "SELECT a FROM t WHERE EXISTS (SELECT MAX(t1.b) FROM t1 WHERE t1.a = t.a)",
+        "SELECT a FROM t WHERE a NOT IN (SELECT t1.a FROM t1 WHERE t1.a = t.a)",
+    };
+    for (const auto& sql_text : blocked_sqls) {
+        const auto logical = sql::bind_select(sql::parse_select(sql_text), catalog);
+        optimizer::Memo memo;
+        const auto root = memo.insert(logical);
+        const auto explored = optimizer::explore_memo_to_fixpoint(memo, optimizer::default_memo_rules());
+        const auto alternatives = memo.extract_alternatives(root, optimizer::AlternativeExtractionOptions{128, 2048});
+        const auto fired = trace_contains(explored.fired_rules, "CorrelatedExistsToSemiJoinRule") ||
+                           trace_contains(explored.fired_rules, "CorrelatedNotExistsToAntiJoinRule") ||
+                           trace_contains(explored.fired_rules, "CorrelatedInToSemiJoinRule") ||
+                           trace_contains(explored.fired_rules, "ExistsToSemiJoinRule") ||
+                           trace_contains(explored.fired_rules, "NotExistsToAntiJoinRule") ||
+                           trace_contains(explored.fired_rules, "InToSemiJoinRule");
+        if (fired || contains_plan_text(alternatives.plans, "SemiJoin[") ||
+            contains_plan_text(alternatives.plans, "AntiJoin[")) {
+            std::cerr << "blocked correlated shape was decorrelated\n"
+                      << "sql: " << sql_text << "\nmemo dump:\n" << memo.dump();
+            std::terminate();
+        }
+    }
+}
+
 void assert_filter_through_aggregate_pushes_only_group_keys() {
     const auto catalog = make_catalog();
     const auto sql =
@@ -896,6 +979,7 @@ int main() {
     assert_filter_through_aggregate_moves_group_key_or_but_pins_aggregate_or();
     assert_semi_anti_join_kinds_are_distinct_memo_identity();
     assert_top_level_subquery_decorrelation_rules_and_guards();
+    assert_correlated_subquery_decorrelation_rules_and_guards();
     assert_subquery_subplans_are_structural_but_opaque_memo_fields();
     assert_subquery_conjunct_moves_using_only_outer_references();
     assert_explain_indents_opaque_subplans_under_owner();

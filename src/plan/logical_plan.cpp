@@ -50,10 +50,13 @@ std::string expression_to_string(const BoundScalarExpr& expression) {
 }
 
 std::string column_to_string(const BoundColumnRef& column) {
+    const auto prefix = column.outer_depth == 0
+                            ? std::string{}
+                            : "outer(" + std::to_string(column.outer_depth) + "):";
     if (column.binding.empty()) {
-        return "col(" + column.column + ")";
+        return prefix + "col(" + column.column + ")";
     }
-    return "col(" + column.binding + "." + column.column + ")";
+    return prefix + "col(" + column.binding + "." + column.column + ")";
 }
 
 std::string comparison_op_to_string(sql::ComparisonOp op) {
@@ -227,7 +230,18 @@ void append_owned_subplans(std::ostringstream& out,
         }
         out << "\n";
         append_indent(out, depth);
-        out << "Subquery[" << subplan.label << "]\n";
+        out << "Subquery[" << subplan.label;
+        if (!subplan.plan->correlation_columns.empty()) {
+            out << " correlation=[";
+            for (std::size_t i = 0; i < subplan.plan->correlation_columns.size(); ++i) {
+                if (i != 0) {
+                    out << ", ";
+                }
+                out << column_to_string(subplan.plan->correlation_columns[i]);
+            }
+            out << "]";
+        }
+        out << "]\n";
         append_plan(out, *subplan.plan, depth + 1, annotation);
     }
 }

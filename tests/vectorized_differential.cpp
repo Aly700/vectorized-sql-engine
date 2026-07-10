@@ -1173,6 +1173,65 @@ void assert_subquery_physical_lowering_and_vectorized_execution_are_supported() 
     assert(differential::same_batch(interpreted, physical_vectorized));
 }
 
+void assert_residual_correlated_subquery_is_rejected_at_physical_lowering() {
+    const auto catalog = make_golden_catalog();
+    const auto logical = sql::bind_select(
+        sql::parse_select("SELECT a FROM t WHERE EXISTS (SELECT t1.a FROM t1 WHERE t1.a > t.a)"), catalog);
+    try {
+        (void)plan::lower_to_physical(logical);
+    } catch (const std::exception& error) {
+        assert(std::string(error.what()) ==
+               "vectorized execution does not support residual correlated subqueries");
+        return;
+    }
+    throw std::logic_error("expected residual correlated subquery lowering guard");
+}
+
+void assert_correlated_scalar_error_is_equivalent_on_every_oracle_path() {
+    const auto catalog = make_golden_catalog();
+    const auto sql_text =
+        "SELECT a FROM t WHERE (SELECT t1.b FROM t1 WHERE t1.a = t.a) = b";
+    const auto logical = sql::bind_select(sql::parse_select(sql_text), catalog);
+    const auto expected_error = "scalar subquery at position 22 returned more than one row";
+    const auto assert_oracle_error = [&](const plan::LogicalPlan& candidate) {
+        try {
+            (void)execution::execute_interpreted(candidate, catalog);
+        } catch (const std::runtime_error& error) {
+            assert(std::string(error.what()) == expected_error);
+            return;
+        }
+        throw std::logic_error("expected per-row correlated scalar cardinality error");
+    };
+    const auto assert_guard = [&](const plan::LogicalPlan& candidate) {
+        try {
+            (void)plan::lower_to_physical(candidate);
+        } catch (const std::runtime_error& error) {
+            assert(std::string(error.what()) ==
+                   "vectorized execution does not support residual correlated subqueries");
+            return;
+        }
+        throw std::logic_error("expected correlated scalar lowering guard");
+    };
+
+    assert_oracle_error(logical);
+    assert_guard(logical);
+    const auto rewritten = optimizer::rewrite_to_fixpoint(logical, optimizer::default_rules());
+    assert_oracle_error(rewritten.plan);
+    assert_guard(rewritten.plan);
+
+    optimizer::Memo memo;
+    const auto root = memo.insert(logical);
+    (void)optimizer::explore_memo_to_fixpoint(memo, optimizer::default_memo_rules());
+    const auto alternatives = memo.extract_alternatives(root);
+    for (const auto& alternative : alternatives.plans) {
+        assert_oracle_error(alternative);
+        assert_guard(alternative);
+    }
+    const auto best = memo.extract_best(root, catalog);
+    assert_oracle_error(best);
+    assert_guard(best);
+}
+
 } // namespace
 
 int main() {
@@ -1181,6 +1240,8 @@ int main() {
     assert_outer_join_physical_lowering_preserves_kind();
     assert_interpreted_semi_anti_join_contract();
     assert_subquery_physical_lowering_and_vectorized_execution_are_supported();
+    assert_residual_correlated_subquery_is_rejected_at_physical_lowering();
+    assert_correlated_scalar_error_is_equivalent_on_every_oracle_path();
 
     bool ok = true;
     ok = run_result_golden_queries() && ok;

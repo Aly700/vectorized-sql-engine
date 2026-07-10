@@ -655,6 +655,33 @@ void assert_subquery_cost_is_added_once_to_owning_filter() {
     assert(best_estimate.cost == 2002.0);
 }
 
+void assert_correlated_subquery_cost_scales_by_outer_rows_and_decorrelation_wins() {
+    const auto catalog = make_skewed_catalog();
+    const auto sql =
+        "SELECT k FROM big WHERE EXISTS (SELECT tiny.k FROM tiny WHERE tiny.k = big.k)";
+    const auto logical = sql::bind_select(sql::parse_select(sql), catalog);
+
+    const auto materialized = optimizer::estimate_cost(logical, catalog);
+    if (materialized.rows != 100.0 || materialized.cost != 6000.0) {
+        std::cerr << "correlated subquery cost did not scale by outer rows\n"
+                  << "sql: " << sql << "\nplan:\n" << plan::to_string(logical) << "\n"
+                  << "rows: " << materialized.rows << "\ncost: " << materialized.cost << "\n";
+        std::terminate();
+    }
+
+    optimizer::GroupId root = 0;
+    auto memo = explored_memo_for(logical, root);
+    const auto best = memo.extract_best(root, catalog);
+    const auto best_estimate = optimizer::estimate_cost(best, catalog);
+    if (plan::to_string(best).find("SemiJoin[") == std::string::npos ||
+        !(best_estimate.cost < materialized.cost)) {
+        std::cerr << "correlated decorrelation did not win the cost comparison\n"
+                  << "materialized cost: " << materialized.cost << "\nbest cost: " << best_estimate.cost
+                  << "\nbest plan:\n" << plan::to_string(best) << "\n";
+        std::terminate();
+    }
+}
+
 void assert_semi_anti_costs_use_complementary_selectivity_and_linear_probe_work() {
     const auto catalog = make_skewed_catalog();
     const auto equality = plan::BoundPredicate::comparison_expr(plan::BoundComparisonExpr{
@@ -696,6 +723,7 @@ int main() {
     assert_extract_best_prefers_pushed_join_filter();
     assert_extract_best_prefers_pushed_one_side_or_filter();
     assert_subquery_cost_is_added_once_to_owning_filter();
+    assert_correlated_subquery_cost_scales_by_outer_rows_and_decorrelation_wins();
     assert_semi_anti_costs_use_complementary_selectivity_and_linear_probe_work();
     return 0;
 }

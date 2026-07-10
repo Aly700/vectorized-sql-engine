@@ -200,6 +200,53 @@ public:
     [[nodiscard]] bool apply(Memo& memo, GroupId group, const MemoExpression& expression) const override;
 };
 
+// Pattern matched: a top-level Filter EXISTS whose correlated subplan is
+// exactly Project(Filter(Q)) and every outer reference occurs in a whole,
+// top-level `outer_col = inner_col` WHERE conjunct.
+// Replacement expression: remove those conjuncts from Q, project deterministic
+// hidden inner keys, and add SemiJoin(outer, decorrelated-Q, outer=hidden-inner).
+// Semantic equivalence: for each outer row, substituting its correlation values
+// accepts exactly inner rows whose equality keys are TRUE. Equi-SemiJoin tests
+// the same TRUE matches and emits the outer row once iff one exists. A NULL on
+// either key makes equality UNKNOWN, hence no Semi match in both forms.
+// Preconditions: correlations must be immediate-parent/local column equality;
+// non-equality, AND/OR-contained, projection, aggregate, HAVING, ON, nested,
+// DISTINCT/ORDER/LIMIT, and any residual correlation block the rule. Existing
+// projections remain evaluated and bag/order of the preserved side is unchanged.
+// Golden query: `SELECT a FROM t WHERE EXISTS (SELECT b FROM t1 WHERE t1.a=t.a)`.
+class CorrelatedExistsToSemiJoinRule final : public MemoRule {
+public:
+    [[nodiscard]] std::string_view name() const override { return "CorrelatedExistsToSemiJoinRule"; }
+    [[nodiscard]] bool apply(Memo& memo, GroupId group, const MemoExpression& expression) const override;
+};
+
+// Pattern/replacement/preconditions are identical to
+// CorrelatedExistsToSemiJoinRule except NOT EXISTS becomes an equi AntiJoin.
+// Semantic equivalence: Anti emits an outer row exactly when no inner equality
+// is TRUE. FALSE and UNKNOWN are both non-matches, so a NULL correlation value
+// is retained, exactly as per-row NOT EXISTS over an UNKNOWN-rejected WHERE.
+// Golden query: `SELECT a FROM t WHERE NOT EXISTS (SELECT b FROM t1 WHERE t1.a=t.a)`.
+class CorrelatedNotExistsToAntiJoinRule final : public MemoRule {
+public:
+    [[nodiscard]] std::string_view name() const override { return "CorrelatedNotExistsToAntiJoinRule"; }
+    [[nodiscard]] bool apply(Memo& memo, GroupId group, const MemoExpression& expression) const override;
+};
+
+// Pattern matched: the same equality-only correlated subplan owned by a whole
+// top-level `x IN (SELECT c ...)` Filter conjunct.
+// Replacement: an equi SemiJoin with the extracted correlation keys plus x=c.
+// Semantic equivalence: the filter survives only when some correlation-matched
+// row makes x=c TRUE; Semi has the same TRUE match set. NULL x, NULL c, and NULL
+// correlation keys cannot match and are rejected in both forms. NOT IN is
+// excluded because a NULL-bearing right set requires null-aware anti semantics.
+// All shape/precondition guards from the correlated EXISTS rule apply.
+// Golden query: `SELECT b FROM t WHERE b IN (SELECT b FROM t1 WHERE t1.a=t.a)`.
+class CorrelatedInToSemiJoinRule final : public MemoRule {
+public:
+    [[nodiscard]] std::string_view name() const override { return "CorrelatedInToSemiJoinRule"; }
+    [[nodiscard]] bool apply(Memo& memo, GroupId group, const MemoExpression& expression) const override;
+};
+
 // Pattern matched: Filter(P, LeftJoin(L, R, J)) where at least one whole top-level conjunct in P
 // is provably null-rejecting for R's binding identities.
 // Replacement expression: Add Filter(P, InnerJoin(L, R, J)) as an equivalent expression in the
