@@ -32,6 +32,7 @@ struct GeneratedTable {
     std::vector<std::string> columns;
     std::vector<catalog::ColumnType> types;
     std::vector<bool> nullable;
+    std::vector<bool> contains_null;
     std::vector<std::vector<Cell>> rows;
 };
 
@@ -40,6 +41,7 @@ struct ColumnRef {
     std::string column;
     catalog::ColumnType type{catalog::ColumnType::Int64};
     bool nullable{false};
+    bool contains_null{false};
 };
 
 struct RangeItem {
@@ -48,6 +50,7 @@ struct RangeItem {
     std::vector<std::string> columns;
     std::vector<catalog::ColumnType> types;
     std::vector<bool> nullable;
+    std::vector<bool> contains_null;
 };
 
 struct SelectItem {
@@ -74,6 +77,11 @@ struct GeneratedCase {
     bool has_string_group_key{false};
     bool has_string_distinct_output{false};
     bool has_string_order_key{false};
+    std::size_t inner_join_count{0};
+    std::size_t left_join_count{0};
+    std::size_t right_join_count{0};
+    std::size_t null_key_join_count{0};
+    bool has_mixed_inner_outer_chain{false};
 };
 
 std::string sql_text(const ColumnRef& ref) {
@@ -184,6 +192,10 @@ public:
 
     GeneratedCase generate() {
         saw_string_join_key_ = false;
+        inner_join_count_ = 0;
+        left_join_count_ = 0;
+        right_join_count_ = 0;
+        null_key_join_count_ = 0;
         auto tables = generate_tables();
         auto catalog = make_catalog(tables);
         auto ranges = choose_ranges(tables);
@@ -268,7 +280,12 @@ public:
                              saw_string_join_key_,
                              any_string_group_key(group_keys),
                              distinct && any_string_select_item(select_items),
-                             saw_string_order_key_};
+                             saw_string_order_key_,
+                             inner_join_count_,
+                             left_join_count_,
+                             right_join_count_,
+                             null_key_join_count_,
+                             inner_join_count_ != 0 && (left_join_count_ != 0 || right_join_count_ != 0)};
     }
 
 private:
@@ -296,6 +313,17 @@ private:
                 }
                 table.rows.push_back(std::move(row));
             }
+            table.contains_null.assign(column_count, false);
+            for (std::size_t column_index = 0; column_index < column_count; ++column_index) {
+                for (const auto& row : table.rows) {
+                    table.contains_null[column_index] =
+                        table.contains_null[column_index] || row[column_index].is_null;
+                }
+                if (table.nullable[column_index] && !table.rows.empty() && !table.contains_null[column_index]) {
+                    table.rows[0][column_index] = null_cell(table.types[column_index]);
+                    table.contains_null[column_index] = true;
+                }
+            }
             tables.push_back(std::move(table));
         }
         return tables;
@@ -311,7 +339,8 @@ private:
                                        "r" + std::to_string(i),
                                        table.columns,
                                        table.types,
-                                       table.nullable});
+                                       table.nullable,
+                                       table.contains_null});
         }
         return ranges;
     }
@@ -323,7 +352,18 @@ private:
         for (std::size_t i = 1; i < ranges.size(); ++i) {
             const auto left_columns = columns_for_ranges(joined);
             const auto right_columns = columns_for_ranges(std::vector<RangeItem>{ranges[i]});
-            out << " JOIN " << ranges[i].table << " AS " << ranges[i].alias << " ON "
+            const auto join_draw = between(1, 100);
+            if (join_draw <= 45) {
+                out << " JOIN ";
+                ++inner_join_count_;
+            } else if (join_draw <= 73) {
+                out << " LEFT JOIN ";
+                ++left_join_count_;
+            } else {
+                out << " RIGHT JOIN ";
+                ++right_join_count_;
+            }
+            out << ranges[i].table << " AS " << ranges[i].alias << " ON "
                 << join_predicate(left_columns, right_columns);
             joined.push_back(ranges[i]);
         }
@@ -453,13 +493,48 @@ private:
 
     std::string join_predicate(const std::vector<ColumnRef>& left_columns, const std::vector<ColumnRef>& right_columns) {
         const auto common_types = common_column_types(left_columns, right_columns);
-        const auto type = contains_type(common_types, catalog::ColumnType::String) && chance(45)
-                              ? catalog::ColumnType::String
-                              : pick(common_types);
+        std::vector<catalog::ColumnType> null_key_types;
+        for (const auto type : common_types) {
+            const auto left_typed = columns_of_type(left_columns, type);
+            const auto right_typed = columns_of_type(right_columns, type);
+            const auto side_has_null = [&](const std::vector<ColumnRef>& columns) {
+                return std::any_of(columns.begin(), columns.end(), [](const auto& column) {
+                    return column.contains_null;
+                });
+            };
+            if (side_has_null(left_typed) || side_has_null(right_typed)) {
+                null_key_types.push_back(type);
+            }
+        }
+        const auto type = !null_key_types.empty() && chance(70)
+                              ? pick(null_key_types)
+                              : contains_type(common_types, catalog::ColumnType::String) && chance(45)
+                                    ? catalog::ColumnType::String
+                                    : pick(common_types);
         saw_string_join_key_ = saw_string_join_key_ || type == catalog::ColumnType::String;
-        const auto left = sql_text(pick(columns_of_type(left_columns, type)));
-        const auto right = sql_text(pick(columns_of_type(right_columns, type)));
-        auto predicate = left + " = " + right;
+        const auto left_typed = columns_of_type(left_columns, type);
+        const auto right_typed = columns_of_type(right_columns, type);
+        auto left = pick(left_typed);
+        auto right = pick(right_typed);
+        std::vector<ColumnRef> null_left;
+        std::vector<ColumnRef> null_right;
+        std::copy_if(left_typed.begin(), left_typed.end(), std::back_inserter(null_left), [](const auto& column) {
+            return column.contains_null;
+        });
+        std::copy_if(right_typed.begin(), right_typed.end(), std::back_inserter(null_right), [](const auto& column) {
+            return column.contains_null;
+        });
+        if ((!null_left.empty() || !null_right.empty()) && chance(70)) {
+            if (!null_left.empty() && (null_right.empty() || chance(50))) {
+                left = pick(null_left);
+            } else {
+                right = pick(null_right);
+            }
+        }
+        null_key_join_count_ += left.contains_null || right.contains_null ? 1 : 0;
+        const auto left_text = sql_text(left);
+        const auto right_text = sql_text(right);
+        auto predicate = left_text + " = " + right_text;
         if (chance(65)) {
             std::vector<ColumnRef> all = left_columns;
             all.insert(all.end(), right_columns.begin(), right_columns.end());
@@ -565,7 +640,8 @@ private:
                 refs.push_back(ColumnRef{range.alias,
                                          range.columns[column_index],
                                          range.types[column_index],
-                                         range.nullable[column_index]});
+                                         range.nullable[column_index],
+                                         range.contains_null[column_index]});
             }
         }
         return refs;
@@ -815,6 +891,10 @@ private:
     std::vector<std::string> used_output_aliases_;
     bool saw_string_join_key_{false};
     bool saw_string_order_key_{false};
+    std::size_t inner_join_count_{0};
+    std::size_t left_join_count_{0};
+    std::size_t right_join_count_{0};
+    std::size_t null_key_join_count_{0};
 };
 
 std::optional<std::uint64_t> parse_seed_arg(int argc, char** argv) {
@@ -887,6 +967,14 @@ int main(int argc, char** argv) {
     std::size_t string_group_key_queries = 0;
     std::size_t string_distinct_output_queries = 0;
     std::size_t string_order_key_queries = 0;
+    std::size_t inner_joins = 0;
+    std::size_t left_joins = 0;
+    std::size_t right_joins = 0;
+    std::size_t null_key_joins = 0;
+    std::size_t mixed_inner_outer_chain_queries = 0;
+    std::size_t left_join_to_inner_firings = 0;
+    std::size_t join_commute_firings = 0;
+    std::size_t join_associate_firings = 0;
     bool hit_expression_bound = false;
     bool hit_plan_bound = false;
 
@@ -908,8 +996,28 @@ int main(int argc, char** argv) {
         string_group_key_queries += generated.has_string_group_key ? 1 : 0;
         string_distinct_output_queries += generated.has_string_distinct_output ? 1 : 0;
         string_order_key_queries += generated.has_string_order_key ? 1 : 0;
+        inner_joins += generated.inner_join_count;
+        left_joins += generated.left_join_count;
+        right_joins += generated.right_join_count;
+        null_key_joins += generated.null_key_join_count;
+        mixed_inner_outer_chain_queries += generated.has_mixed_inner_outer_chain ? 1 : 0;
+        left_join_to_inner_firings += stats.left_join_to_inner_firings;
+        join_commute_firings += stats.join_commute_firings;
+        join_associate_firings += stats.join_associate_firings;
         hit_expression_bound = hit_expression_bound || stats.hit_expression_bound;
         hit_plan_bound = hit_plan_bound || stats.hit_plan_bound;
+    }
+
+    if (seeds.size() == kDefaultSeedCount &&
+        (left_joins == 0 || right_joins == 0 || null_key_joins == 0 || mixed_inner_outer_chain_queries == 0 ||
+         left_join_to_inner_firings == 0 || join_associate_firings == 0)) {
+        std::cerr << "default fuzz corpus missed required outer-join coverage\n"
+                  << "left_joins=" << left_joins << " right_joins=" << right_joins
+                  << " null_key_joins=" << null_key_joins
+                  << " mixed_inner_outer_chain_queries=" << mixed_inner_outer_chain_queries
+                  << " left_join_to_inner_firings=" << left_join_to_inner_firings
+                  << " join_associate_firings=" << join_associate_firings << "\n";
+        return 1;
     }
 
     std::cout << "sql_fuzz_differential coverage: seeds=" << seeds.size() << " queries=" << queries
@@ -922,6 +1030,14 @@ int main(int argc, char** argv) {
               << " string_group_key_queries=" << string_group_key_queries
               << " string_distinct_output_queries=" << string_distinct_output_queries
               << " string_order_key_queries=" << string_order_key_queries
+              << " inner_joins=" << inner_joins
+              << " left_joins=" << left_joins
+              << " right_joins=" << right_joins
+              << " null_key_joins=" << null_key_joins
+              << " mixed_inner_outer_chain_queries=" << mixed_inner_outer_chain_queries
+              << " left_join_to_inner_firings=" << left_join_to_inner_firings
+              << " join_commute_firings=" << join_commute_firings
+              << " join_associate_firings=" << join_associate_firings
               << " hit_expression_bound=" << (hit_expression_bound ? "yes" : "no")
               << " hit_plan_bound=" << (hit_plan_bound ? "yes" : "no") << "\n";
     return 0;

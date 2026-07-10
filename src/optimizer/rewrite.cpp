@@ -248,6 +248,40 @@ bool references_side(const plan::BoundPredicate& predicate, const std::vector<st
     return false;
 }
 
+bool comparison_references_side(const plan::BoundComparisonExpr& comparison,
+                                const std::vector<std::string>& tables) {
+    for (const auto& table : referenced_tables(comparison)) {
+        if (contains_table(tables, table)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool is_null_rejecting_for_side(const plan::BoundPredicate& predicate,
+                                const std::vector<std::string>& tables) {
+    switch (predicate.kind) {
+    case sql::PredicateKind::Comparison:
+        return comparison_references_side(predicate.comparison, tables);
+    case sql::PredicateKind::IsNull:
+    case sql::PredicateKind::IsNotNull:
+        return false;
+    case sql::PredicateKind::And:
+        if (predicate.left == nullptr || predicate.right == nullptr) {
+            throw std::logic_error("bound predicate is missing a child");
+        }
+        return is_null_rejecting_for_side(*predicate.left, tables) ||
+               is_null_rejecting_for_side(*predicate.right, tables);
+    case sql::PredicateKind::Or:
+        if (predicate.left == nullptr || predicate.right == nullptr) {
+            throw std::logic_error("bound predicate is missing a child");
+        }
+        return is_null_rejecting_for_side(*predicate.left, tables) &&
+               is_null_rejecting_for_side(*predicate.right, tables);
+    }
+    throw std::logic_error("unreachable predicate kind");
+}
+
 bool connects_children(const plan::BoundPredicate& predicate,
                        const std::vector<std::string>& left_tables,
                        const std::vector<std::string>& right_tables) {
@@ -662,6 +696,42 @@ bool MergeAdjacentFiltersRule::apply(Memo& memo, GroupId group, const MemoExpres
     return changed;
 }
 
+bool LeftJoinToInnerRule::apply(Memo& memo, GroupId group, const MemoExpression& expression) const {
+    if (expression.kind != MemoExpressionKind::Filter) {
+        return false;
+    }
+
+    const auto child_group = expression.children.at(0);
+    bool changed = false;
+    const auto child_expression_count = memo.group(child_group).expressions.size();
+    for (std::size_t i = 0; i < child_expression_count; ++i) {
+        const auto child_expression = memo.group(child_group).expressions.at(i).expression;
+        if (child_expression.kind != MemoExpressionKind::Join ||
+            child_expression.join_kind != plan::JoinKind::Left) {
+            continue;
+        }
+
+        const auto right_tables = output_tables_for_group(memo, child_expression.children.at(1));
+        const auto rejects_null_extended_right = std::any_of(
+            expression.predicates.begin(), expression.predicates.end(), [&](const auto& predicate) {
+                return is_null_rejecting_for_side(predicate, right_tables);
+            });
+        if (!rejects_null_extended_right) {
+            continue;
+        }
+
+        const auto before_group_count = memo.group_count();
+        auto inner_join = child_expression;
+        inner_join.join_kind = plan::JoinKind::Inner;
+        const auto inner_join_group = memo.insert_expression(std::move(inner_join));
+        const auto inserted = memo.insert_equivalent(
+            group,
+            filter_expression(expression.predicates, inner_join_group, expression.order_permission));
+        changed = inserted || memo.group_count() != before_group_count || changed;
+    }
+    return changed;
+}
+
 bool FilterIntoJoinRule::apply(Memo& memo, GroupId group, const MemoExpression& expression) const {
     if (expression.kind != MemoExpressionKind::Filter) {
         return false;
@@ -1027,6 +1097,7 @@ std::vector<std::reference_wrapper<const MemoRule>> default_memo_rules() {
     static const MergeAdjacentFiltersRule merge_filters;
     static const AlwaysFalseFilterRule always_false;
     static const DropAlwaysTrueFilterRule drop_true;
+    static const LeftJoinToInnerRule left_join_to_inner;
     static const FilterIntoJoinRule filter_into_join;
     static const FilterThroughAggregateRule filter_through_aggregate;
     static const JoinCommuteRule join_commute;
@@ -1035,6 +1106,7 @@ std::vector<std::reference_wrapper<const MemoRule>> default_memo_rules() {
             std::cref(static_cast<const MemoRule&>(merge_filters)),
             std::cref(static_cast<const MemoRule&>(always_false)),
             std::cref(static_cast<const MemoRule&>(drop_true)),
+            std::cref(left_join_to_inner),
             std::cref(filter_into_join),
             std::cref(filter_through_aggregate),
             std::cref(join_commute),

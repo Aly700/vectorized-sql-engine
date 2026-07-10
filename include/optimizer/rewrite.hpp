@@ -142,6 +142,36 @@ public:
     [[nodiscard]] bool apply(Memo& memo, GroupId group, const MemoExpression& expression) const override;
 };
 
+// Pattern matched: Filter(P, LeftJoin(L, R, J)) where at least one whole top-level conjunct in P
+// is provably null-rejecting for R's binding identities.
+// Replacement expression: Add Filter(P, InnerJoin(L, R, J)) as an equivalent expression in the
+// Filter group. The new INNER join is created in its own group; the bare LEFT and INNER joins are
+// never declared equivalent. The original filtered LEFT expression remains in the memo.
+// Semantic equivalence argument: A LEFT join emits every TRUE-matching pair and emits one
+// NULL-extended right row only for a left row with no TRUE ON match. INNER emits the same matching
+// pairs and omits only those NULL-extended rows. On a NULL-extended row, a comparison that reads any
+// R column has a NULL operand and is UNKNOWN, so Filter rejects it. Recursively, an AND tree is
+// null-rejecting if either child is null-rejecting because an AND with a child that cannot be TRUE
+// cannot be TRUE; an OR tree is null-rejecting only if both children are null-rejecting because any
+// non-rejecting disjunct could make the OR TRUE. IS NULL and IS NOT NULL leaves are deliberately
+// outside this comparison-rooted conservative proof; in particular R.x IS NULL is TRUE on the
+// NULL-extended row and cannot justify the rewrite. Therefore P removes exactly the rows on which
+// LEFT and INNER differ, while preserving every matched pair and its bag multiplicity.
+// Preconditions: The Filter child expression must be a LEFT join; right-side membership is proved
+// from the right child group's bound binding identities; predicate trees move only as whole
+// conjuncts and no OR/AND splitting occurs; comparisons and predicates are pure and type-checked;
+// Filter and join order permission is preserved. Exploration terminates because the rule adds only
+// the structurally deduplicated filtered-INNER alternative and never converts INNER back to LEFT.
+// Golden query: `SELECT t1.a, t1.b, t2.c FROM t1 LEFT JOIN t2 ON t1.a = t2.a WHERE t2.c = 201`
+// runs the original, every memo alternative, and extract_best through both engines. The companion
+// EXPLAIN golden over big/mid/tiny pins LEFT-to-INNER plus the commute/associate alternatives it
+// unlocks; targeted negatives pin IS NULL and left-only filters.
+class LeftJoinToInnerRule final : public MemoRule {
+public:
+    [[nodiscard]] std::string_view name() const override { return "LeftJoinToInnerRule"; }
+    [[nodiscard]] bool apply(Memo& memo, GroupId group, const MemoExpression& expression) const override;
+};
+
 // Pattern matched: Filter(P, Join(L, R, J)) in the memo.
 // Replacement expression: An equivalent join alternative where each filter conjunct that references
 // only L's binding identities becomes/merges with a Filter over L, each conjunct that references only
@@ -158,11 +188,12 @@ public:
 // predicate because it is evaluated over the same row pair at a point where both rows are available;
 // NULL operands yield UNKNOWN and are rejected in either placement. Whole-tree reference analysis
 // prevents unsound OR/AND splitting.
-// Preconditions: The child join must be an INNER join. LEFT joins are skipped in Phase 20a because
-// pushing a predicate into the null-supplying side, or turning a post-join predicate into an ON
-// predicate, can preserve NULL-extended rows that the original WHERE would reject or reject rows
-// the original ON would preserve. Sound preserved-side pushdown is left as future outer-join rewrite
-// work. Only conjunct trees whose referenced binding identities are wholly available at the target
+// Preconditions: The child join must be an INNER join. LEFT joins are skipped because pushing a
+// predicate into the null-supplying side, or turning a post-join predicate into an ON predicate,
+// can preserve NULL-extended rows that the original WHERE would reject or reject rows the original
+// ON would preserve. LeftJoinToInnerRule may first establish an equivalent filtered INNER shape;
+// this rule still never weakens its own join-kind guard. Only conjunct trees whose referenced
+// binding identities are wholly available at the target
 // child scope move below the join. Literal-only, unknown-scope, aggregate-output, and mixed-side
 // non-leaf predicates stay residual; predicates are pure, and the original expression remains in
 // the memo with ordering permission preserved on the inserted alternative.
