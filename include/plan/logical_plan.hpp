@@ -14,6 +14,8 @@
 
 namespace plan {
 
+struct LogicalPlan;
+
 enum class LogicalKind { Scan, Join, Filter, Project, Aggregate, Distinct, Sort, Limit, Explain };
 enum class OrderPermission { Deterministic, Arbitrary };
 enum class JoinKind { Inner, Left };
@@ -25,8 +27,18 @@ struct BoundColumnRef {
     catalog::ColumnType type{catalog::ColumnType::Int64};
 };
 
+struct BoundScalarSubquery {
+    std::shared_ptr<const LogicalPlan> plan;
+    std::size_t position{0};
+    std::string name;
+};
+
 struct BoundScalarExpr {
-    using Value = std::variant<BoundColumnRef, sql::IntLiteral, sql::StringLiteral, sql::NullLiteral>;
+    using Value = std::variant<BoundColumnRef,
+                               sql::IntLiteral,
+                               sql::StringLiteral,
+                               sql::NullLiteral,
+                               BoundScalarSubquery>;
 
     Value value;
     catalog::ColumnType type{catalog::ColumnType::Int64};
@@ -36,6 +48,8 @@ struct BoundScalarExpr {
     BoundScalarExpr(sql::IntLiteral literal) : value(literal), type(catalog::ColumnType::Int64) {}
     BoundScalarExpr(sql::StringLiteral literal) : value(std::move(literal)), type(catalog::ColumnType::String) {}
     BoundScalarExpr(sql::NullLiteral literal) : value(literal), type(catalog::ColumnType::Int64) {}
+    BoundScalarExpr(BoundScalarSubquery subquery, catalog::ColumnType type)
+        : value(std::move(subquery)), type(type) {}
     BoundScalarExpr(Value value, catalog::ColumnType type) : value(std::move(value)), type(type) {}
 };
 
@@ -50,6 +64,9 @@ struct BoundPredicate {
     sql::PredicateKind kind{sql::PredicateKind::Comparison};
     BoundComparisonExpr comparison;
     BoundScalarExpr null_check;
+    BoundScalarExpr in_value;
+    std::shared_ptr<const LogicalPlan> subquery;
+    std::string subquery_name;
     std::shared_ptr<BoundPredicate> left;
     std::shared_ptr<BoundPredicate> right;
     std::size_t operator_position{0};
@@ -80,6 +97,32 @@ struct BoundPredicate {
         predicate.left = std::make_shared<BoundPredicate>(std::move(left));
         predicate.right = std::make_shared<BoundPredicate>(std::move(right));
         predicate.operator_position = position;
+        return predicate;
+    }
+
+    static BoundPredicate in_expr(sql::PredicateKind kind,
+                                  BoundScalarExpr value,
+                                  std::shared_ptr<const LogicalPlan> subquery,
+                                  std::size_t position,
+                                  std::string name) {
+        BoundPredicate predicate;
+        predicate.kind = kind;
+        predicate.in_value = std::move(value);
+        predicate.subquery = std::move(subquery);
+        predicate.operator_position = position;
+        predicate.subquery_name = std::move(name);
+        return predicate;
+    }
+
+    static BoundPredicate exists_expr(sql::PredicateKind kind,
+                                      std::shared_ptr<const LogicalPlan> subquery,
+                                      std::size_t position,
+                                      std::string name) {
+        BoundPredicate predicate;
+        predicate.kind = kind;
+        predicate.subquery = std::move(subquery);
+        predicate.operator_position = position;
+        predicate.subquery_name = std::move(name);
         return predicate;
     }
 };

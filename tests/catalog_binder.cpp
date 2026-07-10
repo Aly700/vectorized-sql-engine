@@ -534,6 +534,123 @@ void assert_unterminated_string_literal_reports_start_position() {
     throw std::logic_error("expected unterminated string literal parse error");
 }
 
+void assert_uncorrelated_subquery_forms_bind_with_nested_full_selects() {
+    auto catalog = make_schema_catalog();
+
+    const auto scalar_right = sql::bind_select(
+        sql::parse_select("SELECT a FROM t WHERE a = (SELECT b FROM t1 ORDER BY b LIMIT 1)"), catalog);
+    const auto scalar_left = sql::bind_select(
+        sql::parse_select("SELECT a FROM t WHERE (SELECT b FROM t1 ORDER BY b LIMIT 1) = a"), catalog);
+    const auto in = sql::bind_select(
+        sql::parse_select("SELECT a FROM t WHERE a IN (SELECT t1.a FROM t1 JOIN t2 ON t1.a = t2.a)"), catalog);
+    const auto not_in = sql::bind_select(
+        sql::parse_select("SELECT a FROM t WHERE a NOT IN (SELECT a FROM t1 GROUP BY a HAVING COUNT(*) > 0)"),
+        catalog);
+    const auto nested_exists = sql::bind_select(
+        sql::parse_select(
+            "SELECT a FROM t WHERE EXISTS (SELECT b FROM t1 WHERE b IN (SELECT c FROM t2))"),
+        catalog);
+    const auto not_exists = sql::bind_select(
+        sql::parse_select("SELECT a FROM t WHERE NOT EXISTS (SELECT a FROM t2 LIMIT 0)"), catalog);
+
+    for (const auto* logical : {&scalar_right, &scalar_left, &in, &not_in, &nested_exists, &not_exists}) {
+        const auto printed = plan::to_string(*logical);
+        assert(printed.find("Subquery[") != std::string::npos);
+    }
+}
+
+void assert_scalar_and_in_subquery_width_rules_are_positioned() {
+    auto catalog = make_schema_catalog();
+
+    const std::string scalar_sql = "SELECT a FROM t WHERE a = (SELECT a, b FROM t1)";
+    try {
+        (void)sql::bind_select(sql::parse_select(scalar_sql), catalog);
+    } catch (const sql::BindError& error) {
+        assert(error.position() == scalar_sql.find('('));
+        assert(error.message() == "scalar subquery must produce exactly one output column, got 2");
+        goto in_width;
+    }
+    throw std::logic_error("expected scalar subquery width bind error");
+
+in_width:
+    const std::string in_sql = "SELECT a FROM t WHERE a IN (SELECT a, b FROM t1)";
+    try {
+        (void)sql::bind_select(sql::parse_select(in_sql), catalog);
+    } catch (const sql::BindError& error) {
+        assert(error.position() == in_sql.find("IN"));
+        assert(error.message() == "IN subquery must produce exactly one output column, got 2");
+        return;
+    }
+    throw std::logic_error("expected IN subquery width bind error");
+}
+
+void assert_subquery_type_mismatches_are_positioned() {
+    auto catalog = make_schema_catalog();
+
+    const auto null_in_string = sql::bind_select(
+        sql::parse_select("SELECT a FROM t WHERE NULL IN (SELECT s FROM strings)"), catalog);
+    assert(plan::to_string(null_in_string).find("lit(NULL) IN subquery(") != std::string::npos);
+
+    const std::string scalar_sql = "SELECT a FROM t WHERE a = (SELECT s FROM strings LIMIT 1)";
+    try {
+        (void)sql::bind_select(sql::parse_select(scalar_sql), catalog);
+    } catch (const sql::BindError& error) {
+        assert(error.position() == scalar_sql.find('='));
+        assert(error.message() == "comparison operands must have the same type: int64 vs string");
+        goto in_type;
+    }
+    throw std::logic_error("expected scalar subquery type bind error");
+
+in_type:
+    const std::string in_sql = "SELECT s FROM strings WHERE s IN (SELECT a FROM t)";
+    try {
+        (void)sql::bind_select(sql::parse_select(in_sql), catalog);
+    } catch (const sql::BindError& error) {
+        assert(error.position() == in_sql.find("IN"));
+        assert(error.message() == "IN operand and subquery column must have the same type: string vs int64");
+        return;
+    }
+    throw std::logic_error("expected IN subquery type bind error");
+}
+
+void assert_correlated_subquery_reference_is_never_misbound() {
+    auto catalog = make_schema_catalog();
+    const std::string query =
+        "SELECT outer_t.a FROM t AS outer_t WHERE EXISTS "
+        "(SELECT b FROM t1 WHERE t1.a = outer_t.a)";
+    try {
+        (void)sql::bind_select(sql::parse_select(query), catalog);
+    } catch (const sql::BindError& error) {
+        assert(error.position() == query.find("outer_t.a", query.find("SELECT b")));
+        assert(error.message() == "correlated subqueries are unsupported: 'outer_t.a'");
+        return;
+    }
+    throw std::logic_error("expected correlated subquery bind error");
+}
+
+void assert_subquery_parse_errors_are_positioned() {
+    const std::string missing_right = "SELECT a FROM t WHERE EXISTS (SELECT a FROM t";
+    try {
+        (void)sql::parse_select(missing_right);
+    } catch (const sql::ParseError& error) {
+        assert(error.position() == missing_right.size());
+        assert(error.message() == "expected ')' after subquery");
+        goto missing_select;
+    }
+    throw std::logic_error("expected missing subquery right parenthesis parse error");
+
+missing_select:
+    const std::string invalid_in = "SELECT a FROM t WHERE a IN (a)";
+    try {
+        (void)sql::parse_select(invalid_in);
+    } catch (const sql::ParseError& error) {
+        assert(error.position() == invalid_in.find('('));
+        assert(error.message() == "expected subquery after IN");
+        return;
+    }
+    throw std::logic_error("expected IN subquery parse error");
+}
+
 } // namespace
 
 int main() {
@@ -572,5 +689,10 @@ int main() {
     assert_reverse_comparison_type_mismatch_is_rejected();
     assert_sum_rejects_string_argument();
     assert_unterminated_string_literal_reports_start_position();
+    assert_uncorrelated_subquery_forms_bind_with_nested_full_selects();
+    assert_scalar_and_in_subquery_width_rules_are_positioned();
+    assert_subquery_type_mismatches_are_positioned();
+    assert_correlated_subquery_reference_is_never_misbound();
+    assert_subquery_parse_errors_are_positioned();
     return 0;
 }

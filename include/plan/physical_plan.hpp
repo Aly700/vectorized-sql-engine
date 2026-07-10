@@ -10,6 +10,9 @@
 
 namespace plan {
 
+inline constexpr auto kVectorizedSubqueryNotSupported =
+    "vectorized physical lowering does not support subqueries";
+
 enum class PhysicalKind { Scan, Join, Filter, Project, Aggregate, Distinct, Sort, Limit };
 
 struct PhysicalPlan {

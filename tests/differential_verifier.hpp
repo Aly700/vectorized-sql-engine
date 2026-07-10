@@ -405,6 +405,10 @@ inline std::optional<std::string> accepted_runtime_error_category(const std::str
     if (message.find("overflowed int64") != std::string::npos) {
         return std::string{"int64-overflow"};
     }
+    if (message.find("scalar subquery at position ") != std::string::npos &&
+        message.find(" returned more than one row") != std::string::npos) {
+        return std::string{"scalar-subquery-cardinality"};
+    }
     return std::nullopt;
 }
 
@@ -555,6 +559,144 @@ inline bool verify_result_pair(const storage::ColumnarBatch& unrewritten_oracle,
               << "output order matches:   " << (output_order_matches ? "yes" : "no") << "\n"
               << "ordered outputs sorted: " << (ordered_outputs_are_sorted ? "yes" : "no") << "\n";
     return false;
+}
+
+inline bool has_exact_subquery_lowering_guard(const plan::LogicalPlan& logical,
+                                              const execution::Catalog& catalog,
+                                              const std::string& sql,
+                                              const std::string& path_name) {
+    const auto verify_error = [&](const std::invalid_argument& error) {
+        if (std::string(error.what()) == plan::kVectorizedSubqueryNotSupported) {
+            return true;
+        }
+        std::cerr << "wrong vectorized subquery guard\n"
+                  << "path: " << path_name << "\n"
+                  << "sql: " << sql << "\n"
+                  << "expected: " << plan::kVectorizedSubqueryNotSupported << "\n"
+                  << "actual: " << error.what() << "\n";
+        return false;
+    };
+
+    bool lowering_guarded = false;
+    try {
+        (void)plan::lower_to_physical(logical);
+    } catch (const std::invalid_argument& error) {
+        lowering_guarded = verify_error(error);
+    } catch (const std::exception& error) {
+        std::cerr << "wrong physical-lowering subquery error type\n"
+                  << "path: " << path_name << "\n"
+                  << "sql: " << sql << "\n"
+                  << "actual: " << error.what() << "\n";
+        return false;
+    }
+    if (!lowering_guarded) {
+        std::cerr << "physical lowering accepted a Phase 21a subquery plan\n"
+                  << "path: " << path_name << "\n"
+                  << "sql: " << sql << "\n";
+        return false;
+    }
+
+    try {
+        (void)execution::execute_vectorized(logical, catalog);
+    } catch (const std::invalid_argument& error) {
+        return verify_error(error);
+    } catch (const std::exception& error) {
+        std::cerr << "wrong vectorized-execution subquery error type\n"
+                  << "path: " << path_name << "\n"
+                  << "sql: " << sql << "\n"
+                  << "actual: " << error.what() << "\n";
+        return false;
+    }
+
+    std::cerr << "vectorized execution accepted a Phase 21a subquery plan\n"
+              << "path: " << path_name << "\n"
+              << "sql: " << sql << "\n";
+    return false;
+}
+
+inline bool same_oracle_outcome(const ExecutionOutcome& expected, const ExecutionOutcome& actual) {
+    if (expected.batch.has_value() || actual.batch.has_value()) {
+        return expected.batch.has_value() && actual.batch.has_value() &&
+               same_column_order(*expected.batch, *actual.batch) && same_sorted_bag(*expected.batch, *actual.batch);
+    }
+    return same_accepted_error(expected, actual);
+}
+
+inline bool compare_subquery_oracle_paths(const std::string& sql,
+                                          const execution::Catalog& catalog,
+                                          const std::string& table_text,
+                                          ComparisonStats* stats = nullptr) {
+    try {
+        const auto logical = sql::bind_select(sql::parse_select(sql), catalog);
+        const auto rewritten = optimizer::rewrite_to_fixpoint(logical, optimizer::default_rules());
+
+        optimizer::Memo memo;
+        const auto root = memo.insert(logical);
+        const auto explored = optimizer::explore_memo_to_fixpoint(memo, optimizer::default_memo_rules());
+        const auto alternatives = memo.extract_alternatives(root, optimizer::AlternativeExtractionOptions{256, 4096});
+        if (alternatives.plans.empty() || alternatives.hit_expression_bound || alternatives.hit_plan_bound) {
+            std::cerr << "subquery memo alternative extraction was incomplete\n"
+                      << "sql: " << sql << "\n"
+                      << table_text << "\n"
+                      << "alternatives: " << alternatives.plans.size() << "\n"
+                      << "hit expression bound: " << (alternatives.hit_expression_bound ? "yes" : "no") << "\n"
+                      << "hit plan bound: " << (alternatives.hit_plan_bound ? "yes" : "no") << "\n"
+                      << memo.dump();
+            return false;
+        }
+        if (stats != nullptr) {
+            stats->alternative_count = alternatives.plans.size();
+            stats->max_group_expression_count = alternatives.max_group_expression_count;
+            stats->hit_expression_bound = alternatives.hit_expression_bound;
+            stats->hit_plan_bound = alternatives.hit_plan_bound;
+        }
+
+        const auto baseline = run_execution_path(
+            "unrewritten subquery oracle", [&] { return execution::execute_interpreted(logical, catalog); }, stats);
+        if (baseline.unexpected_error || !has_exact_subquery_lowering_guard(logical, catalog, sql, "unrewritten")) {
+            std::cerr << "subquery baseline path failed\n"
+                      << "sql: " << sql << "\n"
+                      << table_text << "\n"
+                      << "outcome: " << format_outcome(baseline) << "\n";
+            return false;
+        }
+
+        const auto verify = [&](const std::string& path_name, const plan::LogicalPlan& candidate) {
+            const auto outcome = run_execution_path(
+                path_name + " subquery oracle", [&] { return execution::execute_interpreted(candidate, catalog); }, stats);
+            if (same_oracle_outcome(baseline, outcome) &&
+                has_exact_subquery_lowering_guard(candidate, catalog, sql, path_name)) {
+                return true;
+            }
+            std::cerr << "subquery oracle-path divergence\n"
+                      << "path: " << path_name << "\n"
+                      << "sql: " << sql << "\n"
+                      << table_text << "\n"
+                      << "baseline: " << format_outcome(baseline) << "\n"
+                      << "candidate: " << format_outcome(outcome) << "\n"
+                      << "candidate plan:\n" << plan::to_string(candidate) << "\n";
+            return false;
+        };
+
+        if (!verify("standalone rewrite", rewritten.plan)) {
+            return false;
+        }
+        if (!verify("memo canonical extraction", memo.extract(root))) {
+            return false;
+        }
+        for (std::size_t i = 0; i < alternatives.plans.size(); ++i) {
+            if (!verify("memo alternative " + std::to_string(i), alternatives.plans[i])) {
+                return false;
+            }
+        }
+        return verify("memo extract_best", memo.extract_best(root, catalog));
+    } catch (const std::exception& error) {
+        std::cerr << "subquery verification setup failed\n"
+                  << "sql: " << sql << "\n"
+                  << table_text << "\n"
+                  << "exception: " << error.what() << "\n";
+        return false;
+    }
 }
 
 inline bool compare_engines(const std::string& sql,

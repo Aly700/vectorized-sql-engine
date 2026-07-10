@@ -72,7 +72,7 @@ bool is_reserved_keyword(std::string_view text) {
            equals_keyword(text, "SUM") || equals_keyword(text, "MIN") || equals_keyword(text, "MAX") ||
            equals_keyword(text, "HAVING") || equals_keyword(text, "DISTINCT") || equals_keyword(text, "LIMIT") ||
            equals_keyword(text, "NULL") || equals_keyword(text, "IS") || equals_keyword(text, "NOT") ||
-           equals_keyword(text, "EXPLAIN");
+           equals_keyword(text, "IN") || equals_keyword(text, "EXISTS") || equals_keyword(text, "EXPLAIN");
 }
 
 class Lexer {
@@ -164,6 +164,11 @@ public:
         }
     }
 
+    Token peek() const {
+        auto copy = *this;
+        return copy.next();
+    }
+
 private:
     std::string_view input_;
     std::size_t offset_{0};
@@ -176,8 +181,13 @@ public:
     }
 
     SelectQuery parse_select() {
+        return parse_select_query(false);
+    }
+
+private:
+    SelectQuery parse_select_query(bool nested) {
         SelectQuery query;
-        if (is_keyword("EXPLAIN")) {
+        if (!nested && is_keyword("EXPLAIN")) {
             query.explain = true;
             advance();
         }
@@ -217,23 +227,30 @@ public:
             query.limit = parse_limit();
         }
 
-        if (current_.kind == TokenKind::Semicolon) {
+        if (!nested && current_.kind == TokenKind::Semicolon) {
             advance();
         }
-        if (current_.kind != TokenKind::End) {
+        if ((!nested && current_.kind != TokenKind::End) || (nested && current_.kind != TokenKind::RightParen)) {
+            if (nested) {
+                throw ParseError(current_.position, "expected ')' after subquery");
+            }
             throw ParseError(current_.position, "expected end of input after query");
         }
 
         return query;
     }
 
-private:
     void advance() {
         current_ = lexer_.next();
     }
 
     bool is_keyword(std::string_view keyword) const {
         return current_.kind == TokenKind::Identifier && equals_keyword(current_.text, keyword);
+    }
+
+    bool next_is_keyword(std::string_view keyword) const {
+        const auto next = lexer_.peek();
+        return next.kind == TokenKind::Identifier && equals_keyword(next.text, keyword);
     }
 
     void expect_keyword(std::string_view keyword, const std::string& message) {
@@ -455,7 +472,7 @@ private:
     }
 
     PredicateExpr parse_boolean_primary() {
-        if (current_.kind == TokenKind::LeftParen) {
+        if (current_.kind == TokenKind::LeftParen && !next_is_keyword("SELECT")) {
             advance();
             auto expression = parse_boolean_expression();
             expect_token(TokenKind::RightParen, "expected ')' after boolean expression");
@@ -513,7 +530,7 @@ private:
     }
 
     HavingPredicateExpr parse_having_boolean_primary() {
-        if (current_.kind == TokenKind::LeftParen) {
+        if (current_.kind == TokenKind::LeftParen && !next_is_keyword("SELECT")) {
             advance();
             auto expression = parse_having_boolean_expression();
             expect_token(TokenKind::RightParen, "expected ')' after boolean expression");
@@ -535,7 +552,18 @@ private:
     }
 
     PredicateExpr parse_predicate_leaf() {
-        auto left = parse_scalar_expr("expected expression in comparison");
+        if (is_keyword("EXISTS") || (is_keyword("NOT") && next_is_keyword("EXISTS"))) {
+            auto kind = PredicateKind::Exists;
+            if (is_keyword("NOT")) {
+                kind = PredicateKind::NotExists;
+                advance();
+            }
+            const auto position = current_.position;
+            expect_keyword("EXISTS", "expected EXISTS");
+            return PredicateExpr::exists_expr(kind, parse_subquery("expected subquery after EXISTS").query, position);
+        }
+
+        auto left = parse_scalar_expr("expected expression in comparison", true);
         if (is_keyword("IS")) {
             const auto position = current_.position;
             advance();
@@ -548,14 +576,38 @@ private:
             return PredicateExpr::null_check_expr(kind, std::move(left), position);
         }
 
+        if (is_keyword("IN") || (is_keyword("NOT") && next_is_keyword("IN"))) {
+            auto kind = PredicateKind::In;
+            if (is_keyword("NOT")) {
+                kind = PredicateKind::NotIn;
+                advance();
+            }
+            const auto position = current_.position;
+            expect_keyword("IN", "expected IN after NOT");
+            auto subquery = parse_subquery("expected subquery after IN");
+            return PredicateExpr::in_expr(kind, std::move(left), std::move(subquery.query), position);
+        }
+
         const auto op_position = current_.position;
         const auto op = parse_comparison_op();
-        auto right = parse_scalar_expr("expected expression in comparison");
+        auto right = parse_scalar_expr("expected expression in comparison", true);
         return PredicateExpr::comparison_expr(ComparisonExpr{std::move(left), op, std::move(right), op_position});
     }
 
     HavingPredicateExpr parse_having_predicate_leaf() {
-        auto left = parse_having_expr("expected expression in HAVING comparison");
+        if (is_keyword("EXISTS") || (is_keyword("NOT") && next_is_keyword("EXISTS"))) {
+            auto kind = PredicateKind::Exists;
+            if (is_keyword("NOT")) {
+                kind = PredicateKind::NotExists;
+                advance();
+            }
+            const auto position = current_.position;
+            expect_keyword("EXISTS", "expected EXISTS");
+            return HavingPredicateExpr::exists_expr(
+                kind, parse_subquery("expected subquery after EXISTS").query, position);
+        }
+
+        auto left = parse_having_expr("expected expression in HAVING comparison", true);
         if (is_keyword("IS")) {
             const auto position = current_.position;
             advance();
@@ -568,9 +620,21 @@ private:
             return HavingPredicateExpr::null_check_expr(kind, std::move(left), position);
         }
 
+        if (is_keyword("IN") || (is_keyword("NOT") && next_is_keyword("IN"))) {
+            auto kind = PredicateKind::In;
+            if (is_keyword("NOT")) {
+                kind = PredicateKind::NotIn;
+                advance();
+            }
+            const auto position = current_.position;
+            expect_keyword("IN", "expected IN after NOT");
+            auto subquery = parse_subquery("expected subquery after IN");
+            return HavingPredicateExpr::in_expr(kind, std::move(left), std::move(subquery.query), position);
+        }
+
         const auto op_position = current_.position;
         const auto op = parse_comparison_op();
-        auto right = parse_having_expr("expected expression in HAVING comparison");
+        auto right = parse_having_expr("expected expression in HAVING comparison", true);
         return HavingPredicateExpr::comparison_expr(
             HavingComparisonExpr{std::move(left), op, std::move(right), op_position});
     }
@@ -620,7 +684,21 @@ private:
         throw ParseError(current_.position, message);
     }
 
-    ScalarExpr parse_scalar_expr(const std::string& message) {
+    ScalarSubquery parse_subquery(const std::string& message) {
+        if (current_.kind != TokenKind::LeftParen || !next_is_keyword("SELECT")) {
+            throw ParseError(current_.position, message);
+        }
+        const auto position = current_.position;
+        advance();
+        auto query = std::make_shared<SelectQuery>(parse_select_query(true));
+        expect_token(TokenKind::RightParen, "expected ')' after subquery");
+        return ScalarSubquery{std::move(query), position};
+    }
+
+    ScalarExpr parse_scalar_expr(const std::string& message, bool allow_subquery = false) {
+        if (allow_subquery && current_.kind == TokenKind::LeftParen && next_is_keyword("SELECT")) {
+            return parse_subquery(message);
+        }
         if (is_keyword("NULL")) {
             auto literal = NullLiteral{current_.position};
             advance();
@@ -653,7 +731,10 @@ private:
         throw ParseError(current_.position, message);
     }
 
-    HavingExpr parse_having_expr(const std::string& message) {
+    HavingExpr parse_having_expr(const std::string& message, bool allow_subquery = false) {
+        if (allow_subquery && current_.kind == TokenKind::LeftParen && next_is_keyword("SELECT")) {
+            return parse_subquery(message);
+        }
         if (is_aggregate_function()) {
             return parse_aggregate_call();
         }

@@ -10,6 +10,8 @@
 
 namespace sql {
 
+struct SelectQuery;
+
 struct ColumnRef {
     std::optional<std::string> qualifier;
     std::string name;
@@ -30,7 +32,12 @@ struct StringLiteral {
     std::size_t position{0};
 };
 
-using ScalarExpr = std::variant<ColumnRef, IntLiteral, StringLiteral, NullLiteral>;
+struct ScalarSubquery {
+    std::shared_ptr<SelectQuery> query;
+    std::size_t position{0};
+};
+
+using ScalarExpr = std::variant<ColumnRef, IntLiteral, StringLiteral, NullLiteral, ScalarSubquery>;
 
 enum class AggregateFunction { Count, Sum, Min, Max };
 
@@ -45,7 +52,7 @@ struct AggregateCall {
 };
 
 using SelectExpr = std::variant<ScalarExpr, AggregateCall>;
-using HavingExpr = std::variant<ColumnRef, IntLiteral, StringLiteral, NullLiteral, AggregateCall>;
+using HavingExpr = std::variant<ColumnRef, IntLiteral, StringLiteral, NullLiteral, ScalarSubquery, AggregateCall>;
 using OrderByExpr = std::variant<ColumnRef, AggregateCall>;
 
 enum class ComparisonOp { Equal, NotEqual, Less, LessEqual, Greater, GreaterEqual };
@@ -57,12 +64,14 @@ struct ComparisonExpr {
     std::size_t operator_position{0};
 };
 
-enum class PredicateKind { Comparison, IsNull, IsNotNull, And, Or };
+enum class PredicateKind { Comparison, IsNull, IsNotNull, In, NotIn, Exists, NotExists, And, Or };
 
 struct PredicateExpr {
     PredicateKind kind{PredicateKind::Comparison};
     ComparisonExpr comparison;
     ScalarExpr null_check;
+    ScalarExpr in_value;
+    std::shared_ptr<SelectQuery> subquery;
     std::shared_ptr<PredicateExpr> left;
     std::shared_ptr<PredicateExpr> right;
     std::size_t operator_position{0};
@@ -91,6 +100,28 @@ struct PredicateExpr {
         predicate.operator_position = position;
         return predicate;
     }
+
+    static PredicateExpr in_expr(PredicateKind kind,
+                                 ScalarExpr value,
+                                 std::shared_ptr<SelectQuery> subquery,
+                                 std::size_t position) {
+        PredicateExpr predicate;
+        predicate.kind = kind;
+        predicate.in_value = std::move(value);
+        predicate.subquery = std::move(subquery);
+        predicate.operator_position = position;
+        return predicate;
+    }
+
+    static PredicateExpr exists_expr(PredicateKind kind,
+                                     std::shared_ptr<SelectQuery> subquery,
+                                     std::size_t position) {
+        PredicateExpr predicate;
+        predicate.kind = kind;
+        predicate.subquery = std::move(subquery);
+        predicate.operator_position = position;
+        return predicate;
+    }
 };
 
 struct WhereClause {
@@ -108,6 +139,8 @@ struct HavingPredicateExpr {
     PredicateKind kind{PredicateKind::Comparison};
     HavingComparisonExpr comparison;
     HavingExpr null_check;
+    HavingExpr in_value;
+    std::shared_ptr<SelectQuery> subquery;
     std::shared_ptr<HavingPredicateExpr> left;
     std::shared_ptr<HavingPredicateExpr> right;
     std::size_t operator_position{0};
@@ -136,6 +169,28 @@ struct HavingPredicateExpr {
         predicate.kind = kind;
         predicate.left = std::make_shared<HavingPredicateExpr>(std::move(left));
         predicate.right = std::make_shared<HavingPredicateExpr>(std::move(right));
+        predicate.operator_position = position;
+        return predicate;
+    }
+
+    static HavingPredicateExpr in_expr(PredicateKind kind,
+                                       HavingExpr value,
+                                       std::shared_ptr<SelectQuery> subquery,
+                                       std::size_t position) {
+        HavingPredicateExpr predicate;
+        predicate.kind = kind;
+        predicate.in_value = std::move(value);
+        predicate.subquery = std::move(subquery);
+        predicate.operator_position = position;
+        return predicate;
+    }
+
+    static HavingPredicateExpr exists_expr(PredicateKind kind,
+                                           std::shared_ptr<SelectQuery> subquery,
+                                           std::size_t position) {
+        HavingPredicateExpr predicate;
+        predicate.kind = kind;
+        predicate.subquery = std::move(subquery);
         predicate.operator_position = position;
         return predicate;
     }
@@ -199,7 +254,10 @@ inline std::size_t expression_position(const ScalarExpr& expression) {
     if (const auto* literal = std::get_if<StringLiteral>(&expression)) {
         return literal->position;
     }
-    return std::get<NullLiteral>(expression).position;
+    if (const auto* literal = std::get_if<NullLiteral>(&expression)) {
+        return literal->position;
+    }
+    return std::get<ScalarSubquery>(expression).position;
 }
 
 inline std::size_t expression_position(const SelectExpr& expression) {
@@ -221,6 +279,9 @@ inline std::size_t expression_position(const HavingExpr& expression) {
     }
     if (const auto* literal = std::get_if<NullLiteral>(&expression)) {
         return literal->position;
+    }
+    if (const auto* subquery = std::get_if<ScalarSubquery>(&expression)) {
+        return subquery->position;
     }
     return std::get<AggregateCall>(expression).position;
 }
@@ -271,7 +332,10 @@ inline std::string output_name(const ScalarExpr& expression) {
     if (const auto* literal = std::get_if<StringLiteral>(&expression)) {
         return quote_string_literal(literal->value);
     }
-    return "NULL";
+    if (std::holds_alternative<NullLiteral>(expression)) {
+        return "NULL";
+    }
+    return "(subquery)";
 }
 
 inline std::string output_name(const ColumnRef& column) {
@@ -313,6 +377,9 @@ inline std::string output_name(const HavingExpr& expression) {
     }
     if (std::holds_alternative<NullLiteral>(expression)) {
         return "NULL";
+    }
+    if (std::holds_alternative<ScalarSubquery>(expression)) {
+        return "(subquery)";
     }
     return output_name(std::get<AggregateCall>(expression));
 }
