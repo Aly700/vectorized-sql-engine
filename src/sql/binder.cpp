@@ -20,23 +20,17 @@ struct TableScope {
     std::string physical_table;
     std::size_t position{0};
     catalog::TableSchema schema;
+    std::size_t outer_depth{0};
 };
 
 plan::LogicalPlan bind_select_impl(const SelectQuery& query,
                                    const catalog::Catalog& catalog,
-                                   bool inside_subquery);
-
-std::string column_reference_name(const ColumnRef& column) {
-    return column.qualifier.has_value() ? *column.qualifier + "." + column.name : column.name;
-}
+                                   const std::vector<TableScope>& outer_scopes);
 
 [[noreturn]] void throw_unresolved_column(const ColumnRef& column,
                                           const std::vector<TableScope>& scopes,
                                           bool inside_subquery) {
-    if (inside_subquery) {
-        throw BindError(column.position,
-                        "correlated subqueries are unsupported: '" + column_reference_name(column) + "'");
-    }
+    (void)inside_subquery;
     if (column.qualifier.has_value()) {
         throw BindError(column.position, "unknown table qualifier '" + *column.qualifier + "'");
     }
@@ -69,10 +63,12 @@ void add_scope(std::vector<TableScope>& scopes,
     if (!inserted) {
         throw BindError(binding_position, "duplicate table binding '" + binding + "' requires a unique alias");
     }
-    scopes.push_back(TableScope{binding, table_name, position, std::move(schema)});
+    scopes.push_back(TableScope{binding, table_name, position, std::move(schema), 0});
 }
 
-std::vector<TableScope> build_scopes(const SelectQuery& query, const catalog::Catalog& catalog) {
+std::vector<TableScope> build_scopes(const SelectQuery& query,
+                                     const catalog::Catalog& catalog,
+                                     const std::vector<TableScope>& outer_scopes) {
     std::vector<TableScope> scopes;
     scopes.reserve(1 + query.joins.size());
     std::set<std::string> seen_bindings;
@@ -80,6 +76,7 @@ std::vector<TableScope> build_scopes(const SelectQuery& query, const catalog::Ca
     for (const auto& join : query.joins) {
         add_scope(scopes, seen_bindings, join.table, join.table_position, join.alias, join.alias_position, catalog);
     }
+    scopes.insert(scopes.end(), outer_scopes.begin(), outer_scopes.end());
     return scopes;
 }
 
@@ -100,9 +97,6 @@ const TableScope& find_qualified_scope(const ColumnRef& column,
     for (const auto& scope : scopes) {
         if (scope.binding_name == *column.qualifier) {
             if (!scope.schema.has_column(column.name)) {
-                if (inside_subquery) {
-                    throw_unresolved_column(column, scopes, true);
-                }
                 throw BindError(column.position,
                                 "unknown column '" + column.name + "' in table '" + scope.binding_name + "'");
             }
@@ -117,8 +111,13 @@ const TableScope& find_unqualified_scope(const ColumnRef& column,
                                          bool inside_subquery) {
     std::vector<const TableScope*> matches;
     std::vector<std::string> match_names;
+    std::optional<std::size_t> matched_depth;
     for (const auto& scope : scopes) {
+        if (matched_depth.has_value() && scope.outer_depth != *matched_depth) {
+            break;
+        }
         if (scope.schema.has_column(column.name)) {
+            matched_depth = scope.outer_depth;
             matches.push_back(&scope);
             match_names.push_back(scope.binding_name);
         }
@@ -150,7 +149,8 @@ plan::BoundColumnRef bind_column_ref(const ColumnRef& column,
                                      bool inside_subquery) {
     const auto& scope = column.qualifier.has_value() ? find_qualified_scope(column, scopes, inside_subquery)
                                                      : find_unqualified_scope(column, scopes, inside_subquery);
-    return plan::BoundColumnRef{scope.binding_name, column.name, column.position, column_type_in_scope(scope, column)};
+    return plan::BoundColumnRef{
+        scope.binding_name, column.name, column.position, column_type_in_scope(scope, column), scope.outer_depth};
 }
 
 const std::vector<plan::Projection>& output_projections(const plan::LogicalPlan& logical) {
@@ -175,12 +175,22 @@ const std::vector<plan::Projection>& output_projections(const plan::LogicalPlan&
     throw std::logic_error("bound subquery is missing its final projection");
 }
 
+std::vector<TableScope> child_outer_scopes(const std::vector<TableScope>& visible_scopes) {
+    auto outer = visible_scopes;
+    for (auto& scope : outer) {
+        ++scope.outer_depth;
+    }
+    return outer;
+}
+
 std::shared_ptr<const plan::LogicalPlan> bind_subquery(const ScalarSubquery& subquery,
-                                                      const catalog::Catalog& catalog) {
+                                                      const catalog::Catalog& catalog,
+                                                      const std::vector<TableScope>& visible_scopes) {
     if (subquery.query == nullptr) {
         throw std::logic_error("parsed scalar subquery is missing its SELECT query");
     }
-    return std::make_shared<const plan::LogicalPlan>(bind_select_impl(*subquery.query, catalog, true));
+    return std::make_shared<const plan::LogicalPlan>(
+        bind_select_impl(*subquery.query, catalog, child_outer_scopes(visible_scopes)));
 }
 
 plan::BoundScalarExpr bind_expression(const ScalarExpr& expression,
@@ -201,7 +211,7 @@ plan::BoundScalarExpr bind_expression(const ScalarExpr& expression,
         return plan::BoundScalarExpr{*literal, catalog::ColumnType::Int64};
     }
     const auto& subquery = std::get<ScalarSubquery>(expression);
-    auto bound_plan = bind_subquery(subquery, catalog);
+    auto bound_plan = bind_subquery(subquery, catalog, scopes);
     const auto& projections = output_projections(*bound_plan);
     if (projections.size() != 1) {
         throw BindError(subquery.position,
@@ -278,7 +288,7 @@ plan::BoundPredicate bind_predicate(const PredicateExpr& predicate,
         }
         auto value = bind_expression(predicate.in_value, scopes, catalog, inside_subquery);
         const auto parsed_subquery = ScalarSubquery{predicate.subquery, predicate.operator_position};
-        auto subplan = bind_subquery(parsed_subquery, catalog);
+        auto subplan = bind_subquery(parsed_subquery, catalog, scopes);
         const auto& projections = output_projections(*subplan);
         if (projections.size() != 1) {
             throw BindError(predicate.operator_position,
@@ -305,7 +315,8 @@ plan::BoundPredicate bind_predicate(const PredicateExpr& predicate,
         if (predicate.subquery == nullptr) {
             throw std::logic_error("parsed EXISTS predicate is missing its subquery");
         }
-        auto subplan = bind_subquery(ScalarSubquery{predicate.subquery, predicate.operator_position}, catalog);
+        auto subplan =
+            bind_subquery(ScalarSubquery{predicate.subquery, predicate.operator_position}, catalog, scopes);
         return plan::BoundPredicate::exists_expr(
             predicate.kind,
             std::move(subplan),
@@ -486,7 +497,7 @@ plan::BoundScalarExpr bind_having_expression(const HavingExpr& expression,
                                              bool inside_subquery) {
     if (const auto* column = std::get_if<ColumnRef>(&expression)) {
         auto bound = bind_column_ref(*column, scopes, inside_subquery);
-        if (!contains_group_key(group_keys, bound)) {
+        if (bound.outer_depth == 0 && !contains_group_key(group_keys, bound)) {
             throw BindError(column->position,
                             "HAVING column '" + output_name(*column) +
                                 "' must be a GROUP BY column or aggregate expression");
@@ -503,7 +514,7 @@ plan::BoundScalarExpr bind_having_expression(const HavingExpr& expression,
         return plan::BoundScalarExpr{*literal, catalog::ColumnType::Int64};
     }
     if (const auto* subquery = std::get_if<ScalarSubquery>(&expression)) {
-        auto bound_plan = bind_subquery(*subquery, catalog);
+        auto bound_plan = bind_subquery(*subquery, catalog, scopes);
         const auto& projections = output_projections(*bound_plan);
         if (projections.size() != 1) {
             throw BindError(subquery->position,
@@ -566,7 +577,8 @@ plan::BoundPredicate bind_having_predicate(const HavingPredicateExpr& predicate,
         }
         auto value = bind_having_expression(
             predicate.in_value, scopes, group_keys, aggregate_expressions, catalog, inside_subquery);
-        auto subplan = bind_subquery(ScalarSubquery{predicate.subquery, predicate.operator_position}, catalog);
+        auto subplan =
+            bind_subquery(ScalarSubquery{predicate.subquery, predicate.operator_position}, catalog, scopes);
         const auto& projections = output_projections(*subplan);
         if (projections.size() != 1) {
             throw BindError(predicate.operator_position,
@@ -595,7 +607,7 @@ plan::BoundPredicate bind_having_predicate(const HavingPredicateExpr& predicate,
         }
         return plan::BoundPredicate::exists_expr(
             predicate.kind,
-            bind_subquery(ScalarSubquery{predicate.subquery, predicate.operator_position}, catalog),
+            bind_subquery(ScalarSubquery{predicate.subquery, predicate.operator_position}, catalog, scopes),
             predicate.operator_position,
             "EXISTS subquery at position " + std::to_string(predicate.operator_position));
     case PredicateKind::And:
@@ -678,6 +690,120 @@ std::vector<plan::SortKey> bind_order_by_keys(const std::vector<OrderByKey>& key
     return bound;
 }
 
+bool same_correlation(const plan::BoundColumnRef& left, const plan::BoundColumnRef& right) {
+    return left.binding == right.binding && left.column == right.column && left.type == right.type &&
+           left.outer_depth == right.outer_depth;
+}
+
+void add_correlation(std::vector<plan::BoundColumnRef>& correlations, plan::BoundColumnRef column) {
+    if (column.outer_depth == 0) {
+        return;
+    }
+    if (std::none_of(correlations.begin(), correlations.end(), [&](const auto& existing) {
+            return same_correlation(existing, column);
+        })) {
+        correlations.push_back(std::move(column));
+    }
+}
+
+void collect_scalar_correlations(const plan::BoundScalarExpr& expression,
+                                 std::vector<plan::BoundColumnRef>& correlations);
+
+void collect_nested_subplan_correlations(const std::shared_ptr<const plan::LogicalPlan>& subplan,
+                                         std::vector<plan::BoundColumnRef>& correlations) {
+    if (subplan == nullptr) {
+        throw std::logic_error("bound subquery is missing its logical plan");
+    }
+    for (auto column : subplan->correlation_columns) {
+        // A depth-one dependency is satisfied by this query block's current
+        // row. Deeper dependencies remain correlations of this owner after
+        // rebasing one lexical level.
+        if (column.outer_depth > 1) {
+            --column.outer_depth;
+            add_correlation(correlations, std::move(column));
+        }
+    }
+}
+
+void collect_scalar_correlations(const plan::BoundScalarExpr& expression,
+                                 std::vector<plan::BoundColumnRef>& correlations) {
+    if (const auto* column = std::get_if<plan::BoundColumnRef>(&expression.value)) {
+        add_correlation(correlations, *column);
+        return;
+    }
+    if (const auto* subquery = std::get_if<plan::BoundScalarSubquery>(&expression.value)) {
+        collect_nested_subplan_correlations(subquery->plan, correlations);
+    }
+}
+
+void collect_predicate_correlations(const plan::BoundPredicate& predicate,
+                                    std::vector<plan::BoundColumnRef>& correlations) {
+    switch (predicate.kind) {
+    case PredicateKind::Comparison:
+        collect_scalar_correlations(predicate.comparison.left, correlations);
+        collect_scalar_correlations(predicate.comparison.right, correlations);
+        return;
+    case PredicateKind::IsNull:
+    case PredicateKind::IsNotNull:
+        collect_scalar_correlations(predicate.null_check, correlations);
+        return;
+    case PredicateKind::In:
+    case PredicateKind::NotIn:
+        collect_scalar_correlations(predicate.in_value, correlations);
+        collect_nested_subplan_correlations(predicate.subquery, correlations);
+        return;
+    case PredicateKind::Exists:
+    case PredicateKind::NotExists:
+        collect_nested_subplan_correlations(predicate.subquery, correlations);
+        return;
+    case PredicateKind::And:
+    case PredicateKind::Or:
+        if (predicate.left == nullptr || predicate.right == nullptr) {
+            throw std::logic_error("bound predicate is missing a child");
+        }
+        collect_predicate_correlations(*predicate.left, correlations);
+        collect_predicate_correlations(*predicate.right, correlations);
+        return;
+    }
+    throw std::logic_error("unreachable predicate kind");
+}
+
+void collect_plan_correlations(const plan::LogicalPlan& logical,
+                               std::vector<plan::BoundColumnRef>& correlations) {
+    for (const auto& projection : logical.projections) {
+        collect_scalar_correlations(projection.expression, correlations);
+    }
+    for (const auto& key : logical.group_keys) {
+        add_correlation(correlations, key);
+    }
+    for (const auto& aggregate : logical.aggregate_expressions) {
+        if (aggregate.argument.has_value()) {
+            add_correlation(correlations, *aggregate.argument);
+        }
+    }
+    for (const auto& key : logical.sort_keys) {
+        add_correlation(correlations, key.column);
+    }
+    for (const auto& predicate : logical.predicates) {
+        collect_predicate_correlations(predicate, correlations);
+    }
+    if (logical.input != nullptr) {
+        collect_plan_correlations(*logical.input, correlations);
+    }
+    if (logical.left != nullptr) {
+        collect_plan_correlations(*logical.left, correlations);
+    }
+    if (logical.right != nullptr) {
+        collect_plan_correlations(*logical.right, correlations);
+    }
+}
+
+std::vector<plan::BoundColumnRef> correlation_set(const plan::LogicalPlan& logical) {
+    std::vector<plan::BoundColumnRef> correlations;
+    collect_plan_correlations(logical, correlations);
+    return correlations;
+}
+
 void mark_arbitrary_order(plan::LogicalPlan& logical) {
     logical.order_permission = plan::OrderPermission::Arbitrary;
     if (logical.input != nullptr) {
@@ -704,8 +830,9 @@ plan::JoinKind bound_join_kind(JoinKind parsed) {
 
 plan::LogicalPlan bind_select_impl(const SelectQuery& query,
                                    const catalog::Catalog& catalog,
-                                   bool inside_subquery) {
-    const auto scopes = build_scopes(query, catalog);
+                                   const std::vector<TableScope>& outer_scopes) {
+    const auto scopes = build_scopes(query, catalog, outer_scopes);
+    const auto inside_subquery = !outer_scopes.empty();
     auto group_keys = bind_group_by_keys(query.group_by, scopes, inside_subquery);
     const auto aggregate_query = !group_keys.empty() || query_has_aggregate(query) || query.having.has_value();
 
@@ -738,7 +865,7 @@ plan::LogicalPlan bind_select_impl(const SelectQuery& query,
         auto expression = bind_expression(scalar, scopes, catalog, inside_subquery);
         if (aggregate_query) {
             if (const auto* column = std::get_if<plan::BoundColumnRef>(&expression.value);
-                column != nullptr && !contains_group_key(group_keys, *column)) {
+                column != nullptr && column->outer_depth == 0 && !contains_group_key(group_keys, *column)) {
                 const auto& parsed_column = std::get<ColumnRef>(scalar);
                 throw BindError(parsed_column.position,
                                 "non-grouped column '" + output_name(parsed_column) +
@@ -772,8 +899,10 @@ plan::LogicalPlan bind_select_impl(const SelectQuery& query,
     visible_scopes.push_back(scopes.front());
     for (std::size_t i = 0; i < query.joins.size(); ++i) {
         visible_scopes.push_back(scopes.at(i + 1));
-        auto predicates =
-            bind_predicates(query.joins[i].predicates, visible_scopes, catalog, inside_subquery);
+        auto predicate_scopes = visible_scopes;
+        predicate_scopes.insert(predicate_scopes.end(), outer_scopes.begin(), outer_scopes.end());
+        auto predicates = bind_predicates(
+            query.joins[i].predicates, predicate_scopes, catalog, inside_subquery);
         auto right_scan = plan::LogicalPlan::scan(query.joins[i].table, binding_name(query.joins[i]));
         if (query.joins[i].kind == JoinKind::Right) {
             plan = plan::LogicalPlan::join(std::move(predicates),
@@ -810,6 +939,7 @@ plan::LogicalPlan bind_select_impl(const SelectQuery& query,
         bound = plan::LogicalPlan::limit(*query.limit, std::move(bound));
         bound.order_permission = bound.input->order_permission;
     }
+    bound.correlation_columns = correlation_set(bound);
     if (query.explain) {
         return plan::LogicalPlan::explain(std::move(bound));
     }
@@ -819,7 +949,7 @@ plan::LogicalPlan bind_select_impl(const SelectQuery& query,
 } // namespace
 
 plan::LogicalPlan bind_select(const SelectQuery& query, const catalog::Catalog& catalog) {
-    return bind_select_impl(query, catalog, false);
+    return bind_select_impl(query, catalog, {});
 }
 
 } // namespace sql

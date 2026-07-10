@@ -102,7 +102,14 @@ enum class TruthValue { False, True, Unknown };
 
 struct ExecutionContext {
     const Catalog& catalog;
-    std::map<const plan::LogicalPlan*, storage::ColumnarBatch> subquery_results;
+    struct OuterRowFrame {
+        const storage::ColumnarBatch* left{nullptr};
+        std::size_t left_row{0};
+        const storage::ColumnarBatch* right{nullptr};
+        std::size_t right_row{0};
+    };
+    std::map<const plan::LogicalPlan*, std::shared_ptr<const storage::ColumnarBatch>> subquery_results;
+    std::vector<OuterRowFrame> outer_rows;
 };
 
 storage::ColumnarBatch execute_node(const plan::LogicalPlan& plan, ExecutionContext& context);
@@ -153,46 +160,90 @@ Cell cell_at(const storage::ColumnarBatch& batch, const std::string& name, std::
     return string_cell(column.at(row));
 }
 
-const storage::ColumnarBatch& materialize_subquery(const std::shared_ptr<const plan::LogicalPlan>& subquery,
-                                                  ExecutionContext& context) {
+Cell outer_cell_at(const plan::BoundColumnRef& column, const ExecutionContext& context) {
+    if (column.outer_depth == 0 || column.outer_depth > context.outer_rows.size()) {
+        throw std::logic_error("outer column depth is not available: " + column_identity_name(column));
+    }
+    const auto& frame = context.outer_rows.at(context.outer_rows.size() - column.outer_depth);
+    const auto name = column_identity_name(column);
+    if (frame.left != nullptr && frame.left->has_column(name)) {
+        return cell_at(*frame.left, name, frame.left_row);
+    }
+    if (frame.right != nullptr && frame.right->has_column(name)) {
+        return cell_at(*frame.right, name, frame.right_row);
+    }
+    throw std::logic_error("outer column identity is missing from its row frame: " + name);
+}
+
+class OuterRowGuard {
+public:
+    OuterRowGuard(ExecutionContext& context, ExecutionContext::OuterRowFrame frame) : context_(context) {
+        context_.outer_rows.push_back(frame);
+    }
+    ~OuterRowGuard() { context_.outer_rows.pop_back(); }
+
+    OuterRowGuard(const OuterRowGuard&) = delete;
+    OuterRowGuard& operator=(const OuterRowGuard&) = delete;
+
+private:
+    ExecutionContext& context_;
+};
+
+std::shared_ptr<const storage::ColumnarBatch> materialize_subquery(
+    const std::shared_ptr<const plan::LogicalPlan>& subquery,
+    ExecutionContext& context,
+    std::optional<ExecutionContext::OuterRowFrame> outer_row = std::nullopt) {
     if (subquery == nullptr) {
         throw std::invalid_argument("bound subquery is missing its logical plan");
     }
     if (const auto existing = context.subquery_results.find(subquery.get());
-        existing != context.subquery_results.end()) {
+        subquery->correlation_columns.empty() && existing != context.subquery_results.end()) {
         return existing->second;
     }
 
-    // Phase 21a subplans are uncorrelated and immutable. Prepare their nested
-    // subqueries first, then execute this plan exactly once for the top-level
-    // query and retain the materialized batch for every outer row.
+    if (!subquery->correlation_columns.empty()) {
+        if (!outer_row.has_value()) {
+            throw std::logic_error("correlated subquery requires an outer row");
+        }
+        OuterRowGuard guard(context, *outer_row);
+        prepare_subqueries(*subquery, context);
+        return std::make_shared<const storage::ColumnarBatch>(execute_node(*subquery, context));
+    }
+
+    // Empty correlation is the exact Phase 21a path: recursively prepare and
+    // execute this immutable subplan once, then reuse it for every owner row.
     prepare_subqueries(*subquery, context);
     auto result = execute_node(*subquery, context);
-    const auto [inserted, _] = context.subquery_results.emplace(subquery.get(), std::move(result));
+    const auto [inserted, _] = context.subquery_results.emplace(
+        subquery.get(), std::make_shared<const storage::ColumnarBatch>(std::move(result)));
     return inserted->second;
 }
 
 Cell evaluate_scalar_subquery(const plan::BoundScalarSubquery& subquery,
                               catalog::ColumnType type,
-                              ExecutionContext& context) {
-    const auto& result = materialize_subquery(subquery.plan, context);
-    if (result.row_count() == 0) {
+                              ExecutionContext& context,
+                              ExecutionContext::OuterRowFrame outer_row) {
+    const auto materialized = materialize_subquery(subquery.plan, context, outer_row);
+    if (materialized->row_count() == 0) {
         return null_cell(type);
     }
-    if (result.row_count() > 1) {
+    if (materialized->row_count() > 1) {
         throw std::runtime_error(subquery.name + " returned more than one row");
     }
-    if (result.column_names().size() != 1) {
+    if (materialized->column_names().size() != 1) {
         throw std::logic_error("bound scalar subquery did not produce exactly one output column");
     }
-    return cell_at(result, result.column_names().front(), 0);
+    return cell_at(*materialized, materialized->column_names().front(), 0);
 }
 
 Cell evaluate_scalar(const plan::BoundScalarExpr& expression,
                      const storage::ColumnarBatch& batch,
                      std::size_t row,
-                     ExecutionContext& context) {
+    ExecutionContext& context) {
     if (const auto* column = std::get_if<plan::BoundColumnRef>(&expression.value)) {
+        if (column->outer_depth != 0) {
+            return outer_cell_at(*column, context);
+        }
         return cell_at(batch, column_identity_name(*column), row);
     }
     if (const auto* literal = std::get_if<sql::IntLiteral>(&expression.value)) {
@@ -205,7 +256,8 @@ Cell evaluate_scalar(const plan::BoundScalarExpr& expression,
         return null_cell(expression.type);
     }
     const auto& subquery = std::get<plan::BoundScalarSubquery>(expression.value);
-    const auto value = evaluate_scalar_subquery(subquery, expression.type, context);
+    const auto value = evaluate_scalar_subquery(
+        subquery, expression.type, context, ExecutionContext::OuterRowFrame{&batch, row, nullptr, 0});
     return value.is_null ? null_cell(expression.type) : value;
 }
 
@@ -272,12 +324,13 @@ TruthValue evaluate_comparison(const plan::BoundComparisonExpr& comparison,
 
 TruthValue evaluate_in(const Cell& value,
                        const plan::BoundPredicate& predicate,
-                       ExecutionContext& context) {
-    const auto& result = materialize_subquery(predicate.subquery, context);
-    if (result.row_count() == 0) {
+                       ExecutionContext& context,
+                       ExecutionContext::OuterRowFrame outer_row) {
+    const auto result = materialize_subquery(predicate.subquery, context, outer_row);
+    if (result->row_count() == 0) {
         return TruthValue::False;
     }
-    if (result.column_names().size() != 1) {
+    if (result->column_names().size() != 1) {
         throw std::logic_error("bound IN subquery did not produce exactly one output column");
     }
     if (value.is_null) {
@@ -285,9 +338,9 @@ TruthValue evaluate_in(const Cell& value,
     }
 
     bool contains_null = false;
-    const auto& column = result.column_names().front();
-    for (std::size_t row = 0; row < result.row_count(); ++row) {
-        const auto member = cell_at(result, column, row);
+    const auto& column = result->column_names().front();
+    for (std::size_t row = 0; row < result->row_count(); ++row) {
+        const auto member = cell_at(*result, column, row);
         if (member.is_null) {
             contains_null = true;
             continue;
@@ -326,12 +379,17 @@ TruthValue evaluate_predicate(const plan::BoundPredicate& predicate,
         return truth_from_bool(!evaluate_scalar(predicate.null_check, batch, row, context).is_null);
     case sql::PredicateKind::In:
     case sql::PredicateKind::NotIn: {
-        const auto result = evaluate_in(evaluate_scalar(predicate.in_value, batch, row, context), predicate, context);
+        const auto result = evaluate_in(evaluate_scalar(predicate.in_value, batch, row, context),
+                                        predicate,
+                                        context,
+                                        ExecutionContext::OuterRowFrame{&batch, row, nullptr, 0});
         return predicate.kind == sql::PredicateKind::NotIn ? not_truth(result) : result;
     }
     case sql::PredicateKind::Exists:
     case sql::PredicateKind::NotExists: {
-        const auto exists = truth_from_bool(materialize_subquery(predicate.subquery, context).row_count() != 0);
+        const auto result = materialize_subquery(
+            predicate.subquery, context, ExecutionContext::OuterRowFrame{&batch, row, nullptr, 0});
+        const auto exists = truth_from_bool(result->row_count() != 0);
         return predicate.kind == sql::PredicateKind::NotExists ? not_truth(exists) : exists;
     }
     case sql::PredicateKind::And: {
@@ -397,7 +455,8 @@ OutputColumn evaluate_projection(const plan::Projection& projection,
 }
 
 std::vector<std::size_t> stable_sorted_rows(const std::vector<plan::SortKey>& sort_keys,
-                                            const storage::ColumnarBatch& batch) {
+                                            const storage::ColumnarBatch& batch,
+                                            ExecutionContext& context) {
     std::vector<std::size_t> rows;
     rows.reserve(batch.row_count());
     for (std::size_t row = 0; row < batch.row_count(); ++row) {
@@ -407,8 +466,10 @@ std::vector<std::size_t> stable_sorted_rows(const std::vector<plan::SortKey>& so
     std::stable_sort(rows.begin(), rows.end(), [&](std::size_t left, std::size_t right) {
         for (const auto& key : sort_keys) {
             const auto name = column_identity_name(key.column);
-            const auto left_value = cell_at(batch, name, left);
-            const auto right_value = cell_at(batch, name, right);
+            const auto left_value = key.column.outer_depth == 0 ? cell_at(batch, name, left)
+                                                                : outer_cell_at(key.column, context);
+            const auto right_value = key.column.outer_depth == 0 ? cell_at(batch, name, right)
+                                                                 : outer_cell_at(key.column, context);
             if (left_value == right_value) {
                 continue;
             }
@@ -478,6 +539,9 @@ void add_missing_sort_key_columns(storage::ColumnarBatch& sort_input,
                                   const storage::ColumnarBatch& source,
                                   const std::vector<plan::SortKey>& sort_keys) {
     for (const auto& key : sort_keys) {
+        if (key.column.outer_depth != 0) {
+            continue;
+        }
         const auto name = column_identity_name(key.column);
         if (sort_input.has_column(name)) {
             continue;
@@ -537,9 +601,13 @@ std::int64_t checked_sum(std::int64_t left, std::int64_t right, const std::strin
 
 Cell aggregate_argument_value(const plan::AggregateExpression& aggregate,
                               const storage::ColumnarBatch& batch,
-                              std::size_t row) {
+                              std::size_t row,
+                              ExecutionContext& context) {
     if (!aggregate.argument.has_value()) {
         throw std::logic_error("aggregate argument is missing");
+    }
+    if (aggregate.argument->outer_depth != 0) {
+        return outer_cell_at(*aggregate.argument, context);
     }
     return cell_at(batch, column_identity_name(*aggregate.argument), row);
 }
@@ -547,18 +615,19 @@ Cell aggregate_argument_value(const plan::AggregateExpression& aggregate,
 void update_aggregate(AggregateValue& value,
                       const plan::AggregateExpression& aggregate,
                       const storage::ColumnarBatch& batch,
-                      std::size_t row) {
+                      std::size_t row,
+                      ExecutionContext& context) {
     switch (aggregate.function) {
     case sql::AggregateFunction::Count:
         if (aggregate.argument.has_value()) {
-            if (aggregate_argument_value(aggregate, batch, row).is_null) {
+            if (aggregate_argument_value(aggregate, batch, row, context).is_null) {
                 return;
             }
         }
         increment_count(value, aggregate.output_name);
         return;
     case sql::AggregateFunction::Sum: {
-        const auto argument = aggregate_argument_value(aggregate, batch, row);
+        const auto argument = aggregate_argument_value(aggregate, batch, row, context);
         if (argument.is_null) {
             return;
         }
@@ -571,7 +640,7 @@ void update_aggregate(AggregateValue& value,
         return;
     }
     case sql::AggregateFunction::Min: {
-        const auto argument = aggregate_argument_value(aggregate, batch, row);
+        const auto argument = aggregate_argument_value(aggregate, batch, row, context);
         if (argument.is_null) {
             return;
         }
@@ -582,7 +651,7 @@ void update_aggregate(AggregateValue& value,
         return;
     }
     case sql::AggregateFunction::Max: {
-        const auto argument = aggregate_argument_value(aggregate, batch, row);
+        const auto argument = aggregate_argument_value(aggregate, batch, row, context);
         if (argument.is_null) {
             return;
         }
@@ -621,11 +690,13 @@ Cell finalize_aggregate(const AggregateValue& value, const plan::AggregateExpres
 
 std::vector<Cell> group_key_values(const std::vector<plan::BoundColumnRef>& group_keys,
                                    const storage::ColumnarBatch& batch,
-                                   std::size_t row) {
+                                   std::size_t row,
+                                   ExecutionContext& context) {
     std::vector<Cell> values;
     values.reserve(group_keys.size());
     for (const auto& key : group_keys) {
-        values.push_back(cell_at(batch, column_identity_name(key), row));
+        values.push_back(key.outer_depth == 0 ? cell_at(batch, column_identity_name(key), row)
+                                              : outer_cell_at(key, context));
     }
     return values;
 }
@@ -642,8 +713,11 @@ void prepare_scalar_subquery(const plan::BoundScalarExpr& expression, ExecutionC
     if (subquery == nullptr) {
         return;
     }
-    const auto& result = materialize_subquery(subquery->plan, context);
-    if (result.row_count() > 1) {
+    if (!subquery->plan->correlation_columns.empty()) {
+        return;
+    }
+    const auto result = materialize_subquery(subquery->plan, context);
+    if (result->row_count() > 1) {
         throw std::runtime_error(subquery->name + " returned more than one row");
     }
 }
@@ -661,11 +735,15 @@ void prepare_predicate_subqueries(const plan::BoundPredicate& predicate, Executi
     case sql::PredicateKind::In:
     case sql::PredicateKind::NotIn:
         prepare_scalar_subquery(predicate.in_value, context);
-        (void)materialize_subquery(predicate.subquery, context);
+        if (predicate.subquery->correlation_columns.empty()) {
+            (void)materialize_subquery(predicate.subquery, context);
+        }
         return;
     case sql::PredicateKind::Exists:
     case sql::PredicateKind::NotExists:
-        (void)materialize_subquery(predicate.subquery, context);
+        if (predicate.subquery->correlation_columns.empty()) {
+            (void)materialize_subquery(predicate.subquery, context);
+        }
         return;
     case sql::PredicateKind::And:
     case sql::PredicateKind::Or:
@@ -714,6 +792,9 @@ Cell evaluate_join_scalar(const plan::BoundScalarExpr& expression,
                           std::size_t right_row,
                           ExecutionContext& context) {
     if (const auto* column = std::get_if<plan::BoundColumnRef>(&expression.value)) {
+        if (column->outer_depth != 0) {
+            return outer_cell_at(*column, context);
+        }
         const auto name = column_identity_name(*column);
         if (left.has_column(name)) {
             return cell_at(left, name, left_row);
@@ -733,7 +814,10 @@ Cell evaluate_join_scalar(const plan::BoundScalarExpr& expression,
         return null_cell(expression.type);
     }
     return evaluate_scalar_subquery(
-        std::get<plan::BoundScalarSubquery>(expression.value), expression.type, context);
+        std::get<plan::BoundScalarSubquery>(expression.value),
+        expression.type,
+        context,
+        ExecutionContext::OuterRowFrame{&left, left_row, &right, right_row});
 }
 
 TruthValue evaluate_join_comparison(const plan::BoundComparisonExpr& comparison,
@@ -768,12 +852,15 @@ TruthValue evaluate_join_predicate(const plan::BoundPredicate& predicate,
     case sql::PredicateKind::In:
     case sql::PredicateKind::NotIn: {
         const auto value = evaluate_join_scalar(predicate.in_value, left, left_row, right, right_row, context);
-        const auto result = evaluate_in(value, predicate, context);
+        const auto result = evaluate_in(
+            value, predicate, context, ExecutionContext::OuterRowFrame{&left, left_row, &right, right_row});
         return predicate.kind == sql::PredicateKind::NotIn ? not_truth(result) : result;
     }
     case sql::PredicateKind::Exists:
     case sql::PredicateKind::NotExists: {
-        const auto exists = truth_from_bool(materialize_subquery(predicate.subquery, context).row_count() != 0);
+        const auto result = materialize_subquery(
+            predicate.subquery, context, ExecutionContext::OuterRowFrame{&left, left_row, &right, right_row});
+        const auto exists = truth_from_bool(result->row_count() != 0);
         return predicate.kind == sql::PredicateKind::NotExists ? not_truth(exists) : exists;
     }
     case sql::PredicateKind::And: {
@@ -892,7 +979,7 @@ storage::ColumnarBatch execute_aggregate(const plan::LogicalPlan& plan, Executio
         if (!plan.group_keys.empty()) {
             // GROUP BY uses distinct-style key equality: NULL slots compare
             // equal here, while predicate and join equality still use SQL 3VL.
-            auto key = group_key_values(plan.group_keys, input, row);
+            auto key = group_key_values(plan.group_keys, input, row, context);
             const auto found = group_index_by_key.find(key);
             if (found == group_index_by_key.end()) {
                 group_index = groups.size();
@@ -905,7 +992,7 @@ storage::ColumnarBatch execute_aggregate(const plan::LogicalPlan& plan, Executio
 
         auto& group = groups.at(group_index);
         for (std::size_t i = 0; i < plan.aggregate_expressions.size(); ++i) {
-            update_aggregate(group.aggregates.at(i), plan.aggregate_expressions[i], input, row);
+            update_aggregate(group.aggregates.at(i), plan.aggregate_expressions[i], input, row, context);
         }
     }
 
@@ -936,12 +1023,12 @@ storage::ColumnarBatch execute_sort(const plan::LogicalPlan& plan, ExecutionCont
     if (input_plan.kind == plan::LogicalKind::Project) {
         const auto source = execute_node(require_input(input_plan), context);
         const auto sort_input = materialize_project_sort_input(input_plan, source, plan.sort_keys, context);
-        const auto rows = stable_sorted_rows(plan.sort_keys, sort_input);
+        const auto rows = stable_sorted_rows(plan.sort_keys, sort_input, context);
         return materialize_project_output_rows(input_plan, sort_input, rows);
     }
 
     auto input = execute_node(input_plan, context);
-    const auto rows = stable_sorted_rows(plan.sort_keys, input);
+    const auto rows = stable_sorted_rows(plan.sort_keys, input, context);
     return materialize_rows(input, rows);
 }
 
@@ -1037,7 +1124,7 @@ const storage::ColumnarBatch& Catalog::table(const std::string& name) const {
 }
 
 storage::ColumnarBatch execute_interpreted(const plan::LogicalPlan& plan, const Catalog& catalog) {
-    ExecutionContext context{catalog, {}};
+    ExecutionContext context{catalog, {}, {}};
     if (plan.kind != plan::LogicalKind::Explain) {
         prepare_subqueries(plan, context);
     }

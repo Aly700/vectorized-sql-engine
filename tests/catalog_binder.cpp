@@ -613,19 +613,78 @@ in_type:
     throw std::logic_error("expected IN subquery type bind error");
 }
 
-void assert_correlated_subquery_reference_is_never_misbound() {
+void assert_correlated_subquery_binds_outer_identity_and_records_correlation() {
     auto catalog = make_schema_catalog();
     const std::string query =
         "SELECT outer_t.a FROM t AS outer_t WHERE EXISTS "
         "(SELECT b FROM t1 WHERE t1.a = outer_t.a)";
+    const auto logical = sql::bind_select(sql::parse_select(query), catalog);
+    assert(logical.input != nullptr && logical.input->kind == plan::LogicalKind::Filter);
+    const auto& subquery = logical.input->predicates.at(0).subquery;
+    assert(subquery != nullptr);
+    assert(subquery->correlation_columns.size() == 1);
+    const auto& correlation = subquery->correlation_columns.front();
+    assert(correlation.binding == "outer_t");
+    assert(correlation.column == "a");
+    assert(correlation.outer_depth == 1);
+    const auto printed = plan::to_string(logical);
+    assert(printed.find("correlation=[outer(1):col(outer_t.a)]") != std::string::npos);
+}
+
+void assert_subquery_local_scope_shadows_same_named_outer_scope() {
+    auto catalog = make_schema_catalog();
+    const auto logical = sql::bind_select(
+        sql::parse_select("SELECT x.a FROM t AS x WHERE EXISTS (SELECT x.b FROM t1 AS x WHERE x.a = 1)"),
+        catalog);
+    const auto& subquery = logical.input->predicates.at(0).subquery;
+    assert(subquery != nullptr);
+    assert(subquery->correlation_columns.empty());
+}
+
+void assert_unqualified_subquery_reference_falls_back_to_outer_scope() {
+    auto catalog = make_schema_catalog();
+    const auto logical = sql::bind_select(
+        sql::parse_select("SELECT o.b FROM t AS o WHERE EXISTS (SELECT t2.c FROM t2 WHERE t2.c = b)"),
+        catalog);
+    const auto& subquery = logical.input->predicates.at(0).subquery;
+    assert(subquery != nullptr && subquery->correlation_columns.size() == 1);
+    assert(subquery->correlation_columns.front().binding == "o");
+    assert(subquery->correlation_columns.front().column == "b");
+    assert(subquery->correlation_columns.front().outer_depth == 1);
+}
+
+void assert_inner_level_ambiguity_does_not_fall_back_to_outer_scope() {
+    auto catalog = make_schema_catalog();
+    const std::string query =
+        "SELECT o.a FROM t AS o WHERE EXISTS "
+        "(SELECT x.b FROM t1 AS x JOIN t2 AS y ON x.a = y.a WHERE a = o.a)";
     try {
         (void)sql::bind_select(sql::parse_select(query), catalog);
     } catch (const sql::BindError& error) {
-        assert(error.position() == query.find("outer_t.a", query.find("SELECT b")));
-        assert(error.message() == "correlated subqueries are unsupported: 'outer_t.a'");
+        assert(error.message() == "ambiguous column 'a' matches tables 'x', 'y'");
         return;
     }
-    throw std::logic_error("expected correlated subquery bind error");
+    throw std::logic_error("expected innermost-level ambiguity bind error");
+}
+
+void assert_nested_subquery_records_grandparent_dependency() {
+    auto catalog = make_schema_catalog();
+    const auto logical = sql::bind_select(sql::parse_select(
+                                              "SELECT o.a FROM t AS o WHERE EXISTS "
+                                              "(SELECT m.b FROM t1 AS m WHERE EXISTS "
+                                              "(SELECT n.c FROM t2 AS n WHERE n.a = o.a))"),
+                                          catalog);
+    const auto& middle = logical.input->predicates.at(0).subquery;
+    assert(middle != nullptr);
+    assert(middle->correlation_columns.size() == 1);
+    assert(middle->correlation_columns.front().binding == "o");
+    assert(middle->correlation_columns.front().outer_depth == 1);
+    assert(middle->input != nullptr && middle->input->kind == plan::LogicalKind::Filter);
+    const auto& inner = middle->input->predicates.at(0).subquery;
+    assert(inner != nullptr);
+    assert(inner->correlation_columns.size() == 1);
+    assert(inner->correlation_columns.front().binding == "o");
+    assert(inner->correlation_columns.front().outer_depth == 2);
 }
 
 void assert_subquery_parse_errors_are_positioned() {
@@ -692,7 +751,11 @@ int main() {
     assert_uncorrelated_subquery_forms_bind_with_nested_full_selects();
     assert_scalar_and_in_subquery_width_rules_are_positioned();
     assert_subquery_type_mismatches_are_positioned();
-    assert_correlated_subquery_reference_is_never_misbound();
+    assert_correlated_subquery_binds_outer_identity_and_records_correlation();
+    assert_subquery_local_scope_shadows_same_named_outer_scope();
+    assert_unqualified_subquery_reference_falls_back_to_outer_scope();
+    assert_inner_level_ambiguity_does_not_fall_back_to_outer_scope();
+    assert_nested_subquery_records_grandparent_dependency();
     assert_subquery_parse_errors_are_positioned();
     return 0;
 }

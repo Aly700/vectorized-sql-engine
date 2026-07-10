@@ -182,6 +182,196 @@ const plan::Projection& single_subquery_output(const plan::LogicalPlan& subquery
     return node->projections.front();
 }
 
+bool scalar_references_outer_owner(const plan::BoundScalarExpr& expression) {
+    if (const auto* column = std::get_if<plan::BoundColumnRef>(&expression.value)) {
+        return column->outer_depth != 0;
+    }
+    if (const auto* subquery = std::get_if<plan::BoundScalarSubquery>(&expression.value)) {
+        if (subquery->plan == nullptr) {
+            throw std::logic_error("bound scalar subquery is missing its logical plan");
+        }
+        return std::any_of(subquery->plan->correlation_columns.begin(),
+                           subquery->plan->correlation_columns.end(),
+                           [](const auto& column) { return column.outer_depth > 1; });
+    }
+    return false;
+}
+
+bool predicate_references_outer_owner(const plan::BoundPredicate& predicate) {
+    switch (predicate.kind) {
+    case sql::PredicateKind::Comparison:
+        return scalar_references_outer_owner(predicate.comparison.left) ||
+               scalar_references_outer_owner(predicate.comparison.right);
+    case sql::PredicateKind::IsNull:
+    case sql::PredicateKind::IsNotNull:
+        return scalar_references_outer_owner(predicate.null_check);
+    case sql::PredicateKind::In:
+    case sql::PredicateKind::NotIn:
+        if (predicate.subquery == nullptr) {
+            throw std::logic_error("bound IN predicate is missing its subquery");
+        }
+        return scalar_references_outer_owner(predicate.in_value) ||
+               std::any_of(predicate.subquery->correlation_columns.begin(),
+                           predicate.subquery->correlation_columns.end(),
+                           [](const auto& column) { return column.outer_depth > 1; });
+    case sql::PredicateKind::Exists:
+    case sql::PredicateKind::NotExists:
+        if (predicate.subquery == nullptr) {
+            throw std::logic_error("bound EXISTS predicate is missing its subquery");
+        }
+        return std::any_of(predicate.subquery->correlation_columns.begin(),
+                           predicate.subquery->correlation_columns.end(),
+                           [](const auto& column) { return column.outer_depth > 1; });
+    case sql::PredicateKind::And:
+    case sql::PredicateKind::Or:
+        if (predicate.left == nullptr || predicate.right == nullptr) {
+            throw std::logic_error("bound predicate is missing a child");
+        }
+        return predicate_references_outer_owner(*predicate.left) ||
+               predicate_references_outer_owner(*predicate.right);
+    }
+    throw std::logic_error("unreachable predicate kind");
+}
+
+bool plan_references_outer_owner(const plan::LogicalPlan& logical) {
+    for (const auto& projection : logical.projections) {
+        if (scalar_references_outer_owner(projection.expression)) {
+            return true;
+        }
+    }
+    for (const auto& key : logical.group_keys) {
+        if (key.outer_depth != 0) {
+            return true;
+        }
+    }
+    for (const auto& aggregate : logical.aggregate_expressions) {
+        if (aggregate.argument.has_value() && aggregate.argument->outer_depth != 0) {
+            return true;
+        }
+    }
+    for (const auto& key : logical.sort_keys) {
+        if (key.column.outer_depth != 0) {
+            return true;
+        }
+    }
+    for (const auto& predicate : logical.predicates) {
+        if (predicate_references_outer_owner(predicate)) {
+            return true;
+        }
+    }
+    return (logical.input != nullptr && plan_references_outer_owner(*logical.input)) ||
+           (logical.left != nullptr && plan_references_outer_owner(*logical.left)) ||
+           (logical.right != nullptr && plan_references_outer_owner(*logical.right));
+}
+
+struct CorrelationEquality {
+    plan::BoundColumnRef outer;
+    plan::BoundColumnRef inner;
+};
+
+std::optional<CorrelationEquality> correlation_equality(const plan::BoundPredicate& predicate) {
+    if (predicate.kind != sql::PredicateKind::Comparison ||
+        predicate.comparison.op != sql::ComparisonOp::Equal) {
+        return std::nullopt;
+    }
+    const auto* left = std::get_if<plan::BoundColumnRef>(&predicate.comparison.left.value);
+    const auto* right = std::get_if<plan::BoundColumnRef>(&predicate.comparison.right.value);
+    if (left == nullptr || right == nullptr) {
+        return std::nullopt;
+    }
+    if (left->outer_depth == 1 && right->outer_depth == 0) {
+        return CorrelationEquality{*left, *right};
+    }
+    if (right->outer_depth == 1 && left->outer_depth == 0) {
+        return CorrelationEquality{*right, *left};
+    }
+    return std::nullopt;
+}
+
+struct DecorrelatedSubquery {
+    std::shared_ptr<const plan::LogicalPlan> plan;
+    std::vector<plan::BoundPredicate> join_predicates;
+};
+
+std::optional<DecorrelatedSubquery> decorrelate_equality_where(
+    const std::shared_ptr<const plan::LogicalPlan>& subquery) {
+    if (subquery == nullptr || subquery->correlation_columns.empty() ||
+        subquery->kind != plan::LogicalKind::Project || subquery->input == nullptr ||
+        subquery->input->kind != plan::LogicalKind::Filter || subquery->input->input == nullptr ||
+        (subquery->input->input->kind != plan::LogicalKind::Scan &&
+         subquery->input->input->kind != plan::LogicalKind::Join)) {
+        return std::nullopt;
+    }
+    if (std::any_of(subquery->projections.begin(), subquery->projections.end(), [](const auto& projection) {
+            return scalar_references_outer_owner(projection.expression);
+        }) || plan_references_outer_owner(*subquery->input->input)) {
+        return std::nullopt;
+    }
+
+    std::vector<plan::BoundPredicate> residuals;
+    std::vector<CorrelationEquality> equalities;
+    for (const auto& predicate : subquery->input->predicates) {
+        if (!predicate_references_outer_owner(predicate)) {
+            residuals.push_back(predicate);
+            continue;
+        }
+        const auto equality = correlation_equality(predicate);
+        if (!equality.has_value()) {
+            return std::nullopt;
+        }
+        equalities.push_back(*equality);
+    }
+    if (equalities.empty()) {
+        return std::nullopt;
+    }
+
+    for (const auto& correlation : subquery->correlation_columns) {
+        const auto covered = std::any_of(equalities.begin(), equalities.end(), [&](const auto& equality) {
+            return correlation.outer_depth == equality.outer.outer_depth &&
+                   correlation.binding == equality.outer.binding &&
+                   correlation.column == equality.outer.column && correlation.type == equality.outer.type;
+        });
+        if (!covered) {
+            return std::nullopt;
+        }
+    }
+
+    auto decorrelated = *subquery;
+    auto filter = *subquery->input;
+    if (residuals.empty()) {
+        decorrelated.input = filter.input;
+    } else {
+        filter.predicates = std::move(residuals);
+        decorrelated.input = std::make_shared<plan::LogicalPlan>(std::move(filter));
+    }
+    decorrelated.correlation_columns.clear();
+
+    std::vector<plan::BoundPredicate> join_predicates;
+    join_predicates.reserve(equalities.size());
+    for (std::size_t i = 0; i < equalities.size(); ++i) {
+        auto hidden_name = "__corr_key_" + std::to_string(i);
+        while (std::any_of(decorrelated.projections.begin(), decorrelated.projections.end(), [&](const auto& projection) {
+            return projection.output_name == hidden_name;
+        })) {
+            hidden_name += "_";
+        }
+        const auto& equality = equalities[i];
+        decorrelated.projections.push_back(plan::Projection{
+            hidden_name, plan::BoundScalarExpr{equality.inner, equality.inner.type}, equality.inner.type});
+        auto outer = equality.outer;
+        outer.outer_depth = 0;
+        join_predicates.push_back(plan::BoundPredicate::comparison_expr(plan::BoundComparisonExpr{
+            plan::BoundScalarExpr{outer, outer.type},
+            sql::ComparisonOp::Equal,
+            plan::BoundScalarExpr{plan::BoundColumnRef{"", hidden_name, equality.inner.position, equality.inner.type},
+                                  equality.inner.type},
+            equality.outer.position,
+        }));
+    }
+    return DecorrelatedSubquery{
+        std::make_shared<const plan::LogicalPlan>(std::move(decorrelated)), std::move(join_predicates)};
+}
+
 bool insert_decorrelated_filter_alternative(Memo& memo,
                                             GroupId group,
                                             const MemoExpression& filter,
@@ -823,7 +1013,8 @@ bool ExistsToSemiJoinRule::apply(Memo& memo, GroupId group, const MemoExpression
     bool changed = false;
     for (std::size_t i = 0; i < expression.predicates.size(); ++i) {
         const auto& predicate = expression.predicates[i];
-        if (predicate.kind == sql::PredicateKind::Exists) {
+        if (predicate.kind == sql::PredicateKind::Exists && predicate.subquery != nullptr &&
+            predicate.subquery->correlation_columns.empty()) {
             changed = insert_decorrelated_filter_alternative(
                           memo, group, expression, i, plan::JoinKind::Semi, {}, predicate.subquery) ||
                       changed;
@@ -839,7 +1030,8 @@ bool NotExistsToAntiJoinRule::apply(Memo& memo, GroupId group, const MemoExpress
     bool changed = false;
     for (std::size_t i = 0; i < expression.predicates.size(); ++i) {
         const auto& predicate = expression.predicates[i];
-        if (predicate.kind == sql::PredicateKind::NotExists) {
+        if (predicate.kind == sql::PredicateKind::NotExists && predicate.subquery != nullptr &&
+            predicate.subquery->correlation_columns.empty()) {
             changed = insert_decorrelated_filter_alternative(
                           memo, group, expression, i, plan::JoinKind::Anti, {}, predicate.subquery) ||
                       changed;
@@ -861,6 +1053,9 @@ bool InToSemiJoinRule::apply(Memo& memo, GroupId group, const MemoExpression& ex
         if (predicate.subquery == nullptr) {
             throw std::logic_error("decorrelatable IN predicate is missing its bound subquery");
         }
+        if (!predicate.subquery->correlation_columns.empty()) {
+            continue;
+        }
         const auto& output = single_subquery_output(*predicate.subquery);
         auto equality = plan::BoundPredicate::comparison_expr(plan::BoundComparisonExpr{
             predicate.in_value,
@@ -875,6 +1070,99 @@ bool InToSemiJoinRule::apply(Memo& memo, GroupId group, const MemoExpression& ex
                                                          plan::JoinKind::Semi,
                                                          {std::move(equality)},
                                                          predicate.subquery) ||
+                  changed;
+    }
+    return changed;
+}
+
+bool CorrelatedExistsToSemiJoinRule::apply(Memo& memo,
+                                           GroupId group,
+                                           const MemoExpression& expression) const {
+    if (expression.kind != MemoExpressionKind::Filter) {
+        return false;
+    }
+    bool changed = false;
+    for (std::size_t i = 0; i < expression.predicates.size(); ++i) {
+        const auto& predicate = expression.predicates[i];
+        if (predicate.kind != sql::PredicateKind::Exists) {
+            continue;
+        }
+        auto decorrelated = decorrelate_equality_where(predicate.subquery);
+        if (!decorrelated.has_value()) {
+            continue;
+        }
+        changed = insert_decorrelated_filter_alternative(memo,
+                                                         group,
+                                                         expression,
+                                                         i,
+                                                         plan::JoinKind::Semi,
+                                                         std::move(decorrelated->join_predicates),
+                                                         decorrelated->plan) ||
+                  changed;
+    }
+    return changed;
+}
+
+bool CorrelatedNotExistsToAntiJoinRule::apply(Memo& memo,
+                                              GroupId group,
+                                              const MemoExpression& expression) const {
+    if (expression.kind != MemoExpressionKind::Filter) {
+        return false;
+    }
+    bool changed = false;
+    for (std::size_t i = 0; i < expression.predicates.size(); ++i) {
+        const auto& predicate = expression.predicates[i];
+        if (predicate.kind != sql::PredicateKind::NotExists) {
+            continue;
+        }
+        auto decorrelated = decorrelate_equality_where(predicate.subquery);
+        if (!decorrelated.has_value()) {
+            continue;
+        }
+        changed = insert_decorrelated_filter_alternative(memo,
+                                                         group,
+                                                         expression,
+                                                         i,
+                                                         plan::JoinKind::Anti,
+                                                         std::move(decorrelated->join_predicates),
+                                                         decorrelated->plan) ||
+                  changed;
+    }
+    return changed;
+}
+
+bool CorrelatedInToSemiJoinRule::apply(Memo& memo,
+                                       GroupId group,
+                                       const MemoExpression& expression) const {
+    if (expression.kind != MemoExpressionKind::Filter) {
+        return false;
+    }
+    bool changed = false;
+    for (std::size_t i = 0; i < expression.predicates.size(); ++i) {
+        const auto& predicate = expression.predicates[i];
+        if (predicate.kind != sql::PredicateKind::In || scalar_contains_subquery(predicate.in_value) ||
+            predicate.subquery == nullptr) {
+            continue;
+        }
+        const auto& output = single_subquery_output(*predicate.subquery);
+        auto decorrelated = decorrelate_equality_where(predicate.subquery);
+        if (!decorrelated.has_value()) {
+            continue;
+        }
+        decorrelated->join_predicates.push_back(plan::BoundPredicate::comparison_expr(plan::BoundComparisonExpr{
+            predicate.in_value,
+            sql::ComparisonOp::Equal,
+            plan::BoundScalarExpr{
+                plan::BoundColumnRef{"", output.output_name, predicate.operator_position, output.type}, output.type},
+            predicate.operator_position,
+        }));
+        changed = insert_decorrelated_filter_alternative(memo,
+                                                         group,
+                                                         expression,
+                                                         i,
+                                                         plan::JoinKind::Semi,
+                                                         std::move(decorrelated->join_predicates),
+                                                         decorrelated->plan) ||
                   changed;
     }
     return changed;
@@ -1333,6 +1621,9 @@ std::vector<std::reference_wrapper<const MemoRule>> default_memo_rules() {
     static const ExistsToSemiJoinRule exists_to_semi;
     static const NotExistsToAntiJoinRule not_exists_to_anti;
     static const InToSemiJoinRule in_to_semi;
+    static const CorrelatedExistsToSemiJoinRule correlated_exists_to_semi;
+    static const CorrelatedNotExistsToAntiJoinRule correlated_not_exists_to_anti;
+    static const CorrelatedInToSemiJoinRule correlated_in_to_semi;
     static const LeftJoinToInnerRule left_join_to_inner;
     static const FilterIntoJoinRule filter_into_join;
     static const FilterThroughAggregateRule filter_through_aggregate;
@@ -1345,6 +1636,9 @@ std::vector<std::reference_wrapper<const MemoRule>> default_memo_rules() {
             std::cref(exists_to_semi),
             std::cref(not_exists_to_anti),
             std::cref(in_to_semi),
+            std::cref(correlated_exists_to_semi),
+            std::cref(correlated_not_exists_to_anti),
+            std::cref(correlated_in_to_semi),
             std::cref(left_join_to_inner),
             std::cref(filter_into_join),
             std::cref(filter_through_aggregate),

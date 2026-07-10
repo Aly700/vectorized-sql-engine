@@ -85,6 +85,10 @@ struct ComparisonStats {
     std::size_t exists_to_semi_firings{0};
     std::size_t not_exists_to_anti_firings{0};
     std::size_t in_to_semi_firings{0};
+    std::size_t correlated_exists_to_semi_firings{0};
+    std::size_t correlated_not_exists_to_anti_firings{0};
+    std::size_t correlated_in_to_semi_firings{0};
+    std::size_t residual_correlated_guard_paths{0};
     std::size_t left_join_to_inner_firings{0};
     std::size_t join_commute_firings{0};
     std::size_t join_associate_firings{0};
@@ -629,6 +633,12 @@ inline bool compare_engines(const std::string& sql,
                 std::count(explored.fired_rules.begin(), explored.fired_rules.end(), "NotExistsToAntiJoinRule");
             stats->in_to_semi_firings =
                 std::count(explored.fired_rules.begin(), explored.fired_rules.end(), "InToSemiJoinRule");
+            stats->correlated_exists_to_semi_firings = std::count(
+                explored.fired_rules.begin(), explored.fired_rules.end(), "CorrelatedExistsToSemiJoinRule");
+            stats->correlated_not_exists_to_anti_firings = std::count(
+                explored.fired_rules.begin(), explored.fired_rules.end(), "CorrelatedNotExistsToAntiJoinRule");
+            stats->correlated_in_to_semi_firings = std::count(
+                explored.fired_rules.begin(), explored.fired_rules.end(), "CorrelatedInToSemiJoinRule");
             stats->join_commute_firings =
                 std::count(explored.fired_rules.begin(), explored.fired_rules.end(), "JoinCommuteRule");
             stats->join_associate_firings =

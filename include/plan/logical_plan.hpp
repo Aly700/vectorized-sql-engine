@@ -25,6 +25,9 @@ struct BoundColumnRef {
     std::string column;
     std::size_t position{0};
     catalog::ColumnType type{catalog::ColumnType::Int64};
+    // Zero identifies the current query block. Positive values identify the
+    // lexical distance to an enclosing query block (1 = immediate parent).
+    std::size_t outer_depth{0};
 };
 
 struct BoundScalarSubquery {
@@ -158,6 +161,9 @@ struct LogicalPlan {
     std::vector<AggregateExpression> aggregate_expressions;
     std::vector<SortKey> sort_keys;
     std::vector<BoundPredicate> predicates;
+    // Set only on a bound subplan root. Empty is the structural Phase 21a
+    // dispatch; non-empty means execution requires the listed outer values.
+    std::vector<BoundColumnRef> correlation_columns;
     JoinKind join_kind{JoinKind::Inner};
     std::size_t limit_count{0};
     std::shared_ptr<LogicalPlan> input;
