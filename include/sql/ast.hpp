@@ -160,7 +160,10 @@ struct SelectItem {
     std::size_t alias_position{0};
 };
 
+enum class JoinKind { Inner, Left, Right };
+
 struct JoinClause {
+    JoinKind kind{JoinKind::Inner};
     std::string table;
     std::size_t table_position{0};
     std::optional<std::string> alias;

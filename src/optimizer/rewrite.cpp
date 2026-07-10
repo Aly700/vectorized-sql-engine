@@ -118,10 +118,12 @@ MemoExpression filter_expression(std::vector<plan::BoundPredicate> predicates,
 MemoExpression join_expression(std::vector<plan::BoundPredicate> predicates,
                                GroupId left,
                                GroupId right,
-                               plan::OrderPermission order_permission) {
+                               plan::OrderPermission order_permission,
+                               plan::JoinKind join_kind = plan::JoinKind::Inner) {
     MemoExpression expression;
     expression.kind = MemoExpressionKind::Join;
     expression.order_permission = order_permission;
+    expression.join_kind = join_kind;
     expression.predicates = std::move(predicates);
     expression.children.push_back(left);
     expression.children.push_back(right);
@@ -339,6 +341,7 @@ std::vector<std::string> output_tables_for_group(const Memo& memo, GroupId group
 
 bool can_apply_join_transform(const MemoExpression& expression) {
     return expression.kind == MemoExpressionKind::Join &&
+           expression.join_kind == plan::JoinKind::Inner &&
            expression.order_permission == plan::OrderPermission::Arbitrary;
 }
 
@@ -669,7 +672,8 @@ bool FilterIntoJoinRule::apply(Memo& memo, GroupId group, const MemoExpression& 
     const auto child_expression_count = memo.group(child_group).expressions.size();
     for (std::size_t i = 0; i < child_expression_count; ++i) {
         const auto child_expression = memo.group(child_group).expressions.at(i).expression;
-        if (child_expression.kind != MemoExpressionKind::Join) {
+        if (child_expression.kind != MemoExpressionKind::Join ||
+            child_expression.join_kind != plan::JoinKind::Inner) {
             continue;
         }
 
@@ -832,6 +836,7 @@ bool try_left_to_right_associate(Memo& memo, GroupId group, const MemoExpression
     for (std::size_t i = 0; i < left_expression_count; ++i) {
         const auto left_expression = memo.group(left_group).expressions.at(i).expression;
         if (left_expression.kind != MemoExpressionKind::Join ||
+            left_expression.join_kind != plan::JoinKind::Inner ||
             left_expression.order_permission != plan::OrderPermission::Arbitrary) {
             continue;
         }
@@ -891,6 +896,7 @@ bool try_right_to_left_associate(Memo& memo, GroupId group, const MemoExpression
     for (std::size_t i = 0; i < right_expression_count; ++i) {
         const auto right_expression = memo.group(right_group).expressions.at(i).expression;
         if (right_expression.kind != MemoExpressionKind::Join ||
+            right_expression.join_kind != plan::JoinKind::Inner ||
             right_expression.order_permission != plan::OrderPermission::Arbitrary) {
             continue;
         }

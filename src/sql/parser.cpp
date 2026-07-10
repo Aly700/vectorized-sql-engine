@@ -66,6 +66,7 @@ bool is_reserved_keyword(std::string_view text) {
     return equals_keyword(text, "SELECT") || equals_keyword(text, "FROM") || equals_keyword(text, "WHERE") ||
            equals_keyword(text, "AND") || equals_keyword(text, "OR") || equals_keyword(text, "AS") ||
            equals_keyword(text, "JOIN") || equals_keyword(text, "INNER") || equals_keyword(text, "ON") ||
+           equals_keyword(text, "LEFT") || equals_keyword(text, "RIGHT") || equals_keyword(text, "OUTER") ||
            equals_keyword(text, "ORDER") || equals_keyword(text, "BY") || equals_keyword(text, "ASC") ||
            equals_keyword(text, "DESC") || equals_keyword(text, "GROUP") || equals_keyword(text, "COUNT") ||
            equals_keyword(text, "SUM") || equals_keyword(text, "MIN") || equals_keyword(text, "MAX") ||
@@ -191,7 +192,7 @@ public:
         expect_keyword("FROM", "expected FROM after projection list");
         parse_table_reference(query.table, query.table_position, query.alias, query.alias_position, "expected table name");
 
-        while (is_keyword("INNER") || is_keyword("JOIN")) {
+        while (is_keyword("INNER") || is_keyword("JOIN") || is_keyword("LEFT") || is_keyword("RIGHT")) {
             query.joins.push_back(parse_join());
         }
 
@@ -383,14 +384,34 @@ private:
     }
 
     JoinClause parse_join() {
+        auto kind = JoinKind::Inner;
         if (is_keyword("INNER")) {
             advance();
             expect_keyword("JOIN", "expected JOIN after INNER");
+        } else if (is_keyword("LEFT")) {
+            kind = JoinKind::Left;
+            advance();
+            if (is_keyword("OUTER")) {
+                advance();
+                expect_keyword("JOIN", "expected JOIN after OUTER");
+            } else {
+                expect_keyword("JOIN", "expected JOIN after LEFT");
+            }
+        } else if (is_keyword("RIGHT")) {
+            kind = JoinKind::Right;
+            advance();
+            if (is_keyword("OUTER")) {
+                advance();
+                expect_keyword("JOIN", "expected JOIN after OUTER");
+            } else {
+                expect_keyword("JOIN", "expected JOIN after RIGHT");
+            }
         } else {
             expect_keyword("JOIN", "expected JOIN");
         }
 
         JoinClause join;
+        join.kind = kind;
         parse_table_reference(join.table,
                               join.table_position,
                               join.alias,

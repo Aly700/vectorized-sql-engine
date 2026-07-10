@@ -106,6 +106,7 @@ std::size_t structural_hash(const MemoExpression& expression) {
     std::size_t seed = 0;
     hash_combine(seed, static_cast<std::size_t>(expression.kind));
     hash_combine(seed, static_cast<std::size_t>(expression.order_permission));
+    hash_combine(seed, static_cast<std::size_t>(expression.join_kind));
     hash_string(seed, expression.table);
     hash_string(seed, expression.binding_name);
 
@@ -222,8 +223,8 @@ bool vector_equal(const std::vector<T>& left, const std::vector<T>& right, Equal
 }
 
 bool structural_equal(const MemoExpression& left, const MemoExpression& right) {
-    return left.kind == right.kind && left.order_permission == right.order_permission && left.table == right.table &&
-           left.binding_name == right.binding_name &&
+    return left.kind == right.kind && left.order_permission == right.order_permission &&
+           left.join_kind == right.join_kind && left.table == right.table && left.binding_name == right.binding_name &&
            vector_equal(left.projections, right.projections, projection_equal) &&
            vector_equal(left.group_keys, right.group_keys, column_equal) &&
            vector_equal(left.aggregate_expressions, right.aggregate_expressions, aggregate_expression_equal) &&
@@ -344,6 +345,16 @@ std::string sort_key_to_string(const plan::SortKey& key) {
     return column_to_string(key.column) + " " + sort_direction_to_string(key.direction);
 }
 
+std::string join_kind_to_string(plan::JoinKind kind) {
+    switch (kind) {
+    case plan::JoinKind::Inner:
+        return "Join";
+    case plan::JoinKind::Left:
+        return "LeftJoin";
+    }
+    throw std::logic_error("unreachable join kind");
+}
+
 void append_sort_keys(std::ostringstream& out, const std::vector<plan::SortKey>& sort_keys) {
     for (std::size_t i = 0; i < sort_keys.size(); ++i) {
         if (i != 0) {
@@ -402,7 +413,7 @@ std::string memo_expression_to_string(const MemoExpression& expression) {
         out << "]";
         return out.str();
     case MemoExpressionKind::Join:
-        out << "Join[";
+        out << join_kind_to_string(expression.join_kind) << "[";
         append_predicates(out, expression.predicates);
         out << "]";
         append_children(out, expression.children);
@@ -469,7 +480,8 @@ MemoExpression group_ref_expression(GroupId representative,
 // comparison kind, AND multiplies, and OR uses inclusion-exclusion
 // s1 + s2 - s1*s2. Equi-joins use
 // |L| * |R| / max(distinct(left_key), distinct(right_key)); non-equi joins use
-// the cross product. Distinct counts are heuristics derived from row counts:
+// the cross product; LEFT joins then clamp the row estimate to at least the
+// preserved left input cardinality. Distinct counts are heuristics derived from row counts:
 // scan columns start with distinct=row_count and later operators clamp them to
 // the estimated output rows. String columns intentionally reuse the same
 // row-count math in Phase 17a; value-width and collation-aware CPU costing are
@@ -825,6 +837,7 @@ RelationEstimate limit_estimate(std::size_t limit_count, RelationEstimate child,
 RelationEstimate join_estimate(const std::vector<plan::BoundPredicate>& predicates,
                                RelationEstimate left,
                                RelationEstimate right,
+                               plan::JoinKind join_kind,
                                plan::OrderPermission order_permission) {
     std::optional<EquiJoinKeyEstimate> equi_key;
     std::optional<std::size_t> equi_predicate_index;
@@ -843,7 +856,8 @@ RelationEstimate join_estimate(const std::vector<plan::BoundPredicate>& predicat
     const auto residual_selectivity = combined_selectivity(predicates, equi_predicate_index);
 
     RelationEstimate estimate;
-    estimate.rows = safe_multiply(base_rows, residual_selectivity);
+    const auto inner_rows = safe_multiply(base_rows, residual_selectivity);
+    estimate.rows = join_kind == plan::JoinKind::Left ? std::max(inner_rows, left.rows) : inner_rows;
     // Equi-join cost models a linear hash build+probe; without an equi key the
     // logical alternative is costed as nested-loop work over every pair.
     const auto local_cost = equi_key.has_value() ? safe_add(left.rows, right.rows) : cross_rows;
@@ -853,13 +867,13 @@ RelationEstimate join_estimate(const std::vector<plan::BoundPredicate>& predicat
     for (auto& [_, distinct] : estimate.distinct_by_column) {
         distinct = std::min(distinct, estimate.rows);
     }
-    if (equi_key.has_value()) {
+    if (equi_key.has_value() && join_kind == plan::JoinKind::Inner) {
         const auto joined_distinct = std::min({equi_key->left_distinct, equi_key->right_distinct, estimate.rows});
         estimate.distinct_by_column[equi_key->left_key] = joined_distinct;
         estimate.distinct_by_column[equi_key->right_key] = joined_distinct;
     }
 
-    estimate.plan = plan::LogicalPlan::join(predicates, std::move(left.plan), std::move(right.plan));
+    estimate.plan = plan::LogicalPlan::join(predicates, std::move(left.plan), std::move(right.plan), join_kind);
     estimate.plan.order_permission = order_permission;
     return estimate;
 }
@@ -895,6 +909,7 @@ RelationEstimate estimate_logical_relation(const plan::LogicalPlan& logical, con
         return join_estimate(logical.predicates,
                              estimate_logical_relation(require_left(logical), catalog),
                              estimate_logical_relation(require_right(logical), catalog),
+                             logical.join_kind,
                              logical.order_permission);
     case plan::LogicalKind::Explain:
         throw std::invalid_argument("EXPLAIN logical plans cannot be costed directly");
@@ -987,6 +1002,7 @@ private:
             return join_estimate(expression.predicates,
                                  best_for_group(expression.children.at(0), stack).estimate,
                                  best_for_group(expression.children.at(1), stack).estimate,
+                                 expression.join_kind,
                                  expression.order_permission);
         case MemoExpressionKind::GroupRef:
             return best_for_group(expression.children.at(0), stack).estimate;
@@ -1042,6 +1058,7 @@ GroupId Memo::insert(const plan::LogicalPlan& logical) {
         return insert_expression(std::move(expression));
     case plan::LogicalKind::Join:
         expression.kind = MemoExpressionKind::Join;
+        expression.join_kind = logical.join_kind;
         expression.predicates = logical.predicates;
         expression.children.push_back(insert(require_left(logical)));
         expression.children.push_back(insert(require_right(logical)));
@@ -1372,7 +1389,8 @@ plan::LogicalPlan Memo::extract_expression(const MemoExpression& expression, std
     case MemoExpressionKind::Join: {
         auto result = plan::LogicalPlan::join(expression.predicates,
                                              extract(expression.children.at(0), stack),
-                                             extract(expression.children.at(1), stack));
+                                             extract(expression.children.at(1), stack),
+                                             expression.join_kind);
         result.order_permission = expression.order_permission;
         return result;
     }
@@ -1769,7 +1787,7 @@ std::vector<plan::LogicalPlan> Memo::extract_alternatives_for_expression(
                     result.hit_plan_bound = true;
                     return alternatives;
                 }
-                auto join = plan::LogicalPlan::join(expression.predicates, left, right);
+                auto join = plan::LogicalPlan::join(expression.predicates, left, right, expression.join_kind);
                 join.order_permission = expression.order_permission;
                 alternatives.push_back(std::move(join));
             }

@@ -761,6 +761,37 @@ bool run_join_oracle_corpus() {
     return ok;
 }
 
+bool run_outer_join_oracle_corpus() {
+    const auto catalog = make_golden_catalog();
+    const auto table_text =
+        "outer join tables: t1 rows=[[1,10],[2,20],[2,30]], "
+        "t2 rows=[[2,200],[2,201],[3,300]], t3 rows=[[200,1],[201,2],[201,3]], "
+        "j1 rows=[[1,10],[NULL,20],[2,30],[NULL,40]], "
+        "j2 rows=[[NULL,100],[1,101],[2,102],[NULL,103]]";
+    const std::vector<std::string> outer_sqls{
+        "SELECT t1.a, t1.b, t2.c FROM t1 LEFT JOIN t2 ON t1.a = t2.a AND t2.c = 201",
+        "SELECT t1.a, t1.b, t2.c FROM t1 LEFT JOIN t2 ON t1.a = t2.a WHERE t2.c = 201",
+        "SELECT t1.b, t2.c FROM t1 LEFT JOIN t2 ON t1.a = t2.a WHERE t2.c IS NULL",
+        "SELECT t2.c, COUNT(*), COUNT(t2.c), SUM(t2.c) FROM t1 LEFT JOIN t2 ON t1.a = t2.a "
+        "GROUP BY t2.c ORDER BY t2.c ASC",
+        "SELECT l.v, r.w FROM j1 AS l LEFT JOIN j2 AS r ON l.k = r.k",
+        "SELECT t1.b, t2.c, t3.d FROM t1 JOIN t2 ON t1.a = t2.a "
+        "LEFT JOIN t3 ON t2.c = t3.c AND t3.d = 3 ORDER BY t1.b ASC, t2.c ASC",
+        "SELECT t2.c, t1.b FROM t1 RIGHT JOIN t2 ON t1.a = t2.a",
+    };
+
+    bool ok = true;
+    for (const auto& sql : outer_sqls) {
+        ComparisonStats stats;
+        ok = compare_engines(sql, catalog, table_text, &stats) && ok;
+        std::cout << "outer-join oracle alternatives verified: sql=\"" << sql << "\" alternatives="
+                  << stats.alternative_count << " max_group_expressions=" << stats.max_group_expression_count
+                  << " hit_expression_bound=" << (stats.hit_expression_bound ? "yes" : "no")
+                  << " hit_plan_bound=" << (stats.hit_plan_bound ? "yes" : "no") << "\n";
+    }
+    return ok;
+}
+
 execution::Catalog make_string_catalog() {
     storage::Int64Column id;
     for (auto value : {1, 2, 3, 4, 5}) {
@@ -1000,15 +1031,31 @@ void assert_physical_lowering_accepts_string_touching_plans() {
     assert(differential::same_batch(literal_interpreted, literal_vectorized));
 }
 
+void assert_outer_join_physical_lowering_is_guarded() {
+    const auto catalog = make_golden_catalog();
+    const auto logical =
+        sql::bind_select(sql::parse_select("SELECT t1.b, t2.c FROM t1 LEFT JOIN t2 ON t1.a = t2.a"), catalog);
+
+    try {
+        (void)plan::lower_to_physical(logical);
+    } catch (const std::runtime_error& error) {
+        assert(error.what() == std::string(differential::kOuterJoinVectorizedUnsupported));
+        return;
+    }
+    throw std::logic_error("expected outer join physical lowering guard");
+}
+
 } // namespace
 
 int main() {
     assert_physical_lowering_shape();
     assert_physical_lowering_accepts_string_touching_plans();
+    assert_outer_join_physical_lowering_is_guarded();
 
     bool ok = true;
     ok = run_result_golden_queries() && ok;
     ok = run_join_oracle_corpus() && ok;
+    ok = run_outer_join_oracle_corpus() && ok;
     ok = run_vectorized_string_corpus() && ok;
     ok = run_generated_corpus() && ok;
     return ok ? 0 : 1;

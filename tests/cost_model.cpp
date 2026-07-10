@@ -379,6 +379,23 @@ void assert_string_columns_use_row_count_costing_without_width_model() {
     }
 }
 
+void assert_left_join_cardinality_keeps_preserved_side_rows() {
+    const auto catalog = make_skewed_catalog();
+    const auto sql = "SELECT big.k, tiny.k FROM big LEFT JOIN tiny ON big.k = tiny.k";
+    const auto logical = sql::bind_select(sql::parse_select(sql), catalog);
+    const auto estimate = optimizer::estimate_cost(logical, catalog);
+
+    if (estimate.rows != 1000.0 || estimate.cost != 2004.0) {
+        std::cerr << "LEFT join cost did not keep preserved-side cardinality\n"
+                  << "sql: " << sql << "\n"
+                  << "plan:\n"
+                  << plan::to_string(logical) << "\n"
+                  << "rows: " << estimate.rows << "\n"
+                  << "cost: " << estimate.cost << "\n";
+        std::terminate();
+    }
+}
+
 void assert_group_by_does_not_block_join_transforms() {
     const auto catalog = make_skewed_catalog();
     const auto sql =
@@ -626,6 +643,7 @@ int main() {
     assert_aggregate_cost_uses_group_count();
     assert_distinct_and_limit_costs_use_output_count_without_new_semantics();
     assert_string_columns_use_row_count_costing_without_width_model();
+    assert_left_join_cardinality_keeps_preserved_side_rows();
     assert_group_by_does_not_block_join_transforms();
     assert_distinct_limit_do_not_block_join_transforms();
     assert_having_costs_as_filter_over_aggregate();

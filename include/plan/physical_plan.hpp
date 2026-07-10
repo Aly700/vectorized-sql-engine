@@ -23,6 +23,7 @@ struct PhysicalPlan {
     std::vector<AggregateExpression> aggregate_expressions;
     std::vector<SortKey> sort_keys;
     std::vector<BoundPredicate> predicates;
+    JoinKind join_kind{JoinKind::Inner};
     std::size_t limit_count{0};
     std::shared_ptr<PhysicalPlan> input;
     std::shared_ptr<PhysicalPlan> left;
@@ -50,9 +51,11 @@ struct PhysicalPlan {
 
     static PhysicalPlan join(std::vector<BoundPredicate> predicates,
                              PhysicalPlan left,
-                             PhysicalPlan right) {
+                             PhysicalPlan right,
+                             JoinKind join_kind = JoinKind::Inner) {
         PhysicalPlan p;
         p.kind = PhysicalKind::Join;
+        p.join_kind = join_kind;
         p.predicates = std::move(predicates);
         p.left = std::make_shared<PhysicalPlan>(std::move(left));
         p.right = std::make_shared<PhysicalPlan>(std::move(right));

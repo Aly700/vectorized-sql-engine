@@ -487,6 +487,17 @@ void mark_arbitrary_order(plan::LogicalPlan& logical) {
     }
 }
 
+plan::JoinKind bound_join_kind(JoinKind parsed) {
+    switch (parsed) {
+    case JoinKind::Inner:
+        return plan::JoinKind::Inner;
+    case JoinKind::Left:
+    case JoinKind::Right:
+        return plan::JoinKind::Left;
+    }
+    throw std::logic_error("unreachable parsed join kind");
+}
+
 } // namespace
 
 plan::LogicalPlan bind_select(const SelectQuery& query, const catalog::Catalog& catalog) {
@@ -549,9 +560,19 @@ plan::LogicalPlan bind_select(const SelectQuery& query, const catalog::Catalog& 
     visible_scopes.push_back(scopes.front());
     for (std::size_t i = 0; i < query.joins.size(); ++i) {
         visible_scopes.push_back(scopes.at(i + 1));
-        plan = plan::LogicalPlan::join(bind_predicates(query.joins[i].predicates, visible_scopes),
+        auto predicates = bind_predicates(query.joins[i].predicates, visible_scopes);
+        auto right_scan = plan::LogicalPlan::scan(query.joins[i].table, binding_name(query.joins[i]));
+        if (query.joins[i].kind == JoinKind::Right) {
+            plan = plan::LogicalPlan::join(std::move(predicates),
+                                           std::move(right_scan),
+                                           std::move(plan),
+                                           bound_join_kind(query.joins[i].kind));
+            continue;
+        }
+        plan = plan::LogicalPlan::join(std::move(predicates),
                                        std::move(plan),
-                                       plan::LogicalPlan::scan(query.joins[i].table, binding_name(query.joins[i])));
+                                       std::move(right_scan),
+                                       bound_join_kind(query.joins[i].kind));
     }
 
     if (query.predicate.has_value()) {
