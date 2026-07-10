@@ -235,3 +235,16 @@ The checksum match pins left-only output and duplicate-preserving Semi
 semantics before timing. The vectorized lookup-only hash implementation is
 2.301x faster on median than the interpreted left-row-major nested-loop oracle
 for this selective workload.
+
+## Phase 22b Window Baseline (2026-07-10)
+
+Same optimized build, five-repetition min/median, deterministic-data, and
+checksum-before-timing methodology as above. This adds one correctness-first
+Window workload over the 200,000-row `fact` table with 100 partitions:
+`ROW_NUMBER()` ordered inside each partition plus `SUM(value)` replicated over
+the partition. No Window-specific performance tuning was attempted in this
+phase.
+
+| workload | rows | correctness | interpreted min ms | interpreted median ms | vectorized min ms | vectorized median ms | median speedup |
+|---|---:|---|---:|---:|---:|---:|---:|
+| window_row_number_sum | fact=200000,partitions=100 | match rows=200000 checksum=0x1f5b8dc9ce10a38c | 725.385 | 732.916 | 108.253 | 109.029 | 6.722x |

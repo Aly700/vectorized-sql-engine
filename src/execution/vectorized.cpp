@@ -1471,6 +1471,32 @@ TypedCell finalize_aggregate(const AggregateValue& value, const plan::AggregateE
     throw std::logic_error("unreachable aggregate function");
 }
 
+sql::AggregateFunction aggregate_function_for_window(sql::WindowFunction function) {
+    switch (function) {
+    case sql::WindowFunction::Count:
+        return sql::AggregateFunction::Count;
+    case sql::WindowFunction::Sum:
+        return sql::AggregateFunction::Sum;
+    case sql::WindowFunction::Min:
+        return sql::AggregateFunction::Min;
+    case sql::WindowFunction::Max:
+        return sql::AggregateFunction::Max;
+    case sql::WindowFunction::RowNumber:
+    case sql::WindowFunction::Rank:
+    case sql::WindowFunction::DenseRank:
+        break;
+    }
+    throw std::logic_error("ranking window is not an aggregate");
+}
+
+plan::AggregateExpression aggregate_expression_for_window(const plan::WindowExpression& window) {
+    return plan::AggregateExpression{window.output_name,
+                                     aggregate_function_for_window(window.function),
+                                     window.argument,
+                                     window.position,
+                                     window.type};
+}
+
 AggregateGroupState make_aggregate_group(HashKey key, const plan::PhysicalPlan& plan) {
     AggregateGroupState group;
     group.key = std::move(key);
@@ -1721,6 +1747,7 @@ BatchView execute_filter(const plan::PhysicalPlan& plan, ExecutionContext& conte
 BatchView execute_join(const plan::PhysicalPlan& plan, ExecutionContext& context);
 BatchView execute_project(const plan::PhysicalPlan& plan, ExecutionContext& context);
 BatchView execute_aggregate(const plan::PhysicalPlan& plan, ExecutionContext& context);
+BatchView execute_window(const plan::PhysicalPlan& plan, ExecutionContext& context);
 BatchView execute_distinct(const plan::PhysicalPlan& plan, ExecutionContext& context);
 BatchView execute_sort(const plan::PhysicalPlan& plan, ExecutionContext& context);
 BatchView execute_limit(const plan::PhysicalPlan& plan, ExecutionContext& context);
@@ -1737,6 +1764,8 @@ BatchView execute_to_view(const plan::PhysicalPlan& plan, ExecutionContext& cont
         return execute_project(plan, context);
     case plan::PhysicalKind::Aggregate:
         return execute_aggregate(plan, context);
+    case plan::PhysicalKind::Window:
+        return execute_window(plan, context);
     case plan::PhysicalKind::Distinct:
         return execute_distinct(plan, context);
     case plan::PhysicalKind::Sort:
@@ -2065,6 +2094,156 @@ BatchView execute_aggregate(const plan::PhysicalPlan& plan, ExecutionContext& co
     return view;
 }
 
+struct WindowPartition {
+    std::vector<std::size_t> rows;
+};
+
+std::vector<WindowPartition> build_window_partitions(const plan::WindowExpression& window,
+                                                     const BatchView& input) {
+    validate_view(input);
+    const auto partition_keys = compile_columns(window.partition_keys, *input.batch);
+    std::unordered_map<HashKey, std::size_t, HashKeyHash> partition_index_by_key;
+    std::vector<WindowPartition> partitions;
+
+    for (auto row : *input.selection) {
+        auto key = make_key(row, partition_keys);
+        const auto found = partition_index_by_key.find(key);
+        if (found == partition_index_by_key.end()) {
+            const auto index = partitions.size();
+            partition_index_by_key.emplace(std::move(key), index);
+            partitions.push_back(WindowPartition{});
+            partitions.back().rows.push_back(row);
+        } else {
+            partitions.at(found->second).rows.push_back(row);
+        }
+    }
+    return partitions;
+}
+
+bool window_rows_are_peers(const std::vector<CompiledSortKey>& order_keys,
+                           std::size_t left,
+                           std::size_t right) {
+    for (const auto& key : order_keys) {
+        if (!(sort_key_cell(key, left) == sort_key_cell(key, right))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::int64_t checked_window_ordinal(std::size_t ordinal, const std::string& output_name) {
+    if (ordinal > static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max())) {
+        throw std::runtime_error(output_name + " overflowed int64");
+    }
+    return static_cast<std::int64_t>(ordinal);
+}
+
+void evaluate_ranking_window(const plan::WindowExpression& window,
+                             const storage::ColumnarBatch& batch,
+                             const std::vector<WindowPartition>& partitions,
+                             std::vector<TypedCell>& values) {
+    const auto order_keys = compile_sort_keys(window.order_keys, batch);
+    for (const auto& partition : partitions) {
+        auto ordered_rows = partition.rows;
+        std::stable_sort(ordered_rows.begin(), ordered_rows.end(), [&](std::size_t left, std::size_t right) {
+            for (const auto& key : order_keys) {
+                const auto left_value = sort_key_cell(key, left);
+                const auto right_value = sort_key_cell(key, right);
+                if (left_value == right_value) {
+                    continue;
+                }
+                return sort_cell_less(left_value, right_value, key.direction);
+            }
+            return false;
+        });
+
+        std::size_t rank = 1;
+        std::size_t dense_rank = 1;
+        for (std::size_t index = 0; index < ordered_rows.size(); ++index) {
+            if (index != 0 && !window_rows_are_peers(order_keys, ordered_rows[index - 1], ordered_rows[index])) {
+                rank = index + 1;
+                ++dense_rank;
+            }
+            const auto ordinal = window.function == sql::WindowFunction::RowNumber
+                                     ? index + 1
+                                     : (window.function == sql::WindowFunction::Rank ? rank : dense_rank);
+            values.at(ordered_rows[index]) = int_cell(checked_window_ordinal(ordinal, window.output_name));
+        }
+    }
+}
+
+void evaluate_aggregate_window(const plan::WindowExpression& window,
+                               const storage::ColumnarBatch& batch,
+                               const std::vector<WindowPartition>& partitions,
+                               std::vector<TypedCell>& values) {
+    const auto aggregate = aggregate_expression_for_window(window);
+    const auto compiled = compile_aggregate_expression(aggregate, batch);
+    for (const auto& partition : partitions) {
+        AggregateValue state;
+        for (auto row : partition.rows) {
+            update_aggregate(state, compiled, row);
+        }
+        const auto value = finalize_aggregate(state, aggregate);
+        for (auto row : partition.rows) {
+            values.at(row) = value;
+        }
+    }
+}
+
+void add_window_column(storage::ColumnarBatch& out,
+                       const plan::WindowExpression& window,
+                       const BatchView& input) {
+    const auto partitions = build_window_partitions(window, input);
+    std::vector<TypedCell> values(input.batch->row_count(), null_cell(window.type));
+
+    switch (window.function) {
+    case sql::WindowFunction::RowNumber:
+    case sql::WindowFunction::Rank:
+    case sql::WindowFunction::DenseRank:
+        evaluate_ranking_window(window, *input.batch, partitions, values);
+        break;
+    case sql::WindowFunction::Count:
+    case sql::WindowFunction::Sum:
+    case sql::WindowFunction::Min:
+    case sql::WindowFunction::Max:
+        evaluate_aggregate_window(window, *input.batch, partitions, values);
+        break;
+    }
+
+    TypedColumnBuilder column(window.type);
+    column.reserve(input.selection->size());
+    for (auto row : *input.selection) {
+        append_cell(column, values.at(row));
+    }
+    std::move(column).add_to(out, window.output_name);
+}
+
+storage::ColumnarBatch materialize_window(const plan::PhysicalPlan& plan, const BatchView& input) {
+    validate_view(input);
+
+    storage::ColumnarBatch out;
+    for (const auto& name : input.batch->column_names()) {
+        add_materialized_selected_column(out, input, name, name);
+    }
+    for (const auto& window : plan.window_expressions) {
+        add_window_column(out, window, input);
+    }
+    return out;
+}
+
+BatchView execute_window(const plan::PhysicalPlan& plan, ExecutionContext& context) {
+    auto input = execute_to_view(require_input(plan), context);
+    auto materialized = std::make_shared<const storage::ColumnarBatch>(materialize_window(plan, input));
+
+    BatchView view;
+    view.owned_batch = materialized;
+    view.batch = materialized.get();
+    view.selection = identity_selection(materialized->row_count());
+    view.selection_rows_match_positions = true;
+    validate_view(view);
+    return view;
+}
+
 BatchView execute_distinct(const plan::PhysicalPlan& plan, ExecutionContext& context) {
     auto input = execute_to_view(require_input(plan), context);
     validate_view(input);
@@ -2216,6 +2395,22 @@ bool plan_requires_typed_dispatch(const plan::PhysicalPlan& plan, const Catalog&
             return true;
         }
     }
+    for (const auto& window : plan.window_expressions) {
+        if (window.type == catalog::ColumnType::String ||
+            (window.argument.has_value() && window.argument->type == catalog::ColumnType::String)) {
+            return true;
+        }
+        for (const auto& key : window.partition_keys) {
+            if (key.type == catalog::ColumnType::String) {
+                return true;
+            }
+        }
+        for (const auto& key : window.order_keys) {
+            if (key.column.type == catalog::ColumnType::String) {
+                return true;
+            }
+        }
+    }
     for (const auto& key : plan.sort_keys) {
         if (key.column.type == catalog::ColumnType::String) {
             return true;
@@ -2236,6 +2431,7 @@ bool plan_requires_typed_dispatch(const plan::PhysicalPlan& plan, const Catalog&
     case plan::PhysicalKind::Filter:
     case plan::PhysicalKind::Project:
     case plan::PhysicalKind::Aggregate:
+    case plan::PhysicalKind::Window:
     case plan::PhysicalKind::Distinct:
     case plan::PhysicalKind::Sort:
     case plan::PhysicalKind::Limit:

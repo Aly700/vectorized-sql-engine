@@ -1233,25 +1233,27 @@ void assert_correlated_scalar_error_is_equivalent_on_every_oracle_path() {
     assert_guard(best);
 }
 
-void assert_window_oracle_paths_and_vectorized_guard() {
+void assert_window_paths_and_vectorized_execution() {
     const auto catalog = make_golden_catalog();
     const auto sql_text =
         "SELECT t1.b, t2.c, RANK() OVER (ORDER BY t2.c) AS r "
         "FROM t1 JOIN t2 ON t1.a = t2.a ORDER BY t2.c, t1.b";
     const auto logical = sql::bind_select(sql::parse_select(sql_text), catalog);
     const auto expected = execution::execute_interpreted(logical, catalog);
-    const auto guard_message = "vectorized execution does not support window functions";
 
     const auto assert_path = [&](const plan::LogicalPlan& candidate) {
         const auto oracle = execution::execute_interpreted(candidate, catalog);
         assert(differential::same_batch(expected, oracle));
-        try {
-            (void)execution::execute_vectorized(candidate, catalog);
-        } catch (const std::runtime_error& error) {
-            assert(std::string(error.what()) == guard_message);
-            return;
-        }
-        throw std::logic_error("expected window vectorized-lowering guard");
+        const auto physical = plan::lower_to_physical(candidate);
+        assert(physical.kind == plan::PhysicalKind::Sort);
+        assert(physical.input != nullptr);
+        assert(physical.input->kind == plan::PhysicalKind::Project);
+        assert(physical.input->input != nullptr);
+        assert(physical.input->input->kind == plan::PhysicalKind::Window);
+        const auto vectorized = execution::execute_vectorized(candidate, catalog);
+        const auto physical_vectorized = execution::execute_vectorized(physical, catalog);
+        assert(differential::same_batch(expected, vectorized));
+        assert(differential::same_batch(expected, physical_vectorized));
     };
 
     assert_path(logical);
@@ -1279,7 +1281,7 @@ int main() {
     assert_subquery_physical_lowering_and_vectorized_execution_are_supported();
     assert_residual_correlated_subquery_is_rejected_at_physical_lowering();
     assert_correlated_scalar_error_is_equivalent_on_every_oracle_path();
-    assert_window_oracle_paths_and_vectorized_guard();
+    assert_window_paths_and_vectorized_execution();
 
     bool ok = true;
     ok = run_result_golden_queries() && ok;
