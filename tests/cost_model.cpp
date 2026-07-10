@@ -655,6 +655,27 @@ void assert_subquery_cost_is_added_once_to_owning_filter() {
     assert(best_estimate.cost == 2002.0);
 }
 
+void assert_semi_anti_costs_use_complementary_selectivity_and_linear_probe_work() {
+    const auto catalog = make_skewed_catalog();
+    const auto equality = plan::BoundPredicate::comparison_expr(plan::BoundComparisonExpr{
+        plan::BoundColumnRef{"big", "k", 0},
+        sql::ComparisonOp::Equal,
+        plan::BoundColumnRef{"tiny", "k", 0},
+        0,
+    });
+    const auto semi = plan::LogicalPlan::join(
+        {equality}, plan::LogicalPlan::scan("big"), plan::LogicalPlan::scan("tiny"), plan::JoinKind::Semi);
+    const auto anti = plan::LogicalPlan::join(
+        {equality}, plan::LogicalPlan::scan("big"), plan::LogicalPlan::scan("tiny"), plan::JoinKind::Anti);
+
+    const auto semi_estimate = optimizer::estimate_cost(semi, catalog);
+    const auto anti_estimate = optimizer::estimate_cost(anti, catalog);
+    assert(semi_estimate.rows == 500.0);
+    assert(anti_estimate.rows == 500.0);
+    assert(semi_estimate.cost == 2004.0);
+    assert(anti_estimate.cost == 2004.0);
+}
+
 } // namespace
 
 int main() {
@@ -675,5 +696,6 @@ int main() {
     assert_extract_best_prefers_pushed_join_filter();
     assert_extract_best_prefers_pushed_one_side_or_filter();
     assert_subquery_cost_is_added_once_to_owning_filter();
+    assert_semi_anti_costs_use_complementary_selectivity_and_linear_probe_work();
     return 0;
 }

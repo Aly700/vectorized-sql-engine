@@ -170,6 +170,53 @@ MemoExpression aggregate_expression(std::vector<plan::BoundColumnRef> group_keys
     return expression;
 }
 
+const plan::Projection& single_subquery_output(const plan::LogicalPlan& subquery) {
+    const auto* node = &subquery;
+    while (node->kind == plan::LogicalKind::Limit || node->kind == plan::LogicalKind::Sort ||
+           node->kind == plan::LogicalKind::Distinct) {
+        node = &require_input(*node);
+    }
+    if (node->kind != plan::LogicalKind::Project || node->projections.size() != 1) {
+        throw std::logic_error("decorrelatable IN subquery must have exactly one final projection");
+    }
+    return node->projections.front();
+}
+
+bool insert_decorrelated_filter_alternative(Memo& memo,
+                                            GroupId group,
+                                            const MemoExpression& filter,
+                                            std::size_t predicate_index,
+                                            plan::JoinKind join_kind,
+                                            std::vector<plan::BoundPredicate> join_predicates,
+                                            const std::shared_ptr<const plan::LogicalPlan>& subquery) {
+    if (subquery == nullptr) {
+        throw std::logic_error("decorrelatable predicate is missing its bound subquery");
+    }
+    const auto before_group_count = memo.group_count();
+    const auto right_group = memo.insert(*subquery);
+    const auto join_group = memo.insert_expression(join_expression(std::move(join_predicates),
+                                                                   filter.children.at(0),
+                                                                   right_group,
+                                                                   filter.order_permission,
+                                                                   join_kind));
+
+    std::vector<plan::BoundPredicate> residuals;
+    residuals.reserve(filter.predicates.size() - 1);
+    for (std::size_t i = 0; i < filter.predicates.size(); ++i) {
+        if (i != predicate_index) {
+            residuals.push_back(filter.predicates[i]);
+        }
+    }
+
+    const auto inserted = residuals.empty()
+                              ? memo.insert_group_ref_equivalent(group, join_group)
+                              : memo.insert_equivalent(group,
+                                                       filter_expression(std::move(residuals),
+                                                                         join_group,
+                                                                         filter.order_permission));
+    return inserted || memo.group_count() != before_group_count;
+}
+
 plan::OrderPermission order_permission_for_group(const Memo& memo, GroupId group) {
     return memo.group(group).expressions.front().expression.order_permission;
 }
@@ -390,6 +437,9 @@ std::vector<std::string> output_tables_for_expression(const Memo& memo,
     case MemoExpressionKind::GroupRef:
         return output_tables_for_group(memo, expression.children.at(0), stack);
     case MemoExpressionKind::Join:
+        if (expression.join_kind == plan::JoinKind::Semi || expression.join_kind == plan::JoinKind::Anti) {
+            return output_tables_for_group(memo, expression.children.at(0), stack);
+        }
         return merge_tables(output_tables_for_group(memo, expression.children.at(0), stack),
                             output_tables_for_group(memo, expression.children.at(1), stack));
     }
@@ -430,8 +480,9 @@ std::optional<plan::LogicalPlan> rewrite_once(
     const plan::LogicalPlan& logical,
     const std::vector<std::reference_wrapper<const Rule>>& rules,
     RewriteTrace& trace) {
-    // Phase 21a rewrite traversal follows relational children only. Embedded
-    // immutable subplans are intentionally opaque until decorrelation in 21b.
+    // Standalone traversal follows relational children only. Phase 21b memo
+    // rules explicitly lift eligible top-level Filter leaves; residual scalar,
+    // NOT IN, and OR-contained subplans remain immutable opaque fields.
     switch (logical.kind) {
     case plan::LogicalKind::Project:
     case plan::LogicalKind::Aggregate:
@@ -765,6 +816,70 @@ bool MergeAdjacentFiltersRule::apply(Memo& memo, GroupId group, const MemoExpres
     return changed;
 }
 
+bool ExistsToSemiJoinRule::apply(Memo& memo, GroupId group, const MemoExpression& expression) const {
+    if (expression.kind != MemoExpressionKind::Filter) {
+        return false;
+    }
+    bool changed = false;
+    for (std::size_t i = 0; i < expression.predicates.size(); ++i) {
+        const auto& predicate = expression.predicates[i];
+        if (predicate.kind == sql::PredicateKind::Exists) {
+            changed = insert_decorrelated_filter_alternative(
+                          memo, group, expression, i, plan::JoinKind::Semi, {}, predicate.subquery) ||
+                      changed;
+        }
+    }
+    return changed;
+}
+
+bool NotExistsToAntiJoinRule::apply(Memo& memo, GroupId group, const MemoExpression& expression) const {
+    if (expression.kind != MemoExpressionKind::Filter) {
+        return false;
+    }
+    bool changed = false;
+    for (std::size_t i = 0; i < expression.predicates.size(); ++i) {
+        const auto& predicate = expression.predicates[i];
+        if (predicate.kind == sql::PredicateKind::NotExists) {
+            changed = insert_decorrelated_filter_alternative(
+                          memo, group, expression, i, plan::JoinKind::Anti, {}, predicate.subquery) ||
+                      changed;
+        }
+    }
+    return changed;
+}
+
+bool InToSemiJoinRule::apply(Memo& memo, GroupId group, const MemoExpression& expression) const {
+    if (expression.kind != MemoExpressionKind::Filter) {
+        return false;
+    }
+    bool changed = false;
+    for (std::size_t i = 0; i < expression.predicates.size(); ++i) {
+        const auto& predicate = expression.predicates[i];
+        if (predicate.kind != sql::PredicateKind::In || scalar_contains_subquery(predicate.in_value)) {
+            continue;
+        }
+        if (predicate.subquery == nullptr) {
+            throw std::logic_error("decorrelatable IN predicate is missing its bound subquery");
+        }
+        const auto& output = single_subquery_output(*predicate.subquery);
+        auto equality = plan::BoundPredicate::comparison_expr(plan::BoundComparisonExpr{
+            predicate.in_value,
+            sql::ComparisonOp::Equal,
+            plan::BoundColumnRef{"", output.output_name, predicate.operator_position, output.type},
+            predicate.operator_position,
+        });
+        changed = insert_decorrelated_filter_alternative(memo,
+                                                         group,
+                                                         expression,
+                                                         i,
+                                                         plan::JoinKind::Semi,
+                                                         {std::move(equality)},
+                                                         predicate.subquery) ||
+                  changed;
+    }
+    return changed;
+}
+
 bool LeftJoinToInnerRule::apply(Memo& memo, GroupId group, const MemoExpression& expression) const {
     // Independently bound subplans contribute no right-side outer references;
     // null rejection is proved only from the owning predicate's outer operand.
@@ -815,8 +930,7 @@ bool FilterIntoJoinRule::apply(Memo& memo, GroupId group, const MemoExpression& 
     const auto child_expression_count = memo.group(child_group).expressions.size();
     for (std::size_t i = 0; i < child_expression_count; ++i) {
         const auto child_expression = memo.group(child_group).expressions.at(i).expression;
-        if (child_expression.kind != MemoExpressionKind::Join ||
-            child_expression.join_kind != plan::JoinKind::Inner) {
+        if (child_expression.kind != MemoExpressionKind::Join) {
             continue;
         }
 
@@ -824,6 +938,46 @@ bool FilterIntoJoinRule::apply(Memo& memo, GroupId group, const MemoExpression& 
         const auto right_group = child_expression.children.at(1);
         const auto left_tables = output_tables_for_group(memo, left_group);
         const auto right_tables = output_tables_for_group(memo, right_group);
+
+        if (child_expression.join_kind == plan::JoinKind::Semi ||
+            child_expression.join_kind == plan::JoinKind::Anti) {
+            std::vector<plan::BoundPredicate> left_predicates;
+            std::vector<plan::BoundPredicate> residual_predicates;
+            for (const auto& predicate : expression.predicates) {
+                const auto refs = referenced_tables(predicate);
+                if (!refs.empty() && is_subset(refs, left_tables)) {
+                    left_predicates.push_back(predicate);
+                } else {
+                    residual_predicates.push_back(predicate);
+                }
+            }
+            if (left_predicates.empty()) {
+                continue;
+            }
+
+            const auto before_group_count = memo.group_count();
+            const auto pushed_left_group = memo.insert_expression(
+                filter_expression(std::move(left_predicates),
+                                  left_group,
+                                  order_permission_for_group(memo, left_group)));
+            const auto pushed_join_group = memo.insert_expression(join_expression(child_expression.predicates,
+                                                                                   pushed_left_group,
+                                                                                   right_group,
+                                                                                   expression.order_permission,
+                                                                                   child_expression.join_kind));
+            const auto inserted = residual_predicates.empty()
+                                      ? memo.insert_group_ref_equivalent(group, pushed_join_group)
+                                      : memo.insert_equivalent(group,
+                                                               filter_expression(std::move(residual_predicates),
+                                                                                 pushed_join_group,
+                                                                                 expression.order_permission));
+            changed = inserted || memo.group_count() != before_group_count || changed;
+            continue;
+        }
+
+        if (child_expression.join_kind != plan::JoinKind::Inner) {
+            continue;
+        }
         const auto join_tables = merge_tables(left_tables, right_tables);
 
         std::vector<plan::BoundPredicate> left_predicates;
@@ -1176,6 +1330,9 @@ std::vector<std::reference_wrapper<const MemoRule>> default_memo_rules() {
     static const MergeAdjacentFiltersRule merge_filters;
     static const AlwaysFalseFilterRule always_false;
     static const DropAlwaysTrueFilterRule drop_true;
+    static const ExistsToSemiJoinRule exists_to_semi;
+    static const NotExistsToAntiJoinRule not_exists_to_anti;
+    static const InToSemiJoinRule in_to_semi;
     static const LeftJoinToInnerRule left_join_to_inner;
     static const FilterIntoJoinRule filter_into_join;
     static const FilterThroughAggregateRule filter_through_aggregate;
@@ -1185,6 +1342,9 @@ std::vector<std::reference_wrapper<const MemoRule>> default_memo_rules() {
             std::cref(static_cast<const MemoRule&>(merge_filters)),
             std::cref(static_cast<const MemoRule&>(always_false)),
             std::cref(static_cast<const MemoRule&>(drop_true)),
+            std::cref(exists_to_semi),
+            std::cref(not_exists_to_anti),
+            std::cref(in_to_semi),
             std::cref(left_join_to_inner),
             std::cref(filter_into_join),
             std::cref(filter_through_aggregate),

@@ -18,7 +18,7 @@ struct LogicalPlan;
 
 enum class LogicalKind { Scan, Join, Filter, Project, Aggregate, Distinct, Sort, Limit, Explain };
 enum class OrderPermission { Deterministic, Arbitrary };
-enum class JoinKind { Inner, Left };
+enum class JoinKind { Inner, Left, Semi, Anti };
 
 struct BoundColumnRef {
     std::string binding;
@@ -176,10 +176,12 @@ struct LogicalPlan {
         return p;
     }
 
-    // Join output identity/order is deterministic: all columns from the left
-    // child followed by all columns from the right child. Expressions in a
-    // bound logical plan refer to those identities by binding and column name;
-    // downstream layers must not re-resolve parsed SQL names.
+    // INNER/LEFT output identity/order is deterministic: all columns from the
+    // left child followed by all columns from the right child. SEMI/ANTI emit
+    // exactly the left child's identities and order; right identities exist
+    // only while evaluating join predicates. Expressions in a bound logical
+    // plan refer to identities by binding and column name; downstream layers
+    // must not re-resolve parsed SQL names.
     static LogicalPlan join(std::vector<BoundPredicate> predicates,
                             LogicalPlan left,
                             LogicalPlan right,

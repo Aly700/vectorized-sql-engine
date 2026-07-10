@@ -1,5 +1,7 @@
 #include "execution/interpreter.hpp"
 #include "execution/vectorized.hpp"
+#include "optimizer/memo.hpp"
+#include "optimizer/rewrite.hpp"
 #include "sql/binder.hpp"
 
 #include <algorithm>
@@ -304,6 +306,24 @@ plan::LogicalPlan bind_query(const execution::Catalog& catalog, const std::strin
     return sql::bind_select(sql::parse_select(sql), catalog);
 }
 
+plan::LogicalPlan bind_decorrelated_semi_query(const execution::Catalog& catalog, const std::string& sql) {
+    const auto logical = bind_query(catalog, sql);
+    optimizer::Memo memo;
+    const auto root = memo.insert(logical);
+    const auto explored = optimizer::explore_memo_to_fixpoint(memo, optimizer::default_memo_rules());
+    if (!explored.reached_fixpoint) {
+        throw std::logic_error("benchmark semi-join memo exploration did not reach fixpoint");
+    }
+    const auto alternatives =
+        memo.extract_alternatives(root, optimizer::AlternativeExtractionOptions{128, 1024});
+    for (const auto& alternative : alternatives.plans) {
+        if (plan::to_string(alternative).find("SemiJoin[") != std::string::npos) {
+            return alternative;
+        }
+    }
+    throw std::logic_error("benchmark IN query did not produce a SemiJoin alternative");
+}
+
 std::vector<Workload> make_workloads(const execution::Catalog& catalog) {
     std::vector<Workload> workloads;
     auto add = [&](std::string name, std::string rows, std::string sql) {
@@ -323,6 +343,15 @@ std::vector<Workload> make_workloads(const execution::Catalog& catalog) {
         "left=100000,right=256",
         "SELECT l.payload AS left_payload, r.payload AS right_payload "
         "FROM join_left AS l JOIN join_right AS r ON l.k1 = r.k1 AND l.k2 = r.k2");
+    {
+        const std::string sql =
+            "SELECT l.payload AS payload FROM join_left AS l "
+            "WHERE l.k1 IN (SELECT r.k1 FROM join_right AS r WHERE r.payload = 10000)";
+        workloads.push_back(Workload{"selective_in_semi_join",
+                                     "outer=100000,subquery_source=256,subquery_rows=1",
+                                     sql,
+                                     bind_decorrelated_semi_query(catalog, sql)});
+    }
     add("aggregate_few_groups",
         "fact=200000,groups=8",
         "SELECT group_few, SUM(value) AS total, COUNT(*) AS n "

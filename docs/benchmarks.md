@@ -217,3 +217,21 @@ to favorable except for small movements in `aggregate_few_groups` (14.717 ms to
 exercise vectorized Filter in this benchmark set, so they are reported as
 run-to-run noise rather than attributed wins. Correctness checksums stayed
 byte-identical for every workload.
+
+## Phase 21b Selective Semi Join (2026-07-10)
+
+Same optimized build, five-repetition min/median, deterministic-data, and
+checksum-before-timing methodology as above. The SQL source is an IN query over
+the 100,000-row `join_left` table. The benchmark harness requires and times the
+memo-produced equi-SemiJoin alternative, whose subquery scans 256 rows and
+selects one key (`r.payload = 10000`). The interpreted and vectorized engines
+execute the same decorrelated plan.
+
+| workload | rows | correctness | interpreted min ms | interpreted median ms | vectorized min ms | vectorized median ms | median speedup |
+|---|---:|---|---:|---:|---:|---:|---:|
+| selective_in_semi_join | outer=100000,subquery_source=256,subquery_rows=1 | match rows=6250 checksum=0x72a0d9bc69515c7e | 11.122 | 11.865 | 5.131 | 5.157 | 2.301x |
+
+The checksum match pins left-only output and duplicate-preserving Semi
+semantics before timing. The vectorized lookup-only hash implementation is
+2.301x faster on median than the interpreted left-row-major nested-loop oracle
+for this selective workload.

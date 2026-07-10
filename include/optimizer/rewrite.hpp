@@ -142,6 +142,64 @@ public:
     [[nodiscard]] bool apply(Memo& memo, GroupId group, const MemoExpression& expression) const override;
 };
 
+// Pattern matched: a Filter with a top-level EXISTS subquery conjunct.
+// Replacement expression: remove that conjunct and place the Filter input on
+// the preserved side of a keyless SemiJoin whose right side is the subquery;
+// keep any residual top-level conjuncts above the join.
+// Semantic equivalence: EXISTS is TRUE exactly when its independently bound
+// right plan has a row. A keyless SemiJoin treats its empty predicate list as
+// TRUE for every pair and emits a left row once iff any right row exists, so it
+// preserves bag multiplicity and left order exactly.
+// Preconditions: only an entire top-level Filter conjunct is matched; EXISTS
+// inside AND/OR predicate trees is not inspected or split. The subquery is
+// uncorrelated, immutable, pure, and non-null. The rule removes one subquery
+// leaf from the owning Filter and never creates one, while structural memo
+// deduplication closes repeated exploration.
+// Golden query: `SELECT a FROM t WHERE EXISTS (SELECT a FROM t1)`.
+class ExistsToSemiJoinRule final : public MemoRule {
+public:
+    [[nodiscard]] std::string_view name() const override { return "ExistsToSemiJoinRule"; }
+    [[nodiscard]] bool apply(Memo& memo, GroupId group, const MemoExpression& expression) const override;
+};
+
+// Pattern matched: a Filter with a top-level NOT EXISTS subquery conjunct.
+// Replacement expression: remove that conjunct and place the Filter input on
+// the preserved side of a keyless AntiJoin to the subquery, retaining residual
+// top-level conjuncts above it.
+// Semantic equivalence: NOT EXISTS is TRUE exactly when the right plan is
+// empty. Keyless AntiJoin emits each left row once iff no TRUE pair exists;
+// right values and NULLs are irrelevant, so no NULL trap exists.
+// Preconditions: the predicate itself must be one top-level Filter conjunct;
+// trees below AND/OR are opaque. The independently bound subquery is immutable,
+// pure, and non-null. Each application removes one eligible leaf and memo
+// structural deduplication guarantees finite exploration.
+// Golden query: `SELECT a FROM t WHERE NOT EXISTS (SELECT a FROM empty)`.
+class NotExistsToAntiJoinRule final : public MemoRule {
+public:
+    [[nodiscard]] std::string_view name() const override { return "NotExistsToAntiJoinRule"; }
+    [[nodiscard]] bool apply(Memo& memo, GroupId group, const MemoExpression& expression) const override;
+};
+
+// Pattern matched: a Filter with a top-level `x IN (SELECT c ...)` conjunct.
+// Replacement expression: remove that conjunct and add SemiJoin(input,
+// subquery, x = c), retaining residual top-level conjuncts above the join.
+// Semantic equivalence: under TRUE-only filtering, IN survives iff at least
+// one non-NULL c makes x=c TRUE. Equi-SemiJoin has exactly that match set and
+// skips NULL equality keys. When x is NULL, or no value matches but the set has
+// a NULL, IN is UNKNOWN while SemiJoin reports no match; both reject the left
+// row. Right duplicates cannot multiply a Semi result.
+// Preconditions: the IN leaf must be a whole top-level Filter conjunct; IN
+// inside OR/AND is never split. NOT IN is excluded because a NULL-bearing set
+// makes NOT IN never TRUE while plain AntiJoin would emit unmatched rows.
+// Scalar subquery operands are excluded and remain eagerly materialized. The
+// subquery has exactly one typed output by binder invariant.
+// Golden query: `SELECT a FROM t WHERE a IN (SELECT a FROM t1)`.
+class InToSemiJoinRule final : public MemoRule {
+public:
+    [[nodiscard]] std::string_view name() const override { return "InToSemiJoinRule"; }
+    [[nodiscard]] bool apply(Memo& memo, GroupId group, const MemoExpression& expression) const override;
+};
+
 // Pattern matched: Filter(P, LeftJoin(L, R, J)) where at least one whole top-level conjunct in P
 // is provably null-rejecting for R's binding identities.
 // Replacement expression: Add Filter(P, InnerJoin(L, R, J)) as an equivalent expression in the
@@ -188,7 +246,14 @@ public:
 // predicate because it is evaluated over the same row pair at a point where both rows are available;
 // NULL operands yield UNKNOWN and are rejected in either placement. Whole-tree reference analysis
 // prevents unsound OR/AND splitting.
-// Preconditions: The child join must be an INNER join. LEFT joins are skipped because pushing a
+// Preconditions: The child join must be an INNER join, except that a whole
+// left-only conjunct may move into the preserved child of a SEMI/ANTI join.
+// This exception is sound because Semi/Anti output is a subset of left rows:
+// filtering a left row before testing match existence keeps exactly the rows
+// that would pass the same predicate after the existence test. Right-only,
+// mixed-side, literal-only, and empty-reference conjuncts remain above a
+// SEMI/ANTI join; no predicate is moved into its match condition or right side.
+// LEFT joins are skipped because pushing a
 // predicate into the null-supplying side, or turning a post-join predicate into an ON predicate,
 // can preserve NULL-extended rows that the original WHERE would reject or reject rows the original
 // ON would preserve. LeftJoinToInnerRule may first establish an equivalent filtered INNER shape;

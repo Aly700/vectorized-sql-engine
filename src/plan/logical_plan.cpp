@@ -139,6 +139,10 @@ std::string join_kind_to_string(JoinKind kind) {
         return "Join";
     case JoinKind::Left:
         return "LeftJoin";
+    case JoinKind::Semi:
+        return "SemiJoin";
+    case JoinKind::Anti:
+        return "AntiJoin";
     }
     throw std::logic_error("unreachable join kind");
 }
