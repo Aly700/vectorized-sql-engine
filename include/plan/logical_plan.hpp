@@ -16,6 +16,7 @@ namespace plan {
 
 enum class LogicalKind { Scan, Join, Filter, Project, Aggregate, Distinct, Sort, Limit, Explain };
 enum class OrderPermission { Deterministic, Arbitrary };
+enum class JoinKind { Inner, Left };
 
 struct BoundColumnRef {
     std::string binding;
@@ -114,6 +115,7 @@ struct LogicalPlan {
     std::vector<AggregateExpression> aggregate_expressions;
     std::vector<SortKey> sort_keys;
     std::vector<BoundPredicate> predicates;
+    JoinKind join_kind{JoinKind::Inner};
     std::size_t limit_count{0};
     std::shared_ptr<LogicalPlan> input;
     std::shared_ptr<LogicalPlan> left;
@@ -135,9 +137,13 @@ struct LogicalPlan {
     // child followed by all columns from the right child. Expressions in a
     // bound logical plan refer to those identities by binding and column name;
     // downstream layers must not re-resolve parsed SQL names.
-    static LogicalPlan join(std::vector<BoundPredicate> predicates, LogicalPlan left, LogicalPlan right) {
+    static LogicalPlan join(std::vector<BoundPredicate> predicates,
+                            LogicalPlan left,
+                            LogicalPlan right,
+                            JoinKind join_kind = JoinKind::Inner) {
         LogicalPlan p;
         p.kind = LogicalKind::Join;
+        p.join_kind = join_kind;
         p.predicates = std::move(predicates);
         p.left = std::make_shared<LogicalPlan>(std::move(left));
         p.right = std::make_shared<LogicalPlan>(std::move(right));

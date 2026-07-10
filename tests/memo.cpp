@@ -349,6 +349,94 @@ void assert_filter_into_join_moves_one_side_or_but_not_mixed_side_or() {
     memo.assert_invariants();
 }
 
+bool contains_plan_text(const std::vector<plan::LogicalPlan>& alternatives, const std::string& text);
+
+void assert_outer_joins_block_unsound_join_transforms() {
+    const auto catalog = make_catalog();
+    const auto commute_sql = "SELECT t1.b, t2.c FROM t1 LEFT JOIN t2 ON t1.a = t2.a";
+    const auto commute_logical = sql::bind_select(sql::parse_select(commute_sql), catalog);
+
+    optimizer::Memo commute_memo;
+    const auto commute_root = commute_memo.insert(commute_logical);
+    const auto commute_explored =
+        optimizer::explore_memo_to_fixpoint(commute_memo, optimizer::default_memo_rules());
+    assert(commute_explored.reached_fixpoint);
+    const auto commute_alternatives =
+        commute_memo.extract_alternatives(commute_root, optimizer::AlternativeExtractionOptions{128, 1024});
+    if (trace_contains(commute_explored.fired_rules, "JoinCommuteRule") ||
+        contains_plan_text(commute_alternatives.plans, "LeftJoin[col(t1.a) = col(t2.a)]\n    Scan[t2]\n    Scan[t1]")) {
+        std::cerr << "LEFT join commute guard failed\n"
+                  << "sql: " << commute_sql << "\n"
+                  << "trace: ";
+        for (const auto& fired : commute_explored.fired_rules) {
+            std::cerr << fired << " ";
+        }
+        std::cerr << "\nlogical plan:\n"
+                  << plan::to_string(commute_logical) << "\n"
+                  << "memo dump:\n"
+                  << commute_memo.dump();
+        std::terminate();
+    }
+
+    const auto associate_sql =
+        "SELECT t1.b, t2.c, t1_copy.b FROM t1 LEFT JOIN t2 ON t1.a = t2.a "
+        "LEFT JOIN t1 AS t1_copy ON t2.a = t1_copy.a";
+    const auto associate_logical = sql::bind_select(sql::parse_select(associate_sql), catalog);
+    optimizer::Memo associate_memo;
+    const auto associate_root = associate_memo.insert(associate_logical);
+    const auto associate_explored =
+        optimizer::explore_memo_to_fixpoint(associate_memo, optimizer::default_memo_rules());
+    assert(associate_explored.reached_fixpoint);
+    const auto associate_alternatives =
+        associate_memo.extract_alternatives(associate_root, optimizer::AlternativeExtractionOptions{128, 1024});
+    if (trace_contains(associate_explored.fired_rules, "JoinAssociateRule") ||
+        associate_alternatives.plans.size() != 1) {
+        std::cerr << "LEFT join associate guard failed\n"
+                  << "sql: " << associate_sql << "\n"
+                  << "alternative count: " << associate_alternatives.plans.size() << "\n"
+                  << "trace: ";
+        for (const auto& fired : associate_explored.fired_rules) {
+            std::cerr << fired << " ";
+        }
+        std::cerr << "\nlogical plan:\n"
+                  << plan::to_string(associate_logical) << "\n"
+                  << "memo dump:\n"
+                  << associate_memo.dump();
+        std::terminate();
+    }
+
+    const auto filter_sql =
+        "SELECT t1.b, t2.c FROM t1 LEFT JOIN t2 ON t1.a = t2.a WHERE t2.c > 200";
+    const auto filter_logical = sql::bind_select(sql::parse_select(filter_sql), catalog);
+    optimizer::Memo filter_memo;
+    const auto filter_root = filter_memo.insert(filter_logical);
+    const auto filter_explored =
+        optimizer::explore_memo_to_fixpoint(filter_memo, optimizer::default_memo_rules());
+    assert(filter_explored.reached_fixpoint);
+    const auto filter_alternatives =
+        filter_memo.extract_alternatives(filter_root, optimizer::AlternativeExtractionOptions{128, 1024});
+    if (trace_contains(filter_explored.fired_rules, "FilterIntoJoinRule") ||
+        contains_plan_text(filter_alternatives.plans,
+                           "LeftJoin[col(t1.a) = col(t2.a) AND col(t2.c) > lit(200)]") ||
+        contains_plan_text(filter_alternatives.plans, "Filter[col(t2.c) > lit(200)]\n      Scan[t2]")) {
+        std::cerr << "LEFT join filter-into-join guard failed\n"
+                  << "sql: " << filter_sql << "\n"
+                  << "trace: ";
+        for (const auto& fired : filter_explored.fired_rules) {
+            std::cerr << fired << " ";
+        }
+        std::cerr << "\nlogical plan:\n"
+                  << plan::to_string(filter_logical) << "\n"
+                  << "memo dump:\n"
+                  << filter_memo.dump();
+        std::terminate();
+    }
+
+    commute_memo.assert_invariants();
+    associate_memo.assert_invariants();
+    filter_memo.assert_invariants();
+}
+
 bool contains_plan_text(const std::vector<plan::LogicalPlan>& alternatives, const std::string& text) {
     for (const auto& alternative : alternatives) {
         if (plan::to_string(alternative).find(text) != std::string::npos) {
@@ -456,6 +544,7 @@ int main() {
     assert_having_filter_round_trips_through_memo();
     assert_filter_into_join_adds_pushdown_alternative();
     assert_filter_into_join_moves_one_side_or_but_not_mixed_side_or();
+    assert_outer_joins_block_unsound_join_transforms();
     assert_filter_through_aggregate_pushes_only_group_keys();
     assert_filter_through_aggregate_moves_group_key_or_but_pins_aggregate_or();
     return 0;

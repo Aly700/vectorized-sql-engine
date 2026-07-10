@@ -33,9 +33,13 @@ PhysicalPlan lower_to_physical(const LogicalPlan& logical) {
     case LogicalKind::Scan:
         return PhysicalPlan::scan(logical.table, logical.binding_name);
     case LogicalKind::Join:
+        if (logical.join_kind != JoinKind::Inner) {
+            throw std::runtime_error("physical lowering does not support outer joins in phase 20a");
+        }
         return PhysicalPlan::join(logical.predicates,
                                   lower_to_physical(require_left(logical)),
-                                  lower_to_physical(require_right(logical)));
+                                  lower_to_physical(require_right(logical)),
+                                  logical.join_kind);
     case LogicalKind::Filter:
         return PhysicalPlan::filter(logical.predicates, lower_to_physical(require_input(logical)));
     case LogicalKind::Project:

@@ -158,11 +158,14 @@ public:
 // predicate because it is evaluated over the same row pair at a point where both rows are available;
 // NULL operands yield UNKNOWN and are rejected in either placement. Whole-tree reference analysis
 // prevents unsound OR/AND splitting.
-// Preconditions: Only conjunct trees whose referenced binding identities are wholly available at
-// the target child scope move below the join. Literal-only, unknown-scope, aggregate-output, and
-// mixed-side non-leaf predicates stay residual; outer joins, volatile functions, and side effects
-// do not exist in this slice; the original expression remains in the memo and ordering permission
-// is preserved on the inserted alternative.
+// Preconditions: The child join must be an INNER join. LEFT joins are skipped in Phase 20a because
+// pushing a predicate into the null-supplying side, or turning a post-join predicate into an ON
+// predicate, can preserve NULL-extended rows that the original WHERE would reject or reject rows
+// the original ON would preserve. Sound preserved-side pushdown is left as future outer-join rewrite
+// work. Only conjunct trees whose referenced binding identities are wholly available at the target
+// child scope move below the join. Literal-only, unknown-scope, aggregate-output, and mixed-side
+// non-leaf predicates stay residual; predicates are pure, and the original expression remains in
+// the memo with ordering permission preserved on the inserted alternative.
 // Golden query: `SELECT t1.b, t2.c FROM t1 JOIN t2 ON t1.a = t2.a WHERE t1.b = 20 AND t2.c > 200
 // AND t1.b < t2.c` proves all pushed alternatives remain equal to the unrewritten oracle.
 class FilterIntoJoinRule final : public MemoRule {
@@ -184,7 +187,9 @@ public:
 // reject the group or input rows in both shapes. Bound grouping-key predicates carry their checked
 // key type, so string and int64 keys move under the same whole-conjunct argument without coercion.
 // Aggregate outputs such as COUNT/SUM are computed after grouping and are not available before
-// aggregation, so predicates that reference them do not move.
+// aggregation, so predicates that reference them do not move. This rule is unaffected by LEFT joins
+// because it matches only Filter over Aggregate and does not reinterpret join null-extension below
+// the Aggregate input.
 // Preconditions: Every moved conjunct tree must reference at least one column and every referenced
 // column in every leaf must match one of `group_keys` by bound identity. The current binder
 // represents HAVING grouping-key predicates with the original input `BoundColumnRef{binding,
@@ -211,9 +216,11 @@ public:
 // because equality with NULL is UNKNOWN. The join node's internal output identity order flips, but
 // admitted bound SQL plans consume join columns by identity and the final Project fixes
 // user-visible output names/order.
-// Preconditions: The expression must explicitly permit arbitrary row order; the plan context must
-// have a final Project or another identity-addressed consumer that does not observe raw join column
-// order; outer joins, side effects, and volatile expressions do not exist in the slice.
+// Preconditions: The expression must be an INNER join and must explicitly permit arbitrary row
+// order; the plan context must have a final Project or another identity-addressed consumer that
+// does not observe raw join column order. LEFT joins do not commute because swapping inputs changes
+// which side is preserved and which side is NULL-extended. Side effects and volatile expressions do
+// not exist in the slice.
 // Golden query: `SELECT t1.b, t2.c FROM t1 JOIN t2 ON t1.a = t2.a` proves sorted-bag equality for
 // commuted memo alternatives.
 class JoinCommuteRule final : public MemoRule {
@@ -232,10 +239,12 @@ public:
 // TRUE/FALSE/UNKNOWN result in both associations; the tuple is emitted exactly when all required
 // join predicates are TRUE. Multiplicities are preserved because no duplicate-eliminating operator
 // is introduced.
-// Preconditions: The expression must explicitly permit arbitrary row order; every relocated
-// conjunct must reference only tables available at its new join node; the newly created inner join
-// must receive at least one predicate that connects its left and right children, so the rule does
-// not introduce a cross-product-shaped intermediate; outer joins, side effects, and volatile
+// Preconditions: Every join rotated by the rule must be INNER and the outer expression must
+// explicitly permit arbitrary row order; every relocated conjunct must reference only tables
+// available at its new join node; the newly created inner join must receive at least one predicate
+// that connects its left and right children, so the rule does not introduce a cross-product-shaped
+// intermediate. INNER/LEFT and LEFT/LEFT associativity are invalid in general because
+// NULL-extension timing and preserved-side identity can change. Side effects and volatile
 // expressions do not exist in the slice.
 // Golden query: `SELECT t1.b, t2.c, t3.d FROM t1 JOIN t2 ON t1.a = t2.a JOIN t3 ON t2.c = t3.c`
 // proves sorted-bag equality for associated memo alternatives.

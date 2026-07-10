@@ -638,22 +638,33 @@ storage::ColumnarBatch execute_join(const plan::LogicalPlan& plan, const Catalog
         output_columns[left.column_names().size() + i].type = right.column_type(right.column_names()[i]);
     }
 
-    // Inner join order is part of the oracle contract: for each left row in
-    // input order, scan every right row in input order. Future vectorized join
-    // work must reproduce this left-row-major bag order exactly.
+    auto append_output_row = [&](std::size_t left_row, std::optional<std::size_t> right_row) {
+        std::size_t output_index = 0;
+        for (const auto& column_name : left.column_names()) {
+            output_columns[output_index++].append(cell_at(left, column_name, left_row));
+        }
+        for (const auto& column_name : right.column_names()) {
+            output_columns[output_index++].append(right_row.has_value()
+                                                      ? cell_at(right, column_name, *right_row)
+                                                      : null_cell(right.column_type(column_name)));
+        }
+    };
+
+    // Join order is part of the oracle contract: for each preserved left row
+    // in input order, scan every right row in input order. LEFT JOIN emits one
+    // NULL-extended row only when no right row's ON predicates are TRUE.
     for (std::size_t left_row = 0; left_row < left.row_count(); ++left_row) {
+        bool matched = false;
         for (std::size_t right_row = 0; right_row < right.row_count(); ++right_row) {
             if (evaluate_join_predicates(plan.predicates, left, left_row, right, right_row) != TruthValue::True) {
                 continue;
             }
 
-            std::size_t output_index = 0;
-            for (const auto& column_name : left.column_names()) {
-                output_columns[output_index++].append(cell_at(left, column_name, left_row));
-            }
-            for (const auto& column_name : right.column_names()) {
-                output_columns[output_index++].append(cell_at(right, column_name, right_row));
-            }
+            matched = true;
+            append_output_row(left_row, right_row);
+        }
+        if (!matched && plan.join_kind == plan::JoinKind::Left) {
+            append_output_row(left_row, std::nullopt);
         }
     }
 

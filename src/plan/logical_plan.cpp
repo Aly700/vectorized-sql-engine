@@ -120,6 +120,16 @@ std::string sort_key_to_string(const SortKey& key) {
     return column_to_string(key.column) + " " + sort_direction_to_string(key.direction);
 }
 
+std::string join_kind_to_string(JoinKind kind) {
+    switch (kind) {
+    case JoinKind::Inner:
+        return "Join";
+    case JoinKind::Left:
+        return "LeftJoin";
+    }
+    throw std::logic_error("unreachable join kind");
+}
+
 std::string aggregate_expression_to_string(const AggregateExpression& aggregate) {
     auto text = aggregate.output_name;
     if (aggregate.argument.has_value()) {
@@ -161,7 +171,7 @@ void append_plan(std::ostringstream& out,
         append_annotation(out, logical, annotation);
         return;
     case LogicalKind::Join:
-        out << "Join[";
+        out << join_kind_to_string(logical.join_kind) << "[";
         for (std::size_t i = 0; i < logical.predicates.size(); ++i) {
             if (i != 0) {
                 out << " AND ";

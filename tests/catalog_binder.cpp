@@ -104,6 +104,32 @@ void assert_join_binds_qualified_columns_to_stable_plan() {
     assert(printed.find("col(t2.c) > lit(200)") != std::string::npos);
 }
 
+void assert_outer_join_kinds_parse_and_bind() {
+    auto catalog = make_schema_catalog();
+
+    const auto left_parsed =
+        sql::parse_select("SELECT t1.b, t2.c FROM t1 LEFT OUTER JOIN t2 ON t1.a = t2.a");
+    assert(left_parsed.joins.size() == 1);
+    assert(left_parsed.joins[0].kind == sql::JoinKind::Left);
+
+    const auto left_logical = sql::bind_select(left_parsed, catalog);
+    const auto left_printed = plan::to_string(left_logical);
+    assert(left_printed.find("LeftJoin[col(t1.a) = col(t2.a)]") != std::string::npos);
+
+    const auto right_parsed =
+        sql::parse_select("SELECT t2.c, t1.b FROM t1 RIGHT JOIN t2 ON t1.a = t2.a");
+    assert(right_parsed.joins.size() == 1);
+    assert(right_parsed.joins[0].kind == sql::JoinKind::Right);
+
+    const auto right_logical = sql::bind_select(right_parsed, catalog);
+    const auto right_printed = plan::to_string(right_logical);
+    assert(right_printed.find("LeftJoin[col(t1.a) = col(t2.a)]") != std::string::npos);
+    assert(right_printed.find("    Scan[t2]\n    Scan[t1]") != std::string::npos);
+    assert(right_logical.input != nullptr);
+    assert(right_logical.input->kind == plan::LogicalKind::Join);
+    assert(right_logical.input->join_kind == plan::JoinKind::Left);
+}
+
 void assert_alias_binding_replaces_physical_qualifier() {
     auto catalog = make_schema_catalog();
     const auto logical =
@@ -514,6 +540,7 @@ int main() {
     assert_binds_against_schema_only_catalog();
     assert_unknown_column_still_reports_bind_error();
     assert_join_binds_qualified_columns_to_stable_plan();
+    assert_outer_join_kinds_parse_and_bind();
     assert_alias_binding_replaces_physical_qualifier();
     assert_unaliased_scan_keeps_existing_identity_text();
     assert_order_by_uses_from_scope_not_projection_outputs();
