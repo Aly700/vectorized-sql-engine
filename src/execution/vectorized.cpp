@@ -22,6 +22,10 @@ namespace {
 enum class TruthValue { False, True, Unknown };
 enum class KernelDispatch { Int64Only, Typed };
 
+[[noreturn]] void throw_subquery_not_supported() {
+    throw std::invalid_argument(plan::kVectorizedSubqueryNotSupported);
+}
+
 using SelectionVector = std::vector<std::size_t>;
 using SelectionVectorPtr = std::shared_ptr<const SelectionVector>;
 
@@ -445,6 +449,9 @@ CompiledScalar compile_scalar(const plan::BoundScalarExpr& expression, const sto
         compiled.string_literal = literal->value;
         return compiled;
     }
+    if (std::holds_alternative<plan::BoundScalarSubquery>(expression.value)) {
+        throw_subquery_not_supported();
+    }
     compiled.literal_is_null = true;
     return compiled;
 }
@@ -565,6 +572,11 @@ CompiledPredicate compile_predicate(const plan::BoundPredicate& predicate, const
     case sql::PredicateKind::IsNotNull:
         compiled.null_check = compile_scalar(predicate.null_check, batch);
         return compiled;
+    case sql::PredicateKind::In:
+    case sql::PredicateKind::NotIn:
+    case sql::PredicateKind::Exists:
+    case sql::PredicateKind::NotExists:
+        throw_subquery_not_supported();
     case sql::PredicateKind::And:
     case sql::PredicateKind::Or:
         compiled.left = std::make_shared<CompiledPredicate>(compile_predicate(require_left_predicate(predicate), batch));
@@ -842,6 +854,11 @@ PredicateMask evaluate_predicate_mask(const CompiledPredicate& predicate, const 
         return evaluate_null_check_mask(predicate.null_check, domain, false);
     case sql::PredicateKind::IsNotNull:
         return evaluate_null_check_mask(predicate.null_check, domain, true);
+    case sql::PredicateKind::In:
+    case sql::PredicateKind::NotIn:
+    case sql::PredicateKind::Exists:
+    case sql::PredicateKind::NotExists:
+        throw_subquery_not_supported();
     case sql::PredicateKind::And: {
         auto left = evaluate_predicate_mask(require_left_predicate(predicate), domain);
         auto right = evaluate_predicate_mask(require_right_predicate(predicate), domain);
@@ -935,6 +952,9 @@ CompiledJoinScalar compile_join_scalar(const plan::BoundScalarExpr& expression,
         compiled.string_literal = literal->value;
         return compiled;
     }
+    if (std::holds_alternative<plan::BoundScalarSubquery>(expression.value)) {
+        throw_subquery_not_supported();
+    }
     compiled.literal_is_null = true;
     return compiled;
 }
@@ -987,6 +1007,11 @@ CompiledJoinPredicate compile_join_predicate(const plan::BoundPredicate& predica
     case sql::PredicateKind::IsNotNull:
         compiled.null_check = compile_join_scalar(predicate.null_check, left, right);
         return compiled;
+    case sql::PredicateKind::In:
+    case sql::PredicateKind::NotIn:
+    case sql::PredicateKind::Exists:
+    case sql::PredicateKind::NotExists:
+        throw_subquery_not_supported();
     case sql::PredicateKind::And:
     case sql::PredicateKind::Or:
         compiled.left =
@@ -1019,6 +1044,11 @@ TruthValue evaluate_join_predicate(const CompiledJoinPredicate& predicate,
         return truth_from_bool(predicate.null_check.is_null(left_row, right_row));
     case sql::PredicateKind::IsNotNull:
         return truth_from_bool(!predicate.null_check.is_null(left_row, right_row));
+    case sql::PredicateKind::In:
+    case sql::PredicateKind::NotIn:
+    case sql::PredicateKind::Exists:
+    case sql::PredicateKind::NotExists:
+        throw_subquery_not_supported();
     case sql::PredicateKind::And: {
         const auto left_result = evaluate_join_predicate(require_left_predicate(predicate), left_row, right_row);
         const auto right_result = evaluate_join_predicate(require_right_predicate(predicate), left_row, right_row);
@@ -1834,6 +1864,9 @@ storage::ColumnarBatch materialize_view(const BatchView& view) {
 }
 
 bool scalar_requires_typed_dispatch(const plan::BoundScalarExpr& expression) {
+    if (std::holds_alternative<plan::BoundScalarSubquery>(expression.value)) {
+        throw_subquery_not_supported();
+    }
     return expression.type == catalog::ColumnType::String;
 }
 
@@ -1845,6 +1878,11 @@ bool predicate_requires_typed_dispatch(const plan::BoundPredicate& predicate) {
     case sql::PredicateKind::IsNull:
     case sql::PredicateKind::IsNotNull:
         return scalar_requires_typed_dispatch(predicate.null_check);
+    case sql::PredicateKind::In:
+    case sql::PredicateKind::NotIn:
+    case sql::PredicateKind::Exists:
+    case sql::PredicateKind::NotExists:
+        throw_subquery_not_supported();
     case sql::PredicateKind::And:
     case sql::PredicateKind::Or:
         if (predicate.left == nullptr || predicate.right == nullptr) {

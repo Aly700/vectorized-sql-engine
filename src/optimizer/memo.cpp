@@ -23,7 +23,13 @@ void hash_string(std::size_t& seed, const std::string& value) {
     hash_combine(seed, std::hash<std::string>{}(value));
 }
 
+void hash_logical_plan(std::size_t& seed, const plan::LogicalPlan& logical);
+bool logical_plan_equal(const plan::LogicalPlan& left, const plan::LogicalPlan& right);
+
 void hash_scalar(std::size_t& seed, const plan::BoundScalarExpr& expression) {
+    // Phase 21a subplans are opaque memo fields: hash their immutable logical
+    // trees recursively for identity, but never ingest their operators as memo
+    // children or expose them to exploration rules.
     hash_combine(seed, static_cast<std::size_t>(expression.type));
     if (const auto* column = std::get_if<plan::BoundColumnRef>(&expression.value)) {
         hash_combine(seed, 1);
@@ -44,8 +50,16 @@ void hash_scalar(std::size_t& seed, const plan::BoundScalarExpr& expression) {
         hash_string(seed, literal->value);
         return;
     }
-
-    hash_combine(seed, 4);
+    if (std::holds_alternative<sql::NullLiteral>(expression.value)) {
+        hash_combine(seed, 4);
+        return;
+    }
+    const auto& subquery = std::get<plan::BoundScalarSubquery>(expression.value);
+    if (subquery.plan == nullptr) {
+        throw std::logic_error("bound scalar subquery is missing its logical plan");
+    }
+    hash_combine(seed, 5);
+    hash_logical_plan(seed, *subquery.plan);
 }
 
 void hash_comparison(std::size_t& seed, const plan::BoundComparisonExpr& comparison) {
@@ -63,6 +77,21 @@ void hash_predicate(std::size_t& seed, const plan::BoundPredicate& predicate) {
     case sql::PredicateKind::IsNull:
     case sql::PredicateKind::IsNotNull:
         hash_scalar(seed, predicate.null_check);
+        return;
+    case sql::PredicateKind::In:
+    case sql::PredicateKind::NotIn:
+        hash_scalar(seed, predicate.in_value);
+        if (predicate.subquery == nullptr) {
+            throw std::logic_error("bound IN predicate is missing its subquery");
+        }
+        hash_logical_plan(seed, *predicate.subquery);
+        return;
+    case sql::PredicateKind::Exists:
+    case sql::PredicateKind::NotExists:
+        if (predicate.subquery == nullptr) {
+            throw std::logic_error("bound EXISTS predicate is missing its subquery");
+        }
+        hash_logical_plan(seed, *predicate.subquery);
         return;
     case sql::PredicateKind::And:
     case sql::PredicateKind::Or:
@@ -100,6 +129,47 @@ void hash_aggregate_expression(std::size_t& seed, const plan::AggregateExpressio
 void hash_sort_key(std::size_t& seed, const plan::SortKey& key) {
     hash_column(seed, key.column);
     hash_combine(seed, static_cast<std::size_t>(key.direction));
+}
+
+void hash_logical_child(std::size_t& seed, const std::shared_ptr<plan::LogicalPlan>& child) {
+    hash_combine(seed, child == nullptr ? 0 : 1);
+    if (child != nullptr) {
+        hash_logical_plan(seed, *child);
+    }
+}
+
+void hash_logical_plan(std::size_t& seed, const plan::LogicalPlan& logical) {
+    hash_combine(seed, static_cast<std::size_t>(logical.kind));
+    hash_combine(seed, static_cast<std::size_t>(logical.order_permission));
+    hash_combine(seed, static_cast<std::size_t>(logical.join_kind));
+    hash_string(seed, logical.table);
+    hash_string(seed, logical.binding_name);
+    hash_combine(seed, logical.limit_count);
+
+    hash_combine(seed, logical.projections.size());
+    for (const auto& projection : logical.projections) {
+        hash_projection(seed, projection);
+    }
+    hash_combine(seed, logical.group_keys.size());
+    for (const auto& key : logical.group_keys) {
+        hash_column(seed, key);
+    }
+    hash_combine(seed, logical.aggregate_expressions.size());
+    for (const auto& aggregate : logical.aggregate_expressions) {
+        hash_aggregate_expression(seed, aggregate);
+    }
+    hash_combine(seed, logical.sort_keys.size());
+    for (const auto& key : logical.sort_keys) {
+        hash_sort_key(seed, key);
+    }
+    hash_combine(seed, logical.predicates.size());
+    for (const auto& predicate : logical.predicates) {
+        hash_predicate(seed, predicate);
+    }
+
+    hash_logical_child(seed, logical.input);
+    hash_logical_child(seed, logical.left);
+    hash_logical_child(seed, logical.right);
 }
 
 std::size_t structural_hash(const MemoExpression& expression) {
@@ -159,7 +229,15 @@ bool scalar_equal(const plan::BoundScalarExpr& left, const plan::BoundScalarExpr
     if (const auto* left_literal = std::get_if<sql::StringLiteral>(&left.value)) {
         return left_literal->value == std::get<sql::StringLiteral>(right.value).value;
     }
-    return true;
+    if (std::holds_alternative<sql::NullLiteral>(left.value)) {
+        return true;
+    }
+    const auto& left_subquery = std::get<plan::BoundScalarSubquery>(left.value);
+    const auto& right_subquery = std::get<plan::BoundScalarSubquery>(right.value);
+    if (left_subquery.plan == nullptr || right_subquery.plan == nullptr) {
+        return left_subquery.plan == right_subquery.plan;
+    }
+    return logical_plan_equal(*left_subquery.plan, *right_subquery.plan);
 }
 
 bool comparison_equal(const plan::BoundComparisonExpr& left, const plan::BoundComparisonExpr& right) {
@@ -176,6 +254,21 @@ bool predicate_equal(const plan::BoundPredicate& left, const plan::BoundPredicat
     case sql::PredicateKind::IsNull:
     case sql::PredicateKind::IsNotNull:
         return scalar_equal(left.null_check, right.null_check);
+    case sql::PredicateKind::In:
+    case sql::PredicateKind::NotIn:
+        if (!scalar_equal(left.in_value, right.in_value)) {
+            return false;
+        }
+        if (left.subquery == nullptr || right.subquery == nullptr) {
+            return left.subquery == right.subquery;
+        }
+        return logical_plan_equal(*left.subquery, *right.subquery);
+    case sql::PredicateKind::Exists:
+    case sql::PredicateKind::NotExists:
+        if (left.subquery == nullptr || right.subquery == nullptr) {
+            return left.subquery == right.subquery;
+        }
+        return logical_plan_equal(*left.subquery, *right.subquery);
     case sql::PredicateKind::And:
     case sql::PredicateKind::Or:
         if (left.left == nullptr || left.right == nullptr || right.left == nullptr || right.right == nullptr) {
@@ -220,6 +313,27 @@ bool vector_equal(const std::vector<T>& left, const std::vector<T>& right, Equal
         }
     }
     return true;
+}
+
+bool logical_child_equal(const std::shared_ptr<plan::LogicalPlan>& left,
+                         const std::shared_ptr<plan::LogicalPlan>& right) {
+    if (left == nullptr || right == nullptr) {
+        return left == right;
+    }
+    return logical_plan_equal(*left, *right);
+}
+
+bool logical_plan_equal(const plan::LogicalPlan& left, const plan::LogicalPlan& right) {
+    return left.kind == right.kind && left.order_permission == right.order_permission &&
+           left.join_kind == right.join_kind && left.table == right.table && left.binding_name == right.binding_name &&
+           left.limit_count == right.limit_count &&
+           vector_equal(left.projections, right.projections, projection_equal) &&
+           vector_equal(left.group_keys, right.group_keys, column_equal) &&
+           vector_equal(left.aggregate_expressions, right.aggregate_expressions, aggregate_expression_equal) &&
+           vector_equal(left.sort_keys, right.sort_keys, sort_key_equal) &&
+           vector_equal(left.predicates, right.predicates, predicate_equal) &&
+           logical_child_equal(left.input, right.input) && logical_child_equal(left.left, right.left) &&
+           logical_child_equal(left.right, right.right);
 }
 
 bool structural_equal(const MemoExpression& left, const MemoExpression& right) {
@@ -267,7 +381,10 @@ std::string expression_to_string(const plan::BoundScalarExpr& expression) {
     if (const auto* literal = std::get_if<sql::StringLiteral>(&expression.value)) {
         return "lit(" + sql::quote_string_literal(literal->value) + ")";
     }
-    return "lit(NULL)";
+    if (std::holds_alternative<sql::NullLiteral>(expression.value)) {
+        return "lit(NULL)";
+    }
+    return "subquery(" + std::get<plan::BoundScalarSubquery>(expression.value).name + ")";
 }
 
 std::string column_to_string(const plan::BoundColumnRef& column) {
@@ -308,6 +425,14 @@ std::string predicate_to_string(const plan::BoundPredicate& predicate) {
         return expression_to_string(predicate.null_check) + " IS NULL";
     case sql::PredicateKind::IsNotNull:
         return expression_to_string(predicate.null_check) + " IS NOT NULL";
+    case sql::PredicateKind::In:
+        return expression_to_string(predicate.in_value) + " IN subquery(" + predicate.subquery_name + ")";
+    case sql::PredicateKind::NotIn:
+        return expression_to_string(predicate.in_value) + " NOT IN subquery(" + predicate.subquery_name + ")";
+    case sql::PredicateKind::Exists:
+        return "EXISTS subquery(" + predicate.subquery_name + ")";
+    case sql::PredicateKind::NotExists:
+        return "NOT EXISTS subquery(" + predicate.subquery_name + ")";
     case sql::PredicateKind::And:
         if (predicate.left == nullptr || predicate.right == nullptr) {
             throw std::logic_error("bound AND predicate is missing a child");
@@ -499,6 +624,8 @@ struct RelationEstimate {
     plan::LogicalPlan plan;
 };
 
+RelationEstimate estimate_logical_relation(const plan::LogicalPlan& logical, const catalog::Catalog& catalog);
+
 struct EquiJoinKeyEstimate {
     std::string left_key;
     std::string right_key;
@@ -518,6 +645,67 @@ double clamp_estimate(double value) {
 
 double safe_add(double left, double right) {
     return clamp_estimate(left + right);
+}
+
+double scalar_subquery_cost(const plan::BoundScalarExpr& expression, const catalog::Catalog& catalog) {
+    const auto* subquery = std::get_if<plan::BoundScalarSubquery>(&expression.value);
+    if (subquery == nullptr) {
+        return 0.0;
+    }
+    if (subquery->plan == nullptr) {
+        throw std::logic_error("bound scalar subquery is missing its logical plan");
+    }
+    return estimate_logical_relation(*subquery->plan, catalog).cost;
+}
+
+double predicate_subquery_cost(const plan::BoundPredicate& predicate, const catalog::Catalog& catalog) {
+    switch (predicate.kind) {
+    case sql::PredicateKind::Comparison:
+        return safe_add(scalar_subquery_cost(predicate.comparison.left, catalog),
+                        scalar_subquery_cost(predicate.comparison.right, catalog));
+    case sql::PredicateKind::IsNull:
+    case sql::PredicateKind::IsNotNull:
+        return scalar_subquery_cost(predicate.null_check, catalog);
+    case sql::PredicateKind::In:
+    case sql::PredicateKind::NotIn:
+        if (predicate.subquery == nullptr) {
+            throw std::logic_error("bound IN predicate is missing its subquery");
+        }
+        return safe_add(scalar_subquery_cost(predicate.in_value, catalog),
+                        estimate_logical_relation(*predicate.subquery, catalog).cost);
+    case sql::PredicateKind::Exists:
+    case sql::PredicateKind::NotExists:
+        if (predicate.subquery == nullptr) {
+            throw std::logic_error("bound EXISTS predicate is missing its subquery");
+        }
+        return estimate_logical_relation(*predicate.subquery, catalog).cost;
+    case sql::PredicateKind::And:
+    case sql::PredicateKind::Or:
+        if (predicate.left == nullptr || predicate.right == nullptr) {
+            throw std::logic_error("bound predicate is missing a child");
+        }
+        return safe_add(predicate_subquery_cost(*predicate.left, catalog),
+                        predicate_subquery_cost(*predicate.right, catalog));
+    }
+    throw std::logic_error("unreachable predicate kind");
+}
+
+double predicates_subquery_cost(const std::vector<plan::BoundPredicate>& predicates,
+                                const catalog::Catalog& catalog) {
+    double cost = 0.0;
+    for (const auto& predicate : predicates) {
+        cost = safe_add(cost, predicate_subquery_cost(predicate, catalog));
+    }
+    return cost;
+}
+
+double projections_subquery_cost(const std::vector<plan::Projection>& projections,
+                                 const catalog::Catalog& catalog) {
+    double cost = 0.0;
+    for (const auto& projection : projections) {
+        cost = safe_add(cost, scalar_subquery_cost(projection.expression, catalog));
+    }
+    return cost;
 }
 
 double safe_multiply(double left, double right) {
@@ -616,6 +804,12 @@ double predicate_selectivity(const plan::BoundPredicate& predicate) {
         return kEqualitySelectivity;
     case sql::PredicateKind::IsNotNull:
         return kNotEqualSelectivity;
+    case sql::PredicateKind::In:
+    case sql::PredicateKind::Exists:
+        return kEqualitySelectivity;
+    case sql::PredicateKind::NotIn:
+    case sql::PredicateKind::NotExists:
+        return kNotEqualSelectivity;
     case sql::PredicateKind::And: {
         if (predicate.left == nullptr || predicate.right == nullptr) {
             throw std::logic_error("bound AND predicate is missing a child");
@@ -706,12 +900,14 @@ RelationEstimate scan_estimate(const std::string& table,
 
 RelationEstimate filter_estimate(const std::vector<plan::BoundPredicate>& predicates,
                                  RelationEstimate child,
-                                 plan::OrderPermission order_permission) {
+                                 plan::OrderPermission order_permission,
+                                 const catalog::Catalog& catalog) {
     const auto selectivity = combined_selectivity(predicates);
     RelationEstimate estimate;
     estimate.rows = safe_multiply(child.rows, selectivity);
-    // Filter cost is one linear predicate pass over its input, plus child cost.
-    estimate.cost = safe_add(child.cost, child.rows);
+    // An uncorrelated embedded subplan is materialized once by the owning
+    // operator, never once per input row and never as a memo child.
+    estimate.cost = safe_add(safe_add(child.cost, child.rows), predicates_subquery_cost(predicates, catalog));
     for (const auto& [column, distinct] : child.distinct_by_column) {
         estimate.distinct_by_column[column] = std::min(safe_multiply(distinct, selectivity), estimate.rows);
     }
@@ -722,11 +918,12 @@ RelationEstimate filter_estimate(const std::vector<plan::BoundPredicate>& predic
 
 RelationEstimate project_estimate(const std::vector<plan::Projection>& projections,
                                   RelationEstimate child,
-                                  plan::OrderPermission order_permission) {
+                                  plan::OrderPermission order_permission,
+                                  const catalog::Catalog& catalog) {
     RelationEstimate estimate;
     estimate.rows = child.rows;
     // Project is cost-neutral for join-order choice in this logical slice.
-    estimate.cost = child.cost;
+    estimate.cost = safe_add(child.cost, projections_subquery_cost(projections, catalog));
     for (const auto& projection : projections) {
         if (const auto* column = std::get_if<plan::BoundColumnRef>(&projection.expression.value)) {
             const auto key = column_key(*column);
@@ -838,7 +1035,8 @@ RelationEstimate join_estimate(const std::vector<plan::BoundPredicate>& predicat
                                RelationEstimate left,
                                RelationEstimate right,
                                plan::JoinKind join_kind,
-                               plan::OrderPermission order_permission) {
+                               plan::OrderPermission order_permission,
+                               const catalog::Catalog& catalog) {
     std::optional<EquiJoinKeyEstimate> equi_key;
     std::optional<std::size_t> equi_predicate_index;
     for (std::size_t i = 0; i < predicates.size(); ++i) {
@@ -861,7 +1059,8 @@ RelationEstimate join_estimate(const std::vector<plan::BoundPredicate>& predicat
     // Equi-join cost models a linear hash build+probe; without an equi key the
     // logical alternative is costed as nested-loop work over every pair.
     const auto local_cost = equi_key.has_value() ? safe_add(left.rows, right.rows) : cross_rows;
-    estimate.cost = safe_add(safe_add(left.cost, right.cost), local_cost);
+    estimate.cost = safe_add(safe_add(safe_add(left.cost, right.cost), local_cost),
+                             predicates_subquery_cost(predicates, catalog));
     estimate.distinct_by_column = left.distinct_by_column;
     estimate.distinct_by_column.insert(right.distinct_by_column.begin(), right.distinct_by_column.end());
     for (auto& [_, distinct] : estimate.distinct_by_column) {
@@ -885,11 +1084,13 @@ RelationEstimate estimate_logical_relation(const plan::LogicalPlan& logical, con
     case plan::LogicalKind::Filter:
         return filter_estimate(logical.predicates,
                                estimate_logical_relation(require_input(logical), catalog),
-                               logical.order_permission);
+                               logical.order_permission,
+                               catalog);
     case plan::LogicalKind::Project:
         return project_estimate(logical.projections,
                                 estimate_logical_relation(require_input(logical), catalog),
-                                logical.order_permission);
+                                logical.order_permission,
+                                catalog);
     case plan::LogicalKind::Aggregate:
         return aggregate_estimate(logical.group_keys,
                                   logical.aggregate_expressions,
@@ -910,7 +1111,8 @@ RelationEstimate estimate_logical_relation(const plan::LogicalPlan& logical, con
                              estimate_logical_relation(require_left(logical), catalog),
                              estimate_logical_relation(require_right(logical), catalog),
                              logical.join_kind,
-                             logical.order_permission);
+                             logical.order_permission,
+                             catalog);
     case plan::LogicalKind::Explain:
         throw std::invalid_argument("EXPLAIN logical plans cannot be costed directly");
     }
@@ -977,11 +1179,13 @@ private:
         case MemoExpressionKind::Filter:
             return filter_estimate(expression.predicates,
                                    best_for_group(expression.children.at(0), stack).estimate,
-                                   expression.order_permission);
+                                   expression.order_permission,
+                                   catalog_);
         case MemoExpressionKind::Project:
             return project_estimate(expression.projections,
                                     best_for_group(expression.children.at(0), stack).estimate,
-                                    expression.order_permission);
+                                    expression.order_permission,
+                                    catalog_);
         case MemoExpressionKind::Aggregate:
             return aggregate_estimate(expression.group_keys,
                                       expression.aggregate_expressions,
@@ -1003,7 +1207,8 @@ private:
                                  best_for_group(expression.children.at(0), stack).estimate,
                                  best_for_group(expression.children.at(1), stack).estimate,
                                  expression.join_kind,
-                                 expression.order_permission);
+                                 expression.order_permission,
+                                 catalog_);
         case MemoExpressionKind::GroupRef:
             return best_for_group(expression.children.at(0), stack).estimate;
         }
@@ -1018,6 +1223,9 @@ private:
 } // namespace
 
 GroupId Memo::insert(const plan::LogicalPlan& logical) {
+    // Embedded subplans stay inside predicates/scalars. The structural helpers
+    // above include their full trees, while this relational ingest deliberately
+    // follows only input/left/right so Phase 21a exploration cannot enter them.
     MemoExpression expression;
     expression.order_permission = logical.order_permission;
     switch (logical.kind) {

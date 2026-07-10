@@ -409,6 +409,110 @@ int main() {
             ExpectedResult{{"a", "b", "99"}, {{2, 20, 99}, {3, 20, 99}}},
         },
         GoldenQuery{
+            "scalar subquery one row compares as its value",
+            "SELECT a FROM t WHERE a = (SELECT a FROM t ORDER BY a LIMIT 1)",
+            ExpectedResult{{"a"}, {{1}}},
+        },
+        GoldenQuery{
+            "scalar subquery zero rows is NULL",
+            "SELECT a FROM t WHERE (SELECT a FROM empty) IS NULL",
+            ExpectedResult{{"a"}, {{1}, {2}, {3}, {4}}},
+        },
+        GoldenQuery{
+            "scalar subquery one NULL row preserves NULL",
+            "SELECT a FROM t WHERE (SELECT k FROM nullable WHERE k IS NULL LIMIT 1) IS NULL",
+            ExpectedResult{{"a"}, {{1}, {2}, {3}, {4}}},
+        },
+        GoldenQuery{
+            "scalar subquery multiple rows fails loudly",
+            "SELECT a FROM t WHERE (SELECT a FROM t) = a",
+            ExpectedResult{},
+            true,
+            ExpectedError{ErrorKind::Runtime, 0, "scalar subquery at position 22 returned more than one row"},
+        },
+        GoldenQuery{
+            "scalar subquery is prepared even when outer input is empty",
+            "SELECT a FROM empty WHERE (SELECT a FROM t) = a",
+            ExpectedResult{},
+            true,
+            ExpectedError{ErrorKind::Runtime, 0, "scalar subquery at position 26 returned more than one row"},
+        },
+        GoldenQuery{
+            "IN over empty set is false even for NULL left values",
+            "SELECT k FROM nullable WHERE k IN (SELECT a FROM empty)",
+            ExpectedResult{{"k"}, {}},
+        },
+        GoldenQuery{
+            "NOT IN over empty set is true even for NULL left values",
+            "SELECT k FROM nullable WHERE k NOT IN (SELECT a FROM empty)",
+            ExpectedResult{{"k"}, {{1}, {std::nullopt}, {2}, {std::nullopt}}},
+        },
+        GoldenQuery{
+            "IN NULL-bearing set keeps matching non-NULL values",
+            "SELECT a FROM t WHERE a IN (SELECT k FROM nullable)",
+            ExpectedResult{{"a"}, {{1}, {2}}},
+        },
+        GoldenQuery{
+            "NOT IN NULL-bearing set can never be true without a match",
+            "SELECT a FROM t WHERE a NOT IN (SELECT k FROM nullable)",
+            ExpectedResult{{"a"}, {}},
+        },
+        GoldenQuery{
+            "NULL left operand with non-empty IN set is UNKNOWN",
+            "SELECT k FROM nullable WHERE k IN (SELECT a FROM t1)",
+            ExpectedResult{{"k"}, {{1}, {2}}},
+        },
+        GoldenQuery{
+            "NOT IN non-NULL set keeps only nonmatching non-NULL values",
+            "SELECT a FROM t WHERE a NOT IN (SELECT a FROM t1)",
+            ExpectedResult{{"a"}, {{3}, {4}}},
+        },
+        GoldenQuery{
+            "EXISTS ignores row NULLs",
+            "SELECT a FROM t WHERE EXISTS (SELECT k FROM nullable WHERE k IS NULL)",
+            ExpectedResult{{"a"}, {{1}, {2}, {3}, {4}}},
+        },
+        GoldenQuery{
+            "NOT EXISTS negates non-empty subquery",
+            "SELECT a FROM t WHERE NOT EXISTS (SELECT k FROM nullable WHERE k IS NULL)",
+            ExpectedResult{{"a"}, {}},
+        },
+        GoldenQuery{
+            "EXISTS over LIMIT zero is false",
+            "SELECT a FROM t WHERE EXISTS (SELECT a FROM t LIMIT 0)",
+            ExpectedResult{{"a"}, {}},
+        },
+        GoldenQuery{
+            "NOT EXISTS over LIMIT zero is true",
+            "SELECT a FROM t WHERE NOT EXISTS (SELECT a FROM t LIMIT 0)",
+            ExpectedResult{{"a"}, {{1}, {2}, {3}, {4}}},
+        },
+        GoldenQuery{
+            "nested uncorrelated subqueries evaluate recursively",
+            "SELECT a FROM t WHERE a IN (SELECT a FROM t1 WHERE EXISTS (SELECT a FROM t2 WHERE a = 3))",
+            ExpectedResult{{"a"}, {{1}, {2}}},
+        },
+        GoldenQuery{
+            "IN subquery over join uses joined rows",
+            "SELECT a FROM t WHERE a IN (SELECT t1.a FROM t1 JOIN t2 ON t1.a = t2.a)",
+            ExpectedResult{{"a"}, {{2}}},
+        },
+        GoldenQuery{
+            "EXISTS subquery in JOIN ON participates in true-only matching",
+            "SELECT t1.b, t2.c FROM t1 JOIN t2 ON t1.a = t2.a AND EXISTS (SELECT a FROM t LIMIT 0)",
+            ExpectedResult{{"t1.b", "t2.c"}, {}},
+        },
+        GoldenQuery{
+            "IN subquery in HAVING filters groups by grouped outer value",
+            "SELECT a, COUNT(*) FROM t GROUP BY a HAVING a IN (SELECT a FROM t1)",
+            ExpectedResult{{"a", "COUNT(*)"}, {{1, 1}, {2, 1}}},
+        },
+        GoldenQuery{
+            "scalar subquery over aggregate is exactly one row",
+            "SELECT a FROM t WHERE a = (SELECT MAX(a) FROM t1)",
+            ExpectedResult{{"a"}, {{2}}},
+        },
+        GoldenQuery{
             "projected NULL literal uses literal output name",
             "SELECT NULL FROM t LIMIT 2",
             ExpectedResult{{"NULL"}, {{std::nullopt}, {std::nullopt}}},

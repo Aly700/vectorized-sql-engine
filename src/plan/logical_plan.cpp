@@ -3,6 +3,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <variant>
+#include <vector>
 
 namespace plan {
 namespace {
@@ -41,7 +42,11 @@ std::string expression_to_string(const BoundScalarExpr& expression) {
     if (const auto* literal = std::get_if<sql::StringLiteral>(&expression.value)) {
         return "lit(" + sql::quote_string_literal(literal->value) + ")";
     }
-    return "lit(NULL)";
+    if (std::holds_alternative<sql::NullLiteral>(expression.value)) {
+        return "lit(NULL)";
+    }
+    const auto& subquery = std::get<BoundScalarSubquery>(expression.value);
+    return "subquery(" + subquery.name + ")";
 }
 
 std::string column_to_string(const BoundColumnRef& column) {
@@ -96,6 +101,14 @@ std::string predicate_to_string(const BoundPredicate& predicate) {
         return expression_to_string(predicate.null_check) + " IS NULL";
     case sql::PredicateKind::IsNotNull:
         return expression_to_string(predicate.null_check) + " IS NOT NULL";
+    case sql::PredicateKind::In:
+        return expression_to_string(predicate.in_value) + " IN subquery(" + predicate.subquery_name + ")";
+    case sql::PredicateKind::NotIn:
+        return expression_to_string(predicate.in_value) + " NOT IN subquery(" + predicate.subquery_name + ")";
+    case sql::PredicateKind::Exists:
+        return "EXISTS subquery(" + predicate.subquery_name + ")";
+    case sql::PredicateKind::NotExists:
+        return "NOT EXISTS subquery(" + predicate.subquery_name + ")";
     case sql::PredicateKind::And:
         return "(" + predicate_to_string(require_left_predicate(predicate)) + " AND " +
                predicate_to_string(require_right_predicate(predicate)) + ")";
@@ -156,10 +169,69 @@ void append_annotation(std::ostringstream& out,
     }
 }
 
+struct OwnedSubplan {
+    std::string label;
+    std::shared_ptr<const LogicalPlan> plan;
+};
+
+void collect_scalar_subplans(const BoundScalarExpr& expression, std::vector<OwnedSubplan>& subplans) {
+    if (const auto* subquery = std::get_if<BoundScalarSubquery>(&expression.value)) {
+        subplans.push_back(OwnedSubplan{subquery->name, subquery->plan});
+    }
+}
+
+void collect_predicate_subplans(const BoundPredicate& predicate, std::vector<OwnedSubplan>& subplans) {
+    switch (predicate.kind) {
+    case sql::PredicateKind::Comparison:
+        collect_scalar_subplans(predicate.comparison.left, subplans);
+        collect_scalar_subplans(predicate.comparison.right, subplans);
+        return;
+    case sql::PredicateKind::IsNull:
+    case sql::PredicateKind::IsNotNull:
+        collect_scalar_subplans(predicate.null_check, subplans);
+        return;
+    case sql::PredicateKind::In:
+    case sql::PredicateKind::NotIn:
+        collect_scalar_subplans(predicate.in_value, subplans);
+        subplans.push_back(OwnedSubplan{predicate.subquery_name, predicate.subquery});
+        return;
+    case sql::PredicateKind::Exists:
+    case sql::PredicateKind::NotExists:
+        subplans.push_back(OwnedSubplan{predicate.subquery_name, predicate.subquery});
+        return;
+    case sql::PredicateKind::And:
+    case sql::PredicateKind::Or:
+        collect_predicate_subplans(require_left_predicate(predicate), subplans);
+        collect_predicate_subplans(require_right_predicate(predicate), subplans);
+        return;
+    }
+    throw std::logic_error("unreachable predicate kind");
+}
+
 void append_plan(std::ostringstream& out,
                  const LogicalPlan& logical,
                  std::size_t depth,
-                 const std::function<std::string(const LogicalPlan&)>& annotation = {}) {
+                 const std::function<std::string(const LogicalPlan&)>& annotation);
+
+void append_owned_subplans(std::ostringstream& out,
+                           const std::vector<OwnedSubplan>& subplans,
+                           std::size_t depth,
+                           const std::function<std::string(const LogicalPlan&)>& annotation) {
+    for (const auto& subplan : subplans) {
+        if (subplan.plan == nullptr) {
+            throw std::invalid_argument("bound subquery is missing its logical plan");
+        }
+        out << "\n";
+        append_indent(out, depth);
+        out << "Subquery[" << subplan.label << "]\n";
+        append_plan(out, *subplan.plan, depth + 1, annotation);
+    }
+}
+
+void append_plan(std::ostringstream& out,
+                 const LogicalPlan& logical,
+                 std::size_t depth,
+                 const std::function<std::string(const LogicalPlan&)>& annotation) {
     append_indent(out, depth);
     switch (logical.kind) {
     case LogicalKind::Scan:
@@ -170,7 +242,7 @@ void append_plan(std::ostringstream& out,
         out << "]";
         append_annotation(out, logical, annotation);
         return;
-    case LogicalKind::Join:
+    case LogicalKind::Join: {
         out << join_kind_to_string(logical.join_kind) << "[";
         for (std::size_t i = 0; i < logical.predicates.size(); ++i) {
             if (i != 0) {
@@ -180,12 +252,18 @@ void append_plan(std::ostringstream& out,
         }
         out << "]";
         append_annotation(out, logical, annotation);
+        std::vector<OwnedSubplan> subplans;
+        for (const auto& predicate : logical.predicates) {
+            collect_predicate_subplans(predicate, subplans);
+        }
+        append_owned_subplans(out, subplans, depth + 1, annotation);
         out << "\n";
         append_plan(out, require_left(logical), depth + 1, annotation);
         out << "\n";
         append_plan(out, require_right(logical), depth + 1, annotation);
         return;
-    case LogicalKind::Filter:
+    }
+    case LogicalKind::Filter: {
         out << "Filter[";
         for (std::size_t i = 0; i < logical.predicates.size(); ++i) {
             if (i != 0) {
@@ -195,10 +273,16 @@ void append_plan(std::ostringstream& out,
         }
         out << "]";
         append_annotation(out, logical, annotation);
+        std::vector<OwnedSubplan> subplans;
+        for (const auto& predicate : logical.predicates) {
+            collect_predicate_subplans(predicate, subplans);
+        }
+        append_owned_subplans(out, subplans, depth + 1, annotation);
         out << "\n";
         append_plan(out, require_input(logical), depth + 1, annotation);
         return;
-    case LogicalKind::Project:
+    }
+    case LogicalKind::Project: {
         out << "Project[";
         for (std::size_t i = 0; i < logical.projections.size(); ++i) {
             if (i != 0) {
@@ -208,9 +292,15 @@ void append_plan(std::ostringstream& out,
         }
         out << "]";
         append_annotation(out, logical, annotation);
+        std::vector<OwnedSubplan> subplans;
+        for (const auto& projection : logical.projections) {
+            collect_scalar_subplans(projection.expression, subplans);
+        }
+        append_owned_subplans(out, subplans, depth + 1, annotation);
         out << "\n";
         append_plan(out, require_input(logical), depth + 1, annotation);
         return;
+    }
     case LogicalKind::Aggregate:
         out << "Aggregate[group_keys=[";
         for (std::size_t i = 0; i < logical.group_keys.size(); ++i) {
@@ -270,7 +360,7 @@ void append_plan(std::ostringstream& out,
 
 std::string to_string(const LogicalPlan& logical) {
     std::ostringstream out;
-    append_plan(out, logical, 0);
+    append_plan(out, logical, 0, {});
     return out.str();
 }
 

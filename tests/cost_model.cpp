@@ -632,6 +632,29 @@ void assert_extract_best_prefers_pushed_one_side_or_filter() {
     }
 }
 
+void assert_subquery_cost_is_added_once_to_owning_filter() {
+    const auto catalog = make_skewed_catalog();
+    const auto sql = "SELECT k FROM big WHERE k IN (SELECT k FROM tiny)";
+    const auto logical = sql::bind_select(sql::parse_select(sql), catalog);
+
+    const auto estimate = optimizer::estimate_cost(logical, catalog);
+    if (estimate.rows != 100.0 || estimate.cost != 2002.0) {
+        std::cerr << "subquery cost was not added exactly once to its owning filter\n"
+                  << "sql: " << sql << "\n"
+                  << "plan:\n" << plan::to_string(logical) << "\n"
+                  << "rows: " << estimate.rows << "\n"
+                  << "cost: " << estimate.cost << "\n";
+        std::terminate();
+    }
+
+    optimizer::GroupId root = 0;
+    auto memo = explored_memo_for(logical, root);
+    const auto best = memo.extract_best(root, catalog);
+    const auto best_estimate = optimizer::estimate_cost(best, catalog);
+    assert(best_estimate.rows == 100.0);
+    assert(best_estimate.cost == 2002.0);
+}
+
 } // namespace
 
 int main() {
@@ -651,5 +674,6 @@ int main() {
     assert_having_does_not_block_join_transforms();
     assert_extract_best_prefers_pushed_join_filter();
     assert_extract_best_prefers_pushed_one_side_or_filter();
+    assert_subquery_cost_is_added_once_to_owning_filter();
     return 0;
 }

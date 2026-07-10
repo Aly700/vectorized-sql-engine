@@ -100,6 +100,14 @@ struct OutputColumn {
 
 enum class TruthValue { False, True, Unknown };
 
+struct ExecutionContext {
+    const Catalog& catalog;
+    std::map<const plan::LogicalPlan*, storage::ColumnarBatch> subquery_results;
+};
+
+storage::ColumnarBatch execute_node(const plan::LogicalPlan& plan, ExecutionContext& context);
+void prepare_subqueries(const plan::LogicalPlan& plan, ExecutionContext& context);
+
 const plan::LogicalPlan& require_input(const plan::LogicalPlan& plan) {
     if (!plan.input) {
         throw std::invalid_argument("logical plan node is missing its input");
@@ -145,9 +153,45 @@ Cell cell_at(const storage::ColumnarBatch& batch, const std::string& name, std::
     return string_cell(column.at(row));
 }
 
+const storage::ColumnarBatch& materialize_subquery(const std::shared_ptr<const plan::LogicalPlan>& subquery,
+                                                  ExecutionContext& context) {
+    if (subquery == nullptr) {
+        throw std::invalid_argument("bound subquery is missing its logical plan");
+    }
+    if (const auto existing = context.subquery_results.find(subquery.get());
+        existing != context.subquery_results.end()) {
+        return existing->second;
+    }
+
+    // Phase 21a subplans are uncorrelated and immutable. Prepare their nested
+    // subqueries first, then execute this plan exactly once for the top-level
+    // query and retain the materialized batch for every outer row.
+    prepare_subqueries(*subquery, context);
+    auto result = execute_node(*subquery, context);
+    const auto [inserted, _] = context.subquery_results.emplace(subquery.get(), std::move(result));
+    return inserted->second;
+}
+
+Cell evaluate_scalar_subquery(const plan::BoundScalarSubquery& subquery,
+                              catalog::ColumnType type,
+                              ExecutionContext& context) {
+    const auto& result = materialize_subquery(subquery.plan, context);
+    if (result.row_count() == 0) {
+        return null_cell(type);
+    }
+    if (result.row_count() > 1) {
+        throw std::runtime_error(subquery.name + " returned more than one row");
+    }
+    if (result.column_names().size() != 1) {
+        throw std::logic_error("bound scalar subquery did not produce exactly one output column");
+    }
+    return cell_at(result, result.column_names().front(), 0);
+}
+
 Cell evaluate_scalar(const plan::BoundScalarExpr& expression,
                      const storage::ColumnarBatch& batch,
-                     std::size_t row) {
+                     std::size_t row,
+                     ExecutionContext& context) {
     if (const auto* column = std::get_if<plan::BoundColumnRef>(&expression.value)) {
         return cell_at(batch, column_identity_name(*column), row);
     }
@@ -157,7 +201,12 @@ Cell evaluate_scalar(const plan::BoundScalarExpr& expression,
     if (const auto* literal = std::get_if<sql::StringLiteral>(&expression.value)) {
         return string_cell(literal->value);
     }
-    return null_cell(expression.type);
+    if (std::holds_alternative<sql::NullLiteral>(expression.value)) {
+        return null_cell(expression.type);
+    }
+    const auto& subquery = std::get<plan::BoundScalarSubquery>(expression.value);
+    const auto value = evaluate_scalar_subquery(subquery, expression.type, context);
+    return value.is_null ? null_cell(expression.type) : value;
 }
 
 bool compare_values(const Cell& left, sql::ComparisonOp op, const Cell& right) {
@@ -202,15 +251,52 @@ TruthValue or_truth(TruthValue left, TruthValue right) {
     return TruthValue::Unknown;
 }
 
+TruthValue not_truth(TruthValue value) {
+    if (value == TruthValue::Unknown) {
+        return TruthValue::Unknown;
+    }
+    return value == TruthValue::True ? TruthValue::False : TruthValue::True;
+}
+
 TruthValue evaluate_comparison(const plan::BoundComparisonExpr& comparison,
                                const storage::ColumnarBatch& batch,
-                               std::size_t row) {
-    const auto left = evaluate_scalar(comparison.left, batch, row);
-    const auto right = evaluate_scalar(comparison.right, batch, row);
+                               std::size_t row,
+                               ExecutionContext& context) {
+    const auto left = evaluate_scalar(comparison.left, batch, row, context);
+    const auto right = evaluate_scalar(comparison.right, batch, row, context);
     if (left.is_null || right.is_null) {
         return TruthValue::Unknown;
     }
     return truth_from_bool(compare_values(left, comparison.op, right));
+}
+
+TruthValue evaluate_in(const Cell& value,
+                       const plan::BoundPredicate& predicate,
+                       ExecutionContext& context) {
+    const auto& result = materialize_subquery(predicate.subquery, context);
+    if (result.row_count() == 0) {
+        return TruthValue::False;
+    }
+    if (result.column_names().size() != 1) {
+        throw std::logic_error("bound IN subquery did not produce exactly one output column");
+    }
+    if (value.is_null) {
+        return TruthValue::Unknown;
+    }
+
+    bool contains_null = false;
+    const auto& column = result.column_names().front();
+    for (std::size_t row = 0; row < result.row_count(); ++row) {
+        const auto member = cell_at(result, column, row);
+        if (member.is_null) {
+            contains_null = true;
+            continue;
+        }
+        if (value == member) {
+            return TruthValue::True;
+        }
+    }
+    return contains_null ? TruthValue::Unknown : TruthValue::False;
 }
 
 const plan::BoundPredicate& require_left_predicate(const plan::BoundPredicate& predicate) {
@@ -227,24 +313,37 @@ const plan::BoundPredicate& require_right_predicate(const plan::BoundPredicate& 
     return *predicate.right;
 }
 
-TruthValue evaluate_predicate(const plan::BoundPredicate& predicate, const storage::ColumnarBatch& batch, std::size_t row) {
+TruthValue evaluate_predicate(const plan::BoundPredicate& predicate,
+                              const storage::ColumnarBatch& batch,
+                              std::size_t row,
+                              ExecutionContext& context) {
     switch (predicate.kind) {
     case sql::PredicateKind::Comparison:
-        return evaluate_comparison(predicate.comparison, batch, row);
+        return evaluate_comparison(predicate.comparison, batch, row, context);
     case sql::PredicateKind::IsNull:
-        return truth_from_bool(evaluate_scalar(predicate.null_check, batch, row).is_null);
+        return truth_from_bool(evaluate_scalar(predicate.null_check, batch, row, context).is_null);
     case sql::PredicateKind::IsNotNull:
-        return truth_from_bool(!evaluate_scalar(predicate.null_check, batch, row).is_null);
+        return truth_from_bool(!evaluate_scalar(predicate.null_check, batch, row, context).is_null);
+    case sql::PredicateKind::In:
+    case sql::PredicateKind::NotIn: {
+        const auto result = evaluate_in(evaluate_scalar(predicate.in_value, batch, row, context), predicate, context);
+        return predicate.kind == sql::PredicateKind::NotIn ? not_truth(result) : result;
+    }
+    case sql::PredicateKind::Exists:
+    case sql::PredicateKind::NotExists: {
+        const auto exists = truth_from_bool(materialize_subquery(predicate.subquery, context).row_count() != 0);
+        return predicate.kind == sql::PredicateKind::NotExists ? not_truth(exists) : exists;
+    }
     case sql::PredicateKind::And: {
         // Predicate trees are pure in this SQL slice, but evaluation order is
         // still fixed: left child, right child, then the boolean operator.
-        const auto left = evaluate_predicate(require_left_predicate(predicate), batch, row);
-        const auto right = evaluate_predicate(require_right_predicate(predicate), batch, row);
+        const auto left = evaluate_predicate(require_left_predicate(predicate), batch, row, context);
+        const auto right = evaluate_predicate(require_right_predicate(predicate), batch, row, context);
         return and_truth(left, right);
     }
     case sql::PredicateKind::Or: {
-        const auto left = evaluate_predicate(require_left_predicate(predicate), batch, row);
-        const auto right = evaluate_predicate(require_right_predicate(predicate), batch, row);
+        const auto left = evaluate_predicate(require_left_predicate(predicate), batch, row, context);
+        const auto right = evaluate_predicate(require_right_predicate(predicate), batch, row, context);
         return or_truth(left, right);
     }
     }
@@ -253,41 +352,46 @@ TruthValue evaluate_predicate(const plan::BoundPredicate& predicate, const stora
 
 TruthValue evaluate_predicates(const std::vector<plan::BoundPredicate>& predicates,
                                const storage::ColumnarBatch& batch,
-                               std::size_t row) {
+                               std::size_t row,
+                               ExecutionContext& context) {
     auto keep = TruthValue::True;
     for (const auto& predicate : predicates) {
-        const auto predicate_result = evaluate_predicate(predicate, batch, row);
+        const auto predicate_result = evaluate_predicate(predicate, batch, row, context);
         keep = and_truth(keep, predicate_result);
     }
     return keep;
 }
 
 storage::RowMask evaluate_filter(const std::vector<plan::BoundPredicate>& predicates,
-                                 const storage::ColumnarBatch& batch) {
+                                 const storage::ColumnarBatch& batch,
+                                 ExecutionContext& context) {
     storage::RowMask mask;
     mask.keep.reserve(batch.row_count());
     for (std::size_t row = 0; row < batch.row_count(); ++row) {
-        mask.keep.push_back(evaluate_predicates(predicates, batch, row) == TruthValue::True ? 1 : 0);
+        mask.keep.push_back(evaluate_predicates(predicates, batch, row, context) == TruthValue::True ? 1 : 0);
     }
     return mask;
 }
 
-OutputColumn evaluate_projection(const plan::Projection& projection, const storage::ColumnarBatch& batch) {
+OutputColumn evaluate_projection(const plan::Projection& projection,
+                                 const storage::ColumnarBatch& batch,
+                                 ExecutionContext& context) {
     OutputColumn column;
     column.type = projection.type;
     for (std::size_t row = 0; row < batch.row_count(); ++row) {
-        column.append(evaluate_scalar(projection.expression, batch, row));
+        column.append(evaluate_scalar(projection.expression, batch, row, context));
     }
     return column;
 }
 
 OutputColumn evaluate_projection(const plan::Projection& projection,
                                  const storage::ColumnarBatch& batch,
-                                 const std::vector<std::size_t>& rows) {
+                                 const std::vector<std::size_t>& rows,
+                                 ExecutionContext& context) {
     OutputColumn column;
     column.type = projection.type;
     for (auto row : rows) {
-        column.append(evaluate_scalar(projection.expression, batch, row));
+        column.append(evaluate_scalar(projection.expression, batch, row, context));
     }
     return column;
 }
@@ -345,10 +449,11 @@ std::vector<Cell> row_values(const storage::ColumnarBatch& batch, std::size_t ro
 
 storage::ColumnarBatch materialize_project_rows(const plan::LogicalPlan& project,
                                                 const storage::ColumnarBatch& batch,
-                                                const std::vector<std::size_t>& rows) {
+                                                const std::vector<std::size_t>& rows,
+                                                ExecutionContext& context) {
     storage::ColumnarBatch out;
     for (const auto& projection : project.projections) {
-        auto column = evaluate_projection(projection, batch, rows);
+        auto column = evaluate_projection(projection, batch, rows, context);
         std::move(column).add_to(out, projection.output_name);
     }
     return out;
@@ -390,14 +495,15 @@ void add_missing_sort_key_columns(storage::ColumnarBatch& sort_input,
 
 storage::ColumnarBatch materialize_project_sort_input(const plan::LogicalPlan& project,
                                                       const storage::ColumnarBatch& source,
-                                                      const std::vector<plan::SortKey>& sort_keys) {
+                                                      const std::vector<plan::SortKey>& sort_keys,
+                                                      ExecutionContext& context) {
     std::vector<std::size_t> rows;
     rows.reserve(source.row_count());
     for (std::size_t row = 0; row < source.row_count(); ++row) {
         rows.push_back(row);
     }
 
-    auto sort_input = materialize_project_rows(project, source, rows);
+    auto sort_input = materialize_project_rows(project, source, rows, context);
     add_missing_sort_key_columns(sort_input, source, sort_keys);
     return sort_input;
 }
@@ -531,6 +637,63 @@ GroupState make_group(std::vector<Cell> key_values, const plan::LogicalPlan& pla
     return group;
 }
 
+void prepare_scalar_subquery(const plan::BoundScalarExpr& expression, ExecutionContext& context) {
+    const auto* subquery = std::get_if<plan::BoundScalarSubquery>(&expression.value);
+    if (subquery == nullptr) {
+        return;
+    }
+    const auto& result = materialize_subquery(subquery->plan, context);
+    if (result.row_count() > 1) {
+        throw std::runtime_error(subquery->name + " returned more than one row");
+    }
+}
+
+void prepare_predicate_subqueries(const plan::BoundPredicate& predicate, ExecutionContext& context) {
+    switch (predicate.kind) {
+    case sql::PredicateKind::Comparison:
+        prepare_scalar_subquery(predicate.comparison.left, context);
+        prepare_scalar_subquery(predicate.comparison.right, context);
+        return;
+    case sql::PredicateKind::IsNull:
+    case sql::PredicateKind::IsNotNull:
+        prepare_scalar_subquery(predicate.null_check, context);
+        return;
+    case sql::PredicateKind::In:
+    case sql::PredicateKind::NotIn:
+        prepare_scalar_subquery(predicate.in_value, context);
+        (void)materialize_subquery(predicate.subquery, context);
+        return;
+    case sql::PredicateKind::Exists:
+    case sql::PredicateKind::NotExists:
+        (void)materialize_subquery(predicate.subquery, context);
+        return;
+    case sql::PredicateKind::And:
+    case sql::PredicateKind::Or:
+        prepare_predicate_subqueries(require_left_predicate(predicate), context);
+        prepare_predicate_subqueries(require_right_predicate(predicate), context);
+        return;
+    }
+    throw std::logic_error("unreachable predicate kind");
+}
+
+void prepare_subqueries(const plan::LogicalPlan& plan, ExecutionContext& context) {
+    for (const auto& projection : plan.projections) {
+        prepare_scalar_subquery(projection.expression, context);
+    }
+    for (const auto& predicate : plan.predicates) {
+        prepare_predicate_subqueries(predicate, context);
+    }
+    if (plan.input != nullptr) {
+        prepare_subqueries(*plan.input, context);
+    }
+    if (plan.left != nullptr) {
+        prepare_subqueries(*plan.left, context);
+    }
+    if (plan.right != nullptr) {
+        prepare_subqueries(*plan.right, context);
+    }
+}
+
 storage::ColumnarBatch execute_scan(const plan::LogicalPlan& plan, const Catalog& catalog) {
     const auto& input = catalog.table(plan.table);
     storage::ColumnarBatch out;
@@ -547,8 +710,9 @@ storage::ColumnarBatch execute_scan(const plan::LogicalPlan& plan, const Catalog
 Cell evaluate_join_scalar(const plan::BoundScalarExpr& expression,
                           const storage::ColumnarBatch& left,
                           std::size_t left_row,
-    const storage::ColumnarBatch& right,
-    std::size_t right_row) {
+                          const storage::ColumnarBatch& right,
+                          std::size_t right_row,
+                          ExecutionContext& context) {
     if (const auto* column = std::get_if<plan::BoundColumnRef>(&expression.value)) {
         const auto name = column_identity_name(*column);
         if (left.has_column(name)) {
@@ -565,16 +729,21 @@ Cell evaluate_join_scalar(const plan::BoundScalarExpr& expression,
     if (const auto* literal = std::get_if<sql::StringLiteral>(&expression.value)) {
         return string_cell(literal->value);
     }
-    return null_cell(expression.type);
+    if (std::holds_alternative<sql::NullLiteral>(expression.value)) {
+        return null_cell(expression.type);
+    }
+    return evaluate_scalar_subquery(
+        std::get<plan::BoundScalarSubquery>(expression.value), expression.type, context);
 }
 
 TruthValue evaluate_join_comparison(const plan::BoundComparisonExpr& comparison,
                                     const storage::ColumnarBatch& left,
                                     std::size_t left_row,
                                     const storage::ColumnarBatch& right,
-                                    std::size_t right_row) {
-    const auto left_value = evaluate_join_scalar(comparison.left, left, left_row, right, right_row);
-    const auto right_value = evaluate_join_scalar(comparison.right, left, left_row, right, right_row);
+                                    std::size_t right_row,
+                                    ExecutionContext& context) {
+    const auto left_value = evaluate_join_scalar(comparison.left, left, left_row, right, right_row, context);
+    const auto right_value = evaluate_join_scalar(comparison.right, left, left_row, right, right_row, context);
     if (left_value.is_null || right_value.is_null) {
         return TruthValue::Unknown;
     }
@@ -585,26 +754,40 @@ TruthValue evaluate_join_predicate(const plan::BoundPredicate& predicate,
                                    const storage::ColumnarBatch& left,
                                    std::size_t left_row,
                                    const storage::ColumnarBatch& right,
-                                   std::size_t right_row) {
+                                   std::size_t right_row,
+                                   ExecutionContext& context) {
     switch (predicate.kind) {
     case sql::PredicateKind::Comparison:
-        return evaluate_join_comparison(predicate.comparison, left, left_row, right, right_row);
+        return evaluate_join_comparison(predicate.comparison, left, left_row, right, right_row, context);
     case sql::PredicateKind::IsNull:
-        return truth_from_bool(evaluate_join_scalar(predicate.null_check, left, left_row, right, right_row).is_null);
+        return truth_from_bool(
+            evaluate_join_scalar(predicate.null_check, left, left_row, right, right_row, context).is_null);
     case sql::PredicateKind::IsNotNull:
-        return truth_from_bool(!evaluate_join_scalar(predicate.null_check, left, left_row, right, right_row).is_null);
+        return truth_from_bool(
+            !evaluate_join_scalar(predicate.null_check, left, left_row, right, right_row, context).is_null);
+    case sql::PredicateKind::In:
+    case sql::PredicateKind::NotIn: {
+        const auto value = evaluate_join_scalar(predicate.in_value, left, left_row, right, right_row, context);
+        const auto result = evaluate_in(value, predicate, context);
+        return predicate.kind == sql::PredicateKind::NotIn ? not_truth(result) : result;
+    }
+    case sql::PredicateKind::Exists:
+    case sql::PredicateKind::NotExists: {
+        const auto exists = truth_from_bool(materialize_subquery(predicate.subquery, context).row_count() != 0);
+        return predicate.kind == sql::PredicateKind::NotExists ? not_truth(exists) : exists;
+    }
     case sql::PredicateKind::And: {
         const auto left_result =
-            evaluate_join_predicate(require_left_predicate(predicate), left, left_row, right, right_row);
+            evaluate_join_predicate(require_left_predicate(predicate), left, left_row, right, right_row, context);
         const auto right_result =
-            evaluate_join_predicate(require_right_predicate(predicate), left, left_row, right, right_row);
+            evaluate_join_predicate(require_right_predicate(predicate), left, left_row, right, right_row, context);
         return and_truth(left_result, right_result);
     }
     case sql::PredicateKind::Or: {
         const auto left_result =
-            evaluate_join_predicate(require_left_predicate(predicate), left, left_row, right, right_row);
+            evaluate_join_predicate(require_left_predicate(predicate), left, left_row, right, right_row, context);
         const auto right_result =
-            evaluate_join_predicate(require_right_predicate(predicate), left, left_row, right, right_row);
+            evaluate_join_predicate(require_right_predicate(predicate), left, left_row, right, right_row, context);
         return or_truth(left_result, right_result);
     }
     }
@@ -615,18 +798,20 @@ TruthValue evaluate_join_predicates(const std::vector<plan::BoundPredicate>& pre
                                     const storage::ColumnarBatch& left,
                                     std::size_t left_row,
                                     const storage::ColumnarBatch& right,
-                                    std::size_t right_row) {
+                                    std::size_t right_row,
+                                    ExecutionContext& context) {
     auto keep = TruthValue::True;
     for (const auto& predicate : predicates) {
-        const auto predicate_result = evaluate_join_predicate(predicate, left, left_row, right, right_row);
+        const auto predicate_result =
+            evaluate_join_predicate(predicate, left, left_row, right, right_row, context);
         keep = and_truth(keep, predicate_result);
     }
     return keep;
 }
 
-storage::ColumnarBatch execute_join(const plan::LogicalPlan& plan, const Catalog& catalog) {
-    const auto left = execute_interpreted(require_left(plan), catalog);
-    const auto right = execute_interpreted(require_right(plan), catalog);
+storage::ColumnarBatch execute_join(const plan::LogicalPlan& plan, ExecutionContext& context) {
+    const auto left = execute_node(require_left(plan), context);
+    const auto right = execute_node(require_right(plan), context);
 
     std::vector<std::string> output_names = left.column_names();
     output_names.insert(output_names.end(), right.column_names().begin(), right.column_names().end());
@@ -656,7 +841,8 @@ storage::ColumnarBatch execute_join(const plan::LogicalPlan& plan, const Catalog
     for (std::size_t left_row = 0; left_row < left.row_count(); ++left_row) {
         bool matched = false;
         for (std::size_t right_row = 0; right_row < right.row_count(); ++right_row) {
-            if (evaluate_join_predicates(plan.predicates, left, left_row, right, right_row) != TruthValue::True) {
+            if (evaluate_join_predicates(plan.predicates, left, left_row, right, right_row, context) !=
+                TruthValue::True) {
                 continue;
             }
 
@@ -675,8 +861,8 @@ storage::ColumnarBatch execute_join(const plan::LogicalPlan& plan, const Catalog
     return out;
 }
 
-storage::ColumnarBatch execute_aggregate(const plan::LogicalPlan& plan, const Catalog& catalog) {
-    const auto input = execute_interpreted(require_input(plan), catalog);
+storage::ColumnarBatch execute_aggregate(const plan::LogicalPlan& plan, ExecutionContext& context) {
+    const auto input = execute_node(require_input(plan), context);
 
     std::map<std::vector<Cell>, std::size_t> group_index_by_key;
     std::vector<GroupState> groups;
@@ -728,22 +914,22 @@ storage::ColumnarBatch execute_aggregate(const plan::LogicalPlan& plan, const Ca
     return out;
 }
 
-storage::ColumnarBatch execute_sort(const plan::LogicalPlan& plan, const Catalog& catalog) {
+storage::ColumnarBatch execute_sort(const plan::LogicalPlan& plan, ExecutionContext& context) {
     const auto& input_plan = require_input(plan);
     if (input_plan.kind == plan::LogicalKind::Project) {
-        const auto source = execute_interpreted(require_input(input_plan), catalog);
-        const auto sort_input = materialize_project_sort_input(input_plan, source, plan.sort_keys);
+        const auto source = execute_node(require_input(input_plan), context);
+        const auto sort_input = materialize_project_sort_input(input_plan, source, plan.sort_keys, context);
         const auto rows = stable_sorted_rows(plan.sort_keys, sort_input);
         return materialize_project_output_rows(input_plan, sort_input, rows);
     }
 
-    auto input = execute_interpreted(input_plan, catalog);
+    auto input = execute_node(input_plan, context);
     const auto rows = stable_sorted_rows(plan.sort_keys, input);
     return materialize_rows(input, rows);
 }
 
-storage::ColumnarBatch execute_distinct(const plan::LogicalPlan& plan, const Catalog& catalog) {
-    const auto input = execute_interpreted(require_input(plan), catalog);
+storage::ColumnarBatch execute_distinct(const plan::LogicalPlan& plan, ExecutionContext& context) {
+    const auto input = execute_node(require_input(plan), context);
     std::map<std::vector<Cell>, bool> seen;
     std::vector<std::size_t> rows;
     rows.reserve(input.row_count());
@@ -757,8 +943,8 @@ storage::ColumnarBatch execute_distinct(const plan::LogicalPlan& plan, const Cat
     return materialize_rows(input, rows);
 }
 
-storage::ColumnarBatch execute_limit(const plan::LogicalPlan& plan, const Catalog& catalog) {
-    const auto input = execute_interpreted(require_input(plan), catalog);
+storage::ColumnarBatch execute_limit(const plan::LogicalPlan& plan, ExecutionContext& context) {
+    const auto input = execute_node(require_input(plan), context);
     const auto count = std::min(plan.limit_count, input.row_count());
     std::vector<std::size_t> rows;
     rows.reserve(count);
@@ -766,6 +952,39 @@ storage::ColumnarBatch execute_limit(const plan::LogicalPlan& plan, const Catalo
         rows.push_back(row);
     }
     return materialize_rows(input, rows);
+}
+
+storage::ColumnarBatch execute_node(const plan::LogicalPlan& plan, ExecutionContext& context) {
+    switch (plan.kind) {
+    case plan::LogicalKind::Scan:
+        return execute_scan(plan, context.catalog);
+    case plan::LogicalKind::Join:
+        return execute_join(plan, context);
+    case plan::LogicalKind::Filter: {
+        auto input = execute_node(require_input(plan), context);
+        return input.filter(evaluate_filter(plan.predicates, input, context));
+    }
+    case plan::LogicalKind::Project: {
+        auto input = execute_node(require_input(plan), context);
+        storage::ColumnarBatch out;
+        for (const auto& projection : plan.projections) {
+            auto column = evaluate_projection(projection, input, context);
+            std::move(column).add_to(out, projection.output_name);
+        }
+        return out;
+    }
+    case plan::LogicalKind::Aggregate:
+        return execute_aggregate(plan, context);
+    case plan::LogicalKind::Distinct:
+        return execute_distinct(plan, context);
+    case plan::LogicalKind::Sort:
+        return execute_sort(plan, context);
+    case plan::LogicalKind::Limit:
+        return execute_limit(plan, context);
+    case plan::LogicalKind::Explain:
+        return optimizer::explain(require_input(plan), context.catalog);
+    }
+    throw std::logic_error("unreachable logical plan kind");
 }
 
 } // namespace
@@ -801,36 +1020,11 @@ const storage::ColumnarBatch& Catalog::table(const std::string& name) const {
 }
 
 storage::ColumnarBatch execute_interpreted(const plan::LogicalPlan& plan, const Catalog& catalog) {
-    switch (plan.kind) {
-    case plan::LogicalKind::Scan:
-        return execute_scan(plan, catalog);
-    case plan::LogicalKind::Join:
-        return execute_join(plan, catalog);
-    case plan::LogicalKind::Filter: {
-        auto input = execute_interpreted(*plan.input, catalog);
-        return input.filter(evaluate_filter(plan.predicates, input));
+    ExecutionContext context{catalog, {}};
+    if (plan.kind != plan::LogicalKind::Explain) {
+        prepare_subqueries(plan, context);
     }
-    case plan::LogicalKind::Project: {
-        auto input = execute_interpreted(*plan.input, catalog);
-        storage::ColumnarBatch out;
-        for (const auto& projection : plan.projections) {
-            auto column = evaluate_projection(projection, input);
-            std::move(column).add_to(out, projection.output_name);
-        }
-        return out;
-    }
-    case plan::LogicalKind::Aggregate:
-        return execute_aggregate(plan, catalog);
-    case plan::LogicalKind::Distinct:
-        return execute_distinct(plan, catalog);
-    case plan::LogicalKind::Sort:
-        return execute_sort(plan, catalog);
-    case plan::LogicalKind::Limit:
-        return execute_limit(plan, catalog);
-    case plan::LogicalKind::Explain:
-        return optimizer::explain(require_input(plan), catalog);
-    }
-    throw std::logic_error("unreachable logical plan kind");
+    return execute_node(plan, context);
 }
 
 } // namespace execution

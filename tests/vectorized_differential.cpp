@@ -992,6 +992,54 @@ bool run_generated_corpus() {
     return ok;
 }
 
+bool run_subquery_oracle_corpus() {
+    const auto catalog = make_golden_catalog();
+    const std::string table_text = "phase21a deterministic subquery catalog";
+    bool ok = true;
+    ok = differential::compare_subquery_oracle_paths(
+             "SELECT a FROM t WHERE a = (SELECT MAX(a) FROM t1)", catalog, table_text) &&
+         ok;
+    ok = differential::compare_subquery_oracle_paths(
+             "SELECT a FROM t WHERE a NOT IN (SELECT k FROM nullable)", catalog, table_text) &&
+         ok;
+    ok = differential::compare_subquery_oracle_paths(
+             "SELECT a FROM t WHERE NOT EXISTS (SELECT a FROM t LIMIT 0)", catalog, table_text) &&
+         ok;
+    ok = differential::compare_subquery_oracle_paths(
+             "SELECT a FROM t WHERE a IN "
+             "(SELECT t1.a FROM t1 JOIN t2 ON t1.a = t2.a WHERE EXISTS (SELECT a FROM empty))",
+             catalog,
+             table_text) &&
+         ok;
+
+    differential::ComparisonStats error_stats;
+    ok = differential::compare_subquery_oracle_paths(
+             "SELECT a FROM t WHERE (SELECT a FROM t) = a", catalog, table_text, &error_stats) &&
+         ok;
+    if (error_stats.accepted_error_path_count != error_stats.execution_path_count) {
+        std::cerr << "scalar subquery cardinality error was not equivalent across every oracle path\n"
+                  << "accepted errors: " << error_stats.accepted_error_path_count << "\n"
+                  << "oracle paths: " << error_stats.execution_path_count << "\n";
+        ok = false;
+    }
+
+
+    differential::ComparisonStats folded_error_stats;
+    ok = differential::compare_subquery_oracle_paths(
+             "SELECT a FROM t WHERE 1 = 0 AND (SELECT a FROM t) = a",
+             catalog,
+             table_text,
+             &folded_error_stats) &&
+         ok;
+    if (folded_error_stats.accepted_error_path_count != folded_error_stats.execution_path_count) {
+        std::cerr << "constant folding erased an eager scalar subquery cardinality error\n"
+                  << "accepted errors: " << folded_error_stats.accepted_error_path_count << "\n"
+                  << "oracle paths: " << folded_error_stats.execution_path_count << "\n";
+        ok = false;
+    }
+    return ok;
+}
+
 void assert_physical_lowering_shape() {
     const auto catalog = make_golden_catalog();
     const auto logical = sql::bind_select(sql::parse_select("SELECT b, a FROM t WHERE a >= 2 AND b <> 40"), catalog);
@@ -1045,18 +1093,41 @@ void assert_outer_join_physical_lowering_preserves_kind() {
     assert(physical.input->join_kind == plan::JoinKind::Left);
 }
 
+void assert_subquery_physical_lowering_has_one_exact_guard() {
+    const auto catalog = make_golden_catalog();
+    const auto logical =
+        sql::bind_select(sql::parse_select("SELECT a FROM t WHERE a IN (SELECT a FROM t1)"), catalog);
+    constexpr auto expected = "vectorized physical lowering does not support subqueries";
+
+    try {
+        (void)plan::lower_to_physical(logical);
+    } catch (const std::invalid_argument& error) {
+        assert(std::string(error.what()) == expected);
+        try {
+            (void)execution::execute_vectorized(logical, catalog);
+        } catch (const std::invalid_argument& execution_error) {
+            assert(std::string(execution_error.what()) == expected);
+            return;
+        }
+        throw std::logic_error("expected vectorized execution subquery guard");
+    }
+    throw std::logic_error("expected physical lowering subquery guard");
+}
+
 } // namespace
 
 int main() {
     assert_physical_lowering_shape();
     assert_physical_lowering_accepts_string_touching_plans();
     assert_outer_join_physical_lowering_preserves_kind();
+    assert_subquery_physical_lowering_has_one_exact_guard();
 
     bool ok = true;
     ok = run_result_golden_queries() && ok;
     ok = run_join_oracle_corpus() && ok;
     ok = run_outer_join_corpus() && ok;
     ok = run_vectorized_string_corpus() && ok;
+    ok = run_subquery_oracle_corpus() && ok;
     ok = run_generated_corpus() && ok;
     return ok ? 0 : 1;
 }

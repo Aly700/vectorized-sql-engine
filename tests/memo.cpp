@@ -631,6 +631,74 @@ void assert_filter_through_aggregate_moves_group_key_or_but_pins_aggregate_or() 
     memo.assert_invariants();
 }
 
+void assert_subquery_subplans_are_structural_but_opaque_memo_fields() {
+    const auto catalog = make_catalog();
+    const auto first = sql::bind_select(
+        sql::parse_select("SELECT a FROM t WHERE a IN (SELECT a FROM t1)"), catalog);
+    const auto identical = sql::bind_select(
+        sql::parse_select("SELECT a FROM t WHERE a IN ( SELECT a FROM t1 )"), catalog);
+    const auto different = sql::bind_select(
+        sql::parse_select("SELECT a FROM t WHERE a IN (SELECT a FROM t2)"), catalog);
+
+    optimizer::Memo memo;
+    const auto first_root = memo.insert(first);
+    const auto identical_root = memo.insert(identical);
+    assert(first_root == identical_root);
+    assert(memo.group_count() == 3);
+
+    const auto different_root = memo.insert(different);
+    assert(different_root != first_root);
+    assert(memo.group_count() == 5);
+
+    const auto printed = plan::to_string(memo.extract(first_root));
+    assert(printed.find("  Filter[col(t.a) IN subquery(IN subquery at position") != std::string::npos);
+    assert(printed.find("\n    Subquery[IN subquery at position") != std::string::npos);
+    assert(printed.find("\n      Project[a=col(t1.a)]\n        Scan[t1]") != std::string::npos);
+    memo.assert_invariants();
+}
+
+void assert_subquery_conjunct_moves_using_only_outer_references() {
+    const auto catalog = make_catalog();
+    const auto sql =
+        "SELECT t1.b, t2.c FROM t1 JOIN t2 ON t1.a = t2.a "
+        "WHERE t1.b IN (SELECT b FROM t)";
+    const auto logical = sql::bind_select(sql::parse_select(sql), catalog);
+
+    optimizer::Memo memo;
+    const auto root = memo.insert(logical);
+    const auto explored = optimizer::explore_memo_to_fixpoint(memo, optimizer::default_memo_rules());
+    const auto alternatives = memo.extract_alternatives(root, optimizer::AlternativeExtractionOptions{64, 512});
+
+    if (!trace_contains(explored.fired_rules, "FilterIntoJoinRule") ||
+        !contains_plan_text(alternatives.plans,
+                            "Join[col(t1.a) = col(t2.a)]\n"
+                            "    Filter[col(t1.b) IN subquery(")) {
+        std::cerr << "uncorrelated subquery conjunct did not move using its outer t1.b reference\n"
+                  << "sql: " << sql << "\n"
+                  << "plan:\n" << plan::to_string(logical) << "\n"
+                  << "memo dump:\n" << memo.dump();
+        std::terminate();
+    }
+    memo.assert_invariants();
+}
+
+void assert_explain_indents_opaque_subplans_under_owner() {
+    const auto catalog = make_catalog();
+    const auto logical = sql::bind_select(
+        sql::parse_select("EXPLAIN SELECT a FROM t WHERE a IN (SELECT a FROM t1)"), catalog);
+    const auto explained = execution::execute_interpreted(logical, catalog);
+
+    std::string report;
+    const auto& lines = explained.string_column("plan");
+    for (std::size_t row = 0; row < explained.row_count(); ++row) {
+        report += lines.at(row) + "\n";
+    }
+    assert(report.find("    Filter[col(t.a) IN subquery(") != std::string::npos);
+    assert(report.find("      Subquery[IN subquery at position") != std::string::npos);
+    assert(report.find("        Project[a=col(t1.a)]") != std::string::npos);
+    assert(report.find("          Scan[t1]") != std::string::npos);
+}
+
 } // namespace
 
 int main() {
@@ -647,5 +715,8 @@ int main() {
     assert_left_join_to_inner_unlocks_guarded_transforms();
     assert_filter_through_aggregate_pushes_only_group_keys();
     assert_filter_through_aggregate_moves_group_key_or_but_pins_aggregate_or();
+    assert_subquery_subplans_are_structural_but_opaque_memo_fields();
+    assert_subquery_conjunct_moves_using_only_outer_references();
+    assert_explain_indents_opaque_subplans_under_owner();
     return 0;
 }

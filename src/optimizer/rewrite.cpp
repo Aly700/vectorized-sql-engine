@@ -104,6 +104,33 @@ bool is_canonical_false(const plan::BoundPredicate& predicate) {
            is_literal_with_value(comparison.right, 0);
 }
 
+bool scalar_contains_subquery(const plan::BoundScalarExpr& expression) {
+    return std::holds_alternative<plan::BoundScalarSubquery>(expression.value);
+}
+
+bool predicate_contains_subquery(const plan::BoundPredicate& predicate) {
+    switch (predicate.kind) {
+    case sql::PredicateKind::Comparison:
+        return scalar_contains_subquery(predicate.comparison.left) ||
+               scalar_contains_subquery(predicate.comparison.right);
+    case sql::PredicateKind::IsNull:
+    case sql::PredicateKind::IsNotNull:
+        return scalar_contains_subquery(predicate.null_check);
+    case sql::PredicateKind::In:
+    case sql::PredicateKind::NotIn:
+    case sql::PredicateKind::Exists:
+    case sql::PredicateKind::NotExists:
+        return true;
+    case sql::PredicateKind::And:
+    case sql::PredicateKind::Or:
+        if (predicate.left == nullptr || predicate.right == nullptr) {
+            throw std::logic_error("bound predicate is missing a child");
+        }
+        return predicate_contains_subquery(*predicate.left) || predicate_contains_subquery(*predicate.right);
+    }
+    throw std::logic_error("unreachable predicate kind");
+}
+
 MemoExpression filter_expression(std::vector<plan::BoundPredicate> predicates,
                                  GroupId child,
                                  plan::OrderPermission order_permission) {
@@ -166,6 +193,8 @@ std::vector<std::string> referenced_tables(const plan::BoundScalarExpr& expressi
     if (const auto* column = std::get_if<plan::BoundColumnRef>(&expression.value)) {
         add_unique_table(tables, column->binding);
     }
+    // A Phase 21a subquery was independently bound with no outer scope, so its
+    // internal columns are not references of the owning outer conjunct.
     return tables;
 }
 
@@ -180,6 +209,12 @@ std::vector<std::string> referenced_tables(const plan::BoundPredicate& predicate
     case sql::PredicateKind::IsNull:
     case sql::PredicateKind::IsNotNull:
         return referenced_tables(predicate.null_check);
+    case sql::PredicateKind::In:
+    case sql::PredicateKind::NotIn:
+        return referenced_tables(predicate.in_value);
+    case sql::PredicateKind::Exists:
+    case sql::PredicateKind::NotExists:
+        return {};
     case sql::PredicateKind::And:
     case sql::PredicateKind::Or:
         if (predicate.left == nullptr || predicate.right == nullptr) {
@@ -212,6 +247,12 @@ std::vector<plan::BoundColumnRef> referenced_columns(const plan::BoundPredicate&
     case sql::PredicateKind::IsNull:
     case sql::PredicateKind::IsNotNull:
         return referenced_columns(predicate.null_check);
+    case sql::PredicateKind::In:
+    case sql::PredicateKind::NotIn:
+        return referenced_columns(predicate.in_value);
+    case sql::PredicateKind::Exists:
+    case sql::PredicateKind::NotExists:
+        return {};
     case sql::PredicateKind::And:
     case sql::PredicateKind::Or: {
         if (predicate.left == nullptr || predicate.right == nullptr) {
@@ -265,6 +306,12 @@ bool is_null_rejecting_for_side(const plan::BoundPredicate& predicate,
         return comparison_references_side(predicate.comparison, tables);
     case sql::PredicateKind::IsNull:
     case sql::PredicateKind::IsNotNull:
+        return false;
+    case sql::PredicateKind::In:
+        return references_side(predicate, tables);
+    case sql::PredicateKind::NotIn:
+    case sql::PredicateKind::Exists:
+    case sql::PredicateKind::NotExists:
         return false;
     case sql::PredicateKind::And:
         if (predicate.left == nullptr || predicate.right == nullptr) {
@@ -383,6 +430,8 @@ std::optional<plan::LogicalPlan> rewrite_once(
     const plan::LogicalPlan& logical,
     const std::vector<std::reference_wrapper<const Rule>>& rules,
     RewriteTrace& trace) {
+    // Phase 21a rewrite traversal follows relational children only. Embedded
+    // immutable subplans are intentionally opaque until decorrelation in 21b.
     switch (logical.kind) {
     case plan::LogicalKind::Project:
     case plan::LogicalKind::Aggregate:
@@ -448,6 +497,10 @@ plan::BoundPredicate fold_predicate_tree(const plan::BoundPredicate& predicate, 
     }
     case sql::PredicateKind::IsNull:
     case sql::PredicateKind::IsNotNull:
+    case sql::PredicateKind::In:
+    case sql::PredicateKind::NotIn:
+    case sql::PredicateKind::Exists:
+    case sql::PredicateKind::NotExists:
         return predicate;
     case sql::PredicateKind::And:
     case sql::PredicateKind::Or:
@@ -462,8 +515,13 @@ plan::BoundPredicate fold_predicate_tree(const plan::BoundPredicate& predicate, 
 
     if (predicate.kind == sql::PredicateKind::And) {
         if (is_canonical_false(left) || is_canonical_false(right)) {
-            changed = true;
-            return canonical_false();
+            const auto would_drop_subquery =
+                (is_canonical_false(left) && predicate_contains_subquery(right)) ||
+                (is_canonical_false(right) && predicate_contains_subquery(left));
+            if (!would_drop_subquery) {
+                changed = true;
+                return canonical_false();
+            }
         }
         if (is_canonical_true(left)) {
             changed = true;
@@ -480,8 +538,13 @@ plan::BoundPredicate fold_predicate_tree(const plan::BoundPredicate& predicate, 
     }
 
     if (is_canonical_true(left) || is_canonical_true(right)) {
-        changed = true;
-        return canonical_true();
+        const auto would_drop_subquery =
+            (is_canonical_true(left) && predicate_contains_subquery(right)) ||
+            (is_canonical_true(right) && predicate_contains_subquery(left));
+        if (!would_drop_subquery) {
+            changed = true;
+            return canonical_true();
+        }
     }
     if (is_canonical_false(left)) {
         changed = true;
@@ -613,6 +676,9 @@ std::optional<plan::LogicalPlan> AlwaysFalseFilterRule::apply(const plan::Logica
     if (!has_false) {
         return std::nullopt;
     }
+    if (std::any_of(logical.predicates.begin(), logical.predicates.end(), predicate_contains_subquery)) {
+        return std::nullopt;
+    }
     if (logical.predicates.size() == 1 && is_canonical_false(logical.predicates.front())) {
         return std::nullopt;
     }
@@ -636,6 +702,9 @@ bool AlwaysFalseFilterRule::apply(Memo& memo, GroupId group, const MemoExpressio
     }
 
     if (!has_false) {
+        return false;
+    }
+    if (std::any_of(expression.predicates.begin(), expression.predicates.end(), predicate_contains_subquery)) {
         return false;
     }
     if (expression.predicates.size() == 1 && is_canonical_false(expression.predicates.front())) {
@@ -697,6 +766,8 @@ bool MergeAdjacentFiltersRule::apply(Memo& memo, GroupId group, const MemoExpres
 }
 
 bool LeftJoinToInnerRule::apply(Memo& memo, GroupId group, const MemoExpression& expression) const {
+    // Independently bound subplans contribute no right-side outer references;
+    // null rejection is proved only from the owning predicate's outer operand.
     if (expression.kind != MemoExpressionKind::Filter) {
         return false;
     }
@@ -733,6 +804,8 @@ bool LeftJoinToInnerRule::apply(Memo& memo, GroupId group, const MemoExpression&
 }
 
 bool FilterIntoJoinRule::apply(Memo& memo, GroupId group, const MemoExpression& expression) const {
+    // Uncorrelated subplans contribute no outer references, so a whole
+    // conjunct moves according to its ordinary outer operands exactly once.
     if (expression.kind != MemoExpressionKind::Filter) {
         return false;
     }
@@ -828,6 +901,8 @@ bool FilterIntoJoinRule::apply(Memo& memo, GroupId group, const MemoExpression& 
 }
 
 bool FilterThroughAggregateRule::apply(Memo& memo, GroupId group, const MemoExpression& expression) const {
+    // Uncorrelated subplans add no outer columns; the existing all-group-key
+    // proof therefore classifies the owning conjunct from outer operands only.
     if (expression.kind != MemoExpressionKind::Filter) {
         return false;
     }
@@ -898,6 +973,8 @@ bool JoinCommuteRule::apply(Memo& memo, GroupId group, const MemoExpression& exp
 namespace {
 
 bool try_left_to_right_associate(Memo& memo, GroupId group, const MemoExpression& expression) {
+    // Opaque uncorrelated subplans add no outer bindings, preserving the
+    // existing subset proof used to move whole join conjuncts.
     const auto left_group = expression.children.at(0);
     const auto right_group = expression.children.at(1);
     bool changed = false;
@@ -958,6 +1035,8 @@ bool try_left_to_right_associate(Memo& memo, GroupId group, const MemoExpression
 }
 
 bool try_right_to_left_associate(Memo& memo, GroupId group, const MemoExpression& expression) {
+    // Opaque uncorrelated subplans add no outer bindings, preserving the
+    // existing subset proof used to move whole join conjuncts.
     const auto left_group = expression.children.at(0);
     const auto right_group = expression.children.at(1);
     bool changed = false;

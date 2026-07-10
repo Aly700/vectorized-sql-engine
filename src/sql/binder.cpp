@@ -22,6 +22,31 @@ struct TableScope {
     catalog::TableSchema schema;
 };
 
+plan::LogicalPlan bind_select_impl(const SelectQuery& query,
+                                   const catalog::Catalog& catalog,
+                                   bool inside_subquery);
+
+std::string column_reference_name(const ColumnRef& column) {
+    return column.qualifier.has_value() ? *column.qualifier + "." + column.name : column.name;
+}
+
+[[noreturn]] void throw_unresolved_column(const ColumnRef& column,
+                                          const std::vector<TableScope>& scopes,
+                                          bool inside_subquery) {
+    if (inside_subquery) {
+        throw BindError(column.position,
+                        "correlated subqueries are unsupported: '" + column_reference_name(column) + "'");
+    }
+    if (column.qualifier.has_value()) {
+        throw BindError(column.position, "unknown table qualifier '" + *column.qualifier + "'");
+    }
+    if (scopes.size() == 1) {
+        throw BindError(column.position,
+                        "unknown column '" + column.name + "' in table '" + scopes.front().binding_name + "'");
+    }
+    throw BindError(column.position, "unknown column '" + column.name + "'");
+}
+
 catalog::TableSchema require_table(const std::string& name, std::size_t position, const catalog::Catalog& catalog) {
     auto table = catalog.find_table_schema(name);
     if (!table.has_value()) {
@@ -69,20 +94,27 @@ std::string quoted_table_list(const std::vector<std::string>& tables) {
     return out.str();
 }
 
-const TableScope& find_qualified_scope(const ColumnRef& column, const std::vector<TableScope>& scopes) {
+const TableScope& find_qualified_scope(const ColumnRef& column,
+                                       const std::vector<TableScope>& scopes,
+                                       bool inside_subquery) {
     for (const auto& scope : scopes) {
         if (scope.binding_name == *column.qualifier) {
             if (!scope.schema.has_column(column.name)) {
+                if (inside_subquery) {
+                    throw_unresolved_column(column, scopes, true);
+                }
                 throw BindError(column.position,
                                 "unknown column '" + column.name + "' in table '" + scope.binding_name + "'");
             }
             return scope;
         }
     }
-    throw BindError(column.position, "unknown table qualifier '" + *column.qualifier + "'");
+    throw_unresolved_column(column, scopes, inside_subquery);
 }
 
-const TableScope& find_unqualified_scope(const ColumnRef& column, const std::vector<TableScope>& scopes) {
+const TableScope& find_unqualified_scope(const ColumnRef& column,
+                                         const std::vector<TableScope>& scopes,
+                                         bool inside_subquery) {
     std::vector<const TableScope*> matches;
     std::vector<std::string> match_names;
     for (const auto& scope : scopes) {
@@ -93,11 +125,7 @@ const TableScope& find_unqualified_scope(const ColumnRef& column, const std::vec
     }
 
     if (matches.empty()) {
-        if (scopes.size() == 1) {
-            throw BindError(column.position,
-                            "unknown column '" + column.name + "' in table '" + scopes.front().binding_name + "'");
-        }
-        throw BindError(column.position, "unknown column '" + column.name + "'");
+        throw_unresolved_column(column, scopes, inside_subquery);
     }
 
     if (matches.size() > 1) {
@@ -117,15 +145,50 @@ catalog::ColumnType column_type_in_scope(const TableScope& scope, const ColumnRe
     throw std::logic_error("resolved column is missing from scope schema");
 }
 
-plan::BoundColumnRef bind_column_ref(const ColumnRef& column, const std::vector<TableScope>& scopes) {
-    const auto& scope =
-        column.qualifier.has_value() ? find_qualified_scope(column, scopes) : find_unqualified_scope(column, scopes);
+plan::BoundColumnRef bind_column_ref(const ColumnRef& column,
+                                     const std::vector<TableScope>& scopes,
+                                     bool inside_subquery) {
+    const auto& scope = column.qualifier.has_value() ? find_qualified_scope(column, scopes, inside_subquery)
+                                                     : find_unqualified_scope(column, scopes, inside_subquery);
     return plan::BoundColumnRef{scope.binding_name, column.name, column.position, column_type_in_scope(scope, column)};
 }
 
-plan::BoundScalarExpr bind_expression(const ScalarExpr& expression, const std::vector<TableScope>& scopes) {
+const std::vector<plan::Projection>& output_projections(const plan::LogicalPlan& logical) {
+    switch (logical.kind) {
+    case plan::LogicalKind::Project:
+        return logical.projections;
+    case plan::LogicalKind::Distinct:
+    case plan::LogicalKind::Sort:
+    case plan::LogicalKind::Limit:
+        if (logical.input == nullptr) {
+            throw std::logic_error("subquery result-shaping node is missing its input");
+        }
+        return output_projections(*logical.input);
+    case plan::LogicalKind::Explain:
+        throw std::logic_error("EXPLAIN cannot be used as a subquery");
+    case plan::LogicalKind::Scan:
+    case plan::LogicalKind::Join:
+    case plan::LogicalKind::Filter:
+    case plan::LogicalKind::Aggregate:
+        break;
+    }
+    throw std::logic_error("bound subquery is missing its final projection");
+}
+
+std::shared_ptr<const plan::LogicalPlan> bind_subquery(const ScalarSubquery& subquery,
+                                                      const catalog::Catalog& catalog) {
+    if (subquery.query == nullptr) {
+        throw std::logic_error("parsed scalar subquery is missing its SELECT query");
+    }
+    return std::make_shared<const plan::LogicalPlan>(bind_select_impl(*subquery.query, catalog, true));
+}
+
+plan::BoundScalarExpr bind_expression(const ScalarExpr& expression,
+                                      const std::vector<TableScope>& scopes,
+                                      const catalog::Catalog& catalog,
+                                      bool inside_subquery) {
     if (const auto* column = std::get_if<ColumnRef>(&expression)) {
-        auto bound = bind_column_ref(*column, scopes);
+        auto bound = bind_column_ref(*column, scopes, inside_subquery);
         return plan::BoundScalarExpr{bound, bound.type};
     }
     if (const auto* literal = std::get_if<IntLiteral>(&expression)) {
@@ -134,7 +197,22 @@ plan::BoundScalarExpr bind_expression(const ScalarExpr& expression, const std::v
     if (const auto* literal = std::get_if<StringLiteral>(&expression)) {
         return plan::BoundScalarExpr{*literal, catalog::ColumnType::String};
     }
-    return plan::BoundScalarExpr{std::get<NullLiteral>(expression), catalog::ColumnType::Int64};
+    if (const auto* literal = std::get_if<NullLiteral>(&expression)) {
+        return plan::BoundScalarExpr{*literal, catalog::ColumnType::Int64};
+    }
+    const auto& subquery = std::get<ScalarSubquery>(expression);
+    auto bound_plan = bind_subquery(subquery, catalog);
+    const auto& projections = output_projections(*bound_plan);
+    if (projections.size() != 1) {
+        throw BindError(subquery.position,
+                        "scalar subquery must produce exactly one output column, got " +
+                            std::to_string(projections.size()));
+    }
+    const auto type = projections.front().type;
+    return plan::BoundScalarExpr{
+        plan::BoundScalarSubquery{
+            std::move(bound_plan), subquery.position, "scalar subquery at position " + std::to_string(subquery.position)},
+        type};
 }
 
 std::string type_name(catalog::ColumnType type) {
@@ -160,9 +238,12 @@ void align_null_comparison_types(plan::BoundScalarExpr& left, plan::BoundScalarE
     }
 }
 
-plan::BoundComparisonExpr bind_comparison(const ComparisonExpr& comparison, const std::vector<TableScope>& scopes) {
-    auto left = bind_expression(comparison.left, scopes);
-    auto right = bind_expression(comparison.right, scopes);
+plan::BoundComparisonExpr bind_comparison(const ComparisonExpr& comparison,
+                                          const std::vector<TableScope>& scopes,
+                                          const catalog::Catalog& catalog,
+                                          bool inside_subquery) {
+    auto left = bind_expression(comparison.left, scopes, catalog, inside_subquery);
+    auto right = bind_expression(comparison.right, scopes, catalog, inside_subquery);
     align_null_comparison_types(left, right);
     if (left.type != right.type) {
         throw BindError(comparison.operator_position,
@@ -177,34 +258,81 @@ plan::BoundComparisonExpr bind_comparison(const ComparisonExpr& comparison, cons
     };
 }
 
-plan::BoundPredicate bind_predicate(const PredicateExpr& predicate, const std::vector<TableScope>& scopes) {
+plan::BoundPredicate bind_predicate(const PredicateExpr& predicate,
+                                    const std::vector<TableScope>& scopes,
+                                    const catalog::Catalog& catalog,
+                                    bool inside_subquery) {
     switch (predicate.kind) {
     case PredicateKind::Comparison:
-        return plan::BoundPredicate::comparison_expr(bind_comparison(predicate.comparison, scopes));
+        return plan::BoundPredicate::comparison_expr(
+            bind_comparison(predicate.comparison, scopes, catalog, inside_subquery));
     case PredicateKind::IsNull:
     case PredicateKind::IsNotNull:
         return plan::BoundPredicate::null_check_expr(predicate.kind,
-                                                    bind_expression(predicate.null_check, scopes),
+                                                    bind_expression(predicate.null_check, scopes, catalog, inside_subquery),
                                                     predicate.operator_position);
+    case PredicateKind::In:
+    case PredicateKind::NotIn: {
+        if (predicate.subquery == nullptr) {
+            throw std::logic_error("parsed IN predicate is missing its subquery");
+        }
+        auto value = bind_expression(predicate.in_value, scopes, catalog, inside_subquery);
+        const auto parsed_subquery = ScalarSubquery{predicate.subquery, predicate.operator_position};
+        auto subplan = bind_subquery(parsed_subquery, catalog);
+        const auto& projections = output_projections(*subplan);
+        if (projections.size() != 1) {
+            throw BindError(predicate.operator_position,
+                            "IN subquery must produce exactly one output column, got " +
+                                std::to_string(projections.size()));
+        }
+        if (is_null_literal(value)) {
+            value.type = projections.front().type;
+        }
+        if (value.type != projections.front().type) {
+            throw BindError(predicate.operator_position,
+                            "IN operand and subquery column must have the same type: " + type_name(value.type) +
+                                " vs " + type_name(projections.front().type));
+        }
+        return plan::BoundPredicate::in_expr(
+            predicate.kind,
+            std::move(value),
+            std::move(subplan),
+            predicate.operator_position,
+            "IN subquery at position " + std::to_string(predicate.operator_position));
+    }
+    case PredicateKind::Exists:
+    case PredicateKind::NotExists: {
+        if (predicate.subquery == nullptr) {
+            throw std::logic_error("parsed EXISTS predicate is missing its subquery");
+        }
+        auto subplan = bind_subquery(ScalarSubquery{predicate.subquery, predicate.operator_position}, catalog);
+        return plan::BoundPredicate::exists_expr(
+            predicate.kind,
+            std::move(subplan),
+            predicate.operator_position,
+            "EXISTS subquery at position " + std::to_string(predicate.operator_position));
+    }
     case PredicateKind::And:
     case PredicateKind::Or:
         if (predicate.left == nullptr || predicate.right == nullptr) {
             throw std::logic_error("parsed boolean predicate is missing a child");
         }
         return plan::BoundPredicate::binary(predicate.kind,
-                                           bind_predicate(*predicate.left, scopes),
-                                           bind_predicate(*predicate.right, scopes),
+                                           bind_predicate(*predicate.left, scopes, catalog, inside_subquery),
+                                           bind_predicate(*predicate.right, scopes, catalog, inside_subquery),
                                            predicate.operator_position);
     }
     throw std::logic_error("unreachable predicate kind");
 }
 
 std::vector<plan::BoundPredicate> bind_predicates(const std::vector<PredicateExpr>& predicates,
-                                                  const std::vector<TableScope>& scopes) {
+                                                  const std::vector<TableScope>& scopes,
+                                                  const catalog::Catalog& catalog,
+                                                  bool inside_subquery) {
     std::vector<plan::BoundPredicate> bound;
     bound.reserve(predicates.size());
     for (const auto& predicate : predicates) {
-        bound.push_back(bind_predicate(predicate, scopes));
+        bound.push_back(bind_predicate(predicate, scopes, catalog, inside_subquery));
     }
     return bound;
 }
@@ -223,12 +351,13 @@ bool contains_group_key(const std::vector<plan::BoundColumnRef>& group_keys, con
 }
 
 std::vector<plan::BoundColumnRef> bind_group_by_keys(const std::vector<ColumnRef>& keys,
-                                                     const std::vector<TableScope>& scopes) {
+                                                     const std::vector<TableScope>& scopes,
+                                                     bool inside_subquery) {
     std::vector<plan::BoundColumnRef> bound;
     bound.reserve(keys.size());
     std::set<std::string> seen;
     for (const auto& key : keys) {
-        auto column = bind_column_ref(key, scopes);
+        auto column = bind_column_ref(key, scopes, inside_subquery);
         const auto identity = column.binding + "." + column.column;
         const auto [_, inserted] = seen.insert(identity);
         if (!inserted) {
@@ -263,7 +392,8 @@ plan::AggregateExpression hidden_count_star_aggregate() {
 }
 
 plan::AggregateExpression bind_aggregate_call(const AggregateCall& aggregate,
-                                              const std::vector<TableScope>& scopes) {
+                                              const std::vector<TableScope>& scopes,
+                                              bool inside_subquery) {
     if (aggregate.nested_aggregate) {
         throw BindError(aggregate.nested_position,
                         "nested aggregate '" + aggregate_function_name(aggregate.nested_function) + "' is not allowed");
@@ -271,7 +401,7 @@ plan::AggregateExpression bind_aggregate_call(const AggregateCall& aggregate,
 
     std::optional<plan::BoundColumnRef> argument;
     if (aggregate.argument.has_value()) {
-        argument = bind_column_ref(*aggregate.argument, scopes);
+        argument = bind_column_ref(*aggregate.argument, scopes, inside_subquery);
     }
 
     auto output_type = catalog::ColumnType::Int64;
@@ -313,8 +443,9 @@ plan::BoundColumnRef aggregate_output_ref(const plan::AggregateExpression& aggre
 
 plan::BoundColumnRef ensure_aggregate_expression(const AggregateCall& aggregate,
                                                  const std::vector<TableScope>& scopes,
-                                                 std::vector<plan::AggregateExpression>& aggregate_expressions) {
-    auto bound = bind_aggregate_call(aggregate, scopes);
+                                                 std::vector<plan::AggregateExpression>& aggregate_expressions,
+                                                 bool inside_subquery) {
+    auto bound = bind_aggregate_call(aggregate, scopes, inside_subquery);
     for (const auto& existing : aggregate_expressions) {
         if (existing.output_name == bound.output_name) {
             return aggregate_output_ref(existing, aggregate.position);
@@ -350,9 +481,11 @@ catalog::ColumnType output_type_for_name(const std::vector<plan::Projection>& pr
 plan::BoundScalarExpr bind_having_expression(const HavingExpr& expression,
                                              const std::vector<TableScope>& scopes,
                                              const std::vector<plan::BoundColumnRef>& group_keys,
-                                             std::vector<plan::AggregateExpression>& aggregate_expressions) {
+                                             std::vector<plan::AggregateExpression>& aggregate_expressions,
+                                             const catalog::Catalog& catalog,
+                                             bool inside_subquery) {
     if (const auto* column = std::get_if<ColumnRef>(&expression)) {
-        auto bound = bind_column_ref(*column, scopes);
+        auto bound = bind_column_ref(*column, scopes, inside_subquery);
         if (!contains_group_key(group_keys, bound)) {
             throw BindError(column->position,
                             "HAVING column '" + output_name(*column) +
@@ -369,16 +502,36 @@ plan::BoundScalarExpr bind_having_expression(const HavingExpr& expression,
     if (const auto* literal = std::get_if<NullLiteral>(&expression)) {
         return plan::BoundScalarExpr{*literal, catalog::ColumnType::Int64};
     }
-    auto aggregate_ref = ensure_aggregate_expression(std::get<AggregateCall>(expression), scopes, aggregate_expressions);
+    if (const auto* subquery = std::get_if<ScalarSubquery>(&expression)) {
+        auto bound_plan = bind_subquery(*subquery, catalog);
+        const auto& projections = output_projections(*bound_plan);
+        if (projections.size() != 1) {
+            throw BindError(subquery->position,
+                            "scalar subquery must produce exactly one output column, got " +
+                                std::to_string(projections.size()));
+        }
+        const auto type = projections.front().type;
+        return plan::BoundScalarExpr{
+            plan::BoundScalarSubquery{std::move(bound_plan),
+                                      subquery->position,
+                                      "scalar subquery at position " + std::to_string(subquery->position)},
+            type};
+    }
+    auto aggregate_ref = ensure_aggregate_expression(
+        std::get<AggregateCall>(expression), scopes, aggregate_expressions, inside_subquery);
     return plan::BoundScalarExpr{aggregate_ref, aggregate_ref.type};
 }
 
 plan::BoundComparisonExpr bind_having_comparison(const HavingComparisonExpr& comparison,
                                                  const std::vector<TableScope>& scopes,
                                                  const std::vector<plan::BoundColumnRef>& group_keys,
-                                                 std::vector<plan::AggregateExpression>& aggregate_expressions) {
-    auto left = bind_having_expression(comparison.left, scopes, group_keys, aggregate_expressions);
-    auto right = bind_having_expression(comparison.right, scopes, group_keys, aggregate_expressions);
+                                                 std::vector<plan::AggregateExpression>& aggregate_expressions,
+                                                 const catalog::Catalog& catalog,
+                                                 bool inside_subquery) {
+    auto left = bind_having_expression(
+        comparison.left, scopes, group_keys, aggregate_expressions, catalog, inside_subquery);
+    auto right = bind_having_expression(
+        comparison.right, scopes, group_keys, aggregate_expressions, catalog, inside_subquery);
     align_null_comparison_types(left, right);
     if (left.type != right.type) {
         throw BindError(comparison.operator_position,
@@ -391,17 +544,60 @@ plan::BoundComparisonExpr bind_having_comparison(const HavingComparisonExpr& com
 plan::BoundPredicate bind_having_predicate(const HavingPredicateExpr& predicate,
                                            const std::vector<TableScope>& scopes,
                                            const std::vector<plan::BoundColumnRef>& group_keys,
-                                           std::vector<plan::AggregateExpression>& aggregate_expressions) {
+                                           std::vector<plan::AggregateExpression>& aggregate_expressions,
+                                           const catalog::Catalog& catalog,
+                                           bool inside_subquery) {
     switch (predicate.kind) {
     case PredicateKind::Comparison:
         return plan::BoundPredicate::comparison_expr(
-            bind_having_comparison(predicate.comparison, scopes, group_keys, aggregate_expressions));
+            bind_having_comparison(
+                predicate.comparison, scopes, group_keys, aggregate_expressions, catalog, inside_subquery));
     case PredicateKind::IsNull:
     case PredicateKind::IsNotNull:
         return plan::BoundPredicate::null_check_expr(
             predicate.kind,
-            bind_having_expression(predicate.null_check, scopes, group_keys, aggregate_expressions),
+            bind_having_expression(
+                predicate.null_check, scopes, group_keys, aggregate_expressions, catalog, inside_subquery),
             predicate.operator_position);
+    case PredicateKind::In:
+    case PredicateKind::NotIn: {
+        if (predicate.subquery == nullptr) {
+            throw std::logic_error("parsed HAVING IN predicate is missing its subquery");
+        }
+        auto value = bind_having_expression(
+            predicate.in_value, scopes, group_keys, aggregate_expressions, catalog, inside_subquery);
+        auto subplan = bind_subquery(ScalarSubquery{predicate.subquery, predicate.operator_position}, catalog);
+        const auto& projections = output_projections(*subplan);
+        if (projections.size() != 1) {
+            throw BindError(predicate.operator_position,
+                            "IN subquery must produce exactly one output column, got " +
+                                std::to_string(projections.size()));
+        }
+        if (is_null_literal(value)) {
+            value.type = projections.front().type;
+        }
+        if (value.type != projections.front().type) {
+            throw BindError(predicate.operator_position,
+                            "IN operand and subquery column must have the same type: " + type_name(value.type) +
+                                " vs " + type_name(projections.front().type));
+        }
+        return plan::BoundPredicate::in_expr(
+            predicate.kind,
+            std::move(value),
+            std::move(subplan),
+            predicate.operator_position,
+            "IN subquery at position " + std::to_string(predicate.operator_position));
+    }
+    case PredicateKind::Exists:
+    case PredicateKind::NotExists:
+        if (predicate.subquery == nullptr) {
+            throw std::logic_error("parsed HAVING EXISTS predicate is missing its subquery");
+        }
+        return plan::BoundPredicate::exists_expr(
+            predicate.kind,
+            bind_subquery(ScalarSubquery{predicate.subquery, predicate.operator_position}, catalog),
+            predicate.operator_position,
+            "EXISTS subquery at position " + std::to_string(predicate.operator_position));
     case PredicateKind::And:
     case PredicateKind::Or:
         if (predicate.left == nullptr || predicate.right == nullptr) {
@@ -411,11 +607,15 @@ plan::BoundPredicate bind_having_predicate(const HavingPredicateExpr& predicate,
                                            bind_having_predicate(*predicate.left,
                                                                  scopes,
                                                                  group_keys,
-                                                                 aggregate_expressions),
+                                                                 aggregate_expressions,
+                                                                 catalog,
+                                                                 inside_subquery),
                                            bind_having_predicate(*predicate.right,
                                                                  scopes,
                                                                  group_keys,
-                                                                 aggregate_expressions),
+                                                                 aggregate_expressions,
+                                                                 catalog,
+                                                                 inside_subquery),
                                            predicate.operator_position);
     }
     throw std::logic_error("unreachable predicate kind");
@@ -425,11 +625,14 @@ std::vector<plan::BoundPredicate> bind_having_predicates(
     const std::vector<HavingPredicateExpr>& predicates,
     const std::vector<TableScope>& scopes,
     const std::vector<plan::BoundColumnRef>& group_keys,
-    std::vector<plan::AggregateExpression>& aggregate_expressions) {
+    std::vector<plan::AggregateExpression>& aggregate_expressions,
+    const catalog::Catalog& catalog,
+    bool inside_subquery) {
     std::vector<plan::BoundPredicate> bound;
     bound.reserve(predicates.size());
     for (const auto& predicate : predicates) {
-        bound.push_back(bind_having_predicate(predicate, scopes, group_keys, aggregate_expressions));
+        bound.push_back(
+            bind_having_predicate(predicate, scopes, group_keys, aggregate_expressions, catalog, inside_subquery));
     }
     return bound;
 }
@@ -440,7 +643,8 @@ std::vector<plan::SortKey> bind_order_by_keys(const std::vector<OrderByKey>& key
                                               bool aggregate_query,
                                               bool distinct_query,
                                               const std::vector<std::string>& output_names,
-                                              const std::vector<plan::Projection>& projections) {
+                                              const std::vector<plan::Projection>& projections,
+                                              bool inside_subquery) {
     std::vector<plan::SortKey> bound;
     bound.reserve(keys.size());
     for (const auto& key : keys) {
@@ -453,12 +657,12 @@ std::vector<plan::SortKey> bind_order_by_keys(const std::vector<OrderByKey>& key
         }
 
         if (const auto* aggregate = std::get_if<AggregateCall>(&key.expression)) {
-            (void)bind_aggregate_call(*aggregate, scopes);
+            (void)bind_aggregate_call(*aggregate, scopes, inside_subquery);
             throw BindError(aggregate->position, "ORDER BY output '" + name + "' must appear in SELECT list");
         }
 
         const auto& column = std::get<ColumnRef>(key.expression);
-        auto sort_key = plan::SortKey{bind_column_ref(column, scopes), key.direction};
+        auto sort_key = plan::SortKey{bind_column_ref(column, scopes, inside_subquery), key.direction};
         if (distinct_query) {
             throw BindError(column.position,
                             "ORDER BY column '" + output_name(column) +
@@ -498,11 +702,11 @@ plan::JoinKind bound_join_kind(JoinKind parsed) {
     throw std::logic_error("unreachable parsed join kind");
 }
 
-} // namespace
-
-plan::LogicalPlan bind_select(const SelectQuery& query, const catalog::Catalog& catalog) {
+plan::LogicalPlan bind_select_impl(const SelectQuery& query,
+                                   const catalog::Catalog& catalog,
+                                   bool inside_subquery) {
     const auto scopes = build_scopes(query, catalog);
-    auto group_keys = bind_group_by_keys(query.group_by, scopes);
+    auto group_keys = bind_group_by_keys(query.group_by, scopes, inside_subquery);
     const auto aggregate_query = !group_keys.empty() || query_has_aggregate(query) || query.having.has_value();
 
     std::set<std::string> output_names;
@@ -520,7 +724,8 @@ plan::LogicalPlan bind_select(const SelectQuery& query, const catalog::Catalog& 
         output_name_order.push_back(name);
 
         if (const auto* aggregate = std::get_if<AggregateCall>(&item.expression)) {
-            const auto aggregate_ref = ensure_aggregate_expression(*aggregate, scopes, aggregate_expressions);
+            const auto aggregate_ref =
+                ensure_aggregate_expression(*aggregate, scopes, aggregate_expressions, inside_subquery);
             projections.push_back(plan::Projection{
                 name,
                 plan::BoundScalarExpr{aggregate_ref, aggregate_ref.type},
@@ -530,7 +735,7 @@ plan::LogicalPlan bind_select(const SelectQuery& query, const catalog::Catalog& 
         }
 
         const auto& scalar = std::get<ScalarExpr>(item.expression);
-        auto expression = bind_expression(scalar, scopes);
+        auto expression = bind_expression(scalar, scopes, catalog, inside_subquery);
         if (aggregate_query) {
             if (const auto* column = std::get_if<plan::BoundColumnRef>(&expression.value);
                 column != nullptr && !contains_group_key(group_keys, *column)) {
@@ -546,21 +751,29 @@ plan::LogicalPlan bind_select(const SelectQuery& query, const catalog::Catalog& 
 
     std::vector<plan::BoundPredicate> having_predicates;
     if (query.having.has_value()) {
-        having_predicates = bind_having_predicates(query.having->conjuncts, scopes, group_keys, aggregate_expressions);
+        having_predicates = bind_having_predicates(
+            query.having->conjuncts, scopes, group_keys, aggregate_expressions, catalog, inside_subquery);
         if (group_keys.empty() && aggregate_expressions.empty()) {
             aggregate_expressions.push_back(hidden_count_star_aggregate());
         }
     }
 
-    auto sort_keys =
-        bind_order_by_keys(query.order_by, scopes, group_keys, aggregate_query, query.distinct, output_name_order, projections);
+    auto sort_keys = bind_order_by_keys(query.order_by,
+                                        scopes,
+                                        group_keys,
+                                        aggregate_query,
+                                        query.distinct,
+                                        output_name_order,
+                                        projections,
+                                        inside_subquery);
 
     auto plan = plan::LogicalPlan::scan(query.table, binding_name(query));
     std::vector<TableScope> visible_scopes;
     visible_scopes.push_back(scopes.front());
     for (std::size_t i = 0; i < query.joins.size(); ++i) {
         visible_scopes.push_back(scopes.at(i + 1));
-        auto predicates = bind_predicates(query.joins[i].predicates, visible_scopes);
+        auto predicates =
+            bind_predicates(query.joins[i].predicates, visible_scopes, catalog, inside_subquery);
         auto right_scan = plan::LogicalPlan::scan(query.joins[i].table, binding_name(query.joins[i]));
         if (query.joins[i].kind == JoinKind::Right) {
             plan = plan::LogicalPlan::join(std::move(predicates),
@@ -576,7 +789,8 @@ plan::LogicalPlan bind_select(const SelectQuery& query, const catalog::Catalog& 
     }
 
     if (query.predicate.has_value()) {
-        plan = plan::LogicalPlan::filter(bind_predicates(query.predicate->conjuncts, scopes), std::move(plan));
+        plan = plan::LogicalPlan::filter(
+            bind_predicates(query.predicate->conjuncts, scopes, catalog, inside_subquery), std::move(plan));
     }
     if (aggregate_query) {
         plan = plan::LogicalPlan::aggregate(std::move(group_keys), std::move(aggregate_expressions), std::move(plan));
@@ -600,6 +814,12 @@ plan::LogicalPlan bind_select(const SelectQuery& query, const catalog::Catalog& 
         return plan::LogicalPlan::explain(std::move(bound));
     }
     return bound;
+}
+
+} // namespace
+
+plan::LogicalPlan bind_select(const SelectQuery& query, const catalog::Catalog& catalog) {
+    return bind_select_impl(query, catalog, false);
 }
 
 } // namespace sql
