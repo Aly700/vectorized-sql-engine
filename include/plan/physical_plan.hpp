@@ -10,7 +10,7 @@
 
 namespace plan {
 
-enum class PhysicalKind { Scan, Join, Filter, Project, Aggregate, Distinct, Sort, Limit };
+enum class PhysicalKind { Scan, Join, Filter, Project, Aggregate, Window, Distinct, Sort, Limit };
 
 struct PhysicalPlan {
     PhysicalKind kind{PhysicalKind::Scan};
@@ -21,6 +21,7 @@ struct PhysicalPlan {
     std::vector<Projection> projections;
     std::vector<BoundColumnRef> group_keys;
     std::vector<AggregateExpression> aggregate_expressions;
+    std::vector<WindowExpression> window_expressions;
     std::vector<SortKey> sort_keys;
     std::vector<BoundPredicate> predicates;
     JoinKind join_kind{JoinKind::Inner};
@@ -77,6 +78,14 @@ struct PhysicalPlan {
         p.kind = PhysicalKind::Aggregate;
         p.group_keys = std::move(group_keys);
         p.aggregate_expressions = std::move(aggregate_expressions);
+        p.input = std::make_shared<PhysicalPlan>(std::move(child));
+        return p;
+    }
+
+    static PhysicalPlan window(std::vector<WindowExpression> window_expressions, PhysicalPlan child) {
+        PhysicalPlan p;
+        p.kind = PhysicalKind::Window;
+        p.window_expressions = std::move(window_expressions);
         p.input = std::make_shared<PhysicalPlan>(std::move(child));
         return p;
     }

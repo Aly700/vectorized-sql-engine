@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
+#include <iterator>
 #include <limits>
 #include <optional>
 #include <random>
@@ -65,6 +66,14 @@ struct AggregateExpr {
     std::string expression;
     catalog::ColumnType type{catalog::ColumnType::Int64};
     bool nullable{false};
+    bool contains_null{false};
+};
+
+struct WindowInput {
+    std::string expression;
+    catalog::ColumnType type{catalog::ColumnType::Int64};
+    bool nullable{false};
+    bool contains_null{false};
 };
 
 struct GeneratedCase {
@@ -93,6 +102,27 @@ struct GeneratedCase {
     bool has_null_bearing_subquery{false};
     bool has_empty_subquery{false};
     bool has_or_embedded_subquery{false};
+    std::size_t window_definition_count{0};
+    std::size_t row_number_window_count{0};
+    std::size_t rank_window_count{0};
+    std::size_t dense_rank_window_count{0};
+    std::size_t count_window_count{0};
+    std::size_t sum_window_count{0};
+    std::size_t min_window_count{0};
+    std::size_t max_window_count{0};
+    std::size_t partitioned_window_count{0};
+    std::size_t unpartitioned_window_count{0};
+    std::size_t ordered_rank_window_count{0};
+    std::size_t unordered_rank_window_count{0};
+    bool has_window{false};
+    bool has_null_window_key{false};
+    bool has_string_window_key{false};
+    bool has_string_window_argument{false};
+    bool has_joined_window_input{false};
+    bool has_grouped_window_input{false};
+    bool has_having_window_input{false};
+    bool has_multiple_windows{false};
+    bool has_window_outer_order{false};
 };
 
 std::string sql_text(const ColumnRef& ref) {
@@ -208,18 +238,24 @@ public:
         right_join_count_ = 0;
         null_key_join_count_ = 0;
         reset_subquery_coverage();
+        reset_window_coverage();
+        const auto window_mode = static_cast<std::size_t>((seed_ - 1) % 8);
+        const auto window_query = static_cast<std::size_t>((seed_ - 1) % 16) < 8;
+        const auto force_window_join = window_query && (window_mode == 0 || window_mode == 7);
+        const auto force_grouped_window = window_query && (window_mode == 4 || window_mode == 7);
         auto tables = generate_tables();
         auto catalog = make_catalog(tables);
-        auto ranges = choose_ranges(tables);
+        auto ranges = choose_ranges(tables, force_window_join);
         const auto all_columns = columns_for_ranges(ranges);
         const auto from_sql = from_clause(ranges);
-        const auto aggregate_query = chance(48);
+        const auto aggregate_query = force_grouped_window || (window_query ? chance(36) : chance(48));
         std::vector<ColumnRef> group_keys;
         std::vector<AggregateExpr> aggregate_exprs;
         std::vector<SelectItem> select_items;
+        std::vector<std::string> window_aliases;
 
         if (aggregate_query) {
-            if (chance(70)) {
+            if (force_grouped_window || chance(70)) {
                 group_keys = sample_unique_columns(all_columns,
                                            between(1, std::min<std::size_t>(3, all_columns.size())));
             }
@@ -230,6 +266,13 @@ public:
             select_items = aggregate_select_items(group_keys, aggregate_exprs, all_columns);
         } else {
             select_items = scalar_select_items(all_columns);
+        }
+        if (window_query) {
+            auto window_items = window_select_items(
+                window_mode, aggregate_query, group_keys, aggregate_exprs, all_columns, &window_aliases);
+            select_items.insert(select_items.end(),
+                                std::make_move_iterator(window_items.begin()),
+                                std::make_move_iterator(window_items.end()));
         }
 
         const auto distinct = chance(28);
@@ -263,14 +306,20 @@ public:
                 sql << sql_text(group_keys[i]);
             }
         }
-        if (!group_keys.empty() && chance(55)) {
+        bool has_having = false;
+        if (!group_keys.empty() && (force_grouped_window || chance(55))) {
             sql << " HAVING " << having_tree(group_keys, aggregate_exprs, 2);
+            has_having = true;
         }
 
         const auto order_candidates = order_by_candidates(distinct, aggregate_query, group_keys, select_items, all_columns);
-        if (!order_candidates.empty() && chance(62)) {
+        const auto force_window_outer_order = window_query && !window_aliases.empty() && (window_mode == 1 || window_mode == 7);
+        if (!order_candidates.empty() && (force_window_outer_order || chance(62))) {
             sql << " ORDER BY ";
-            auto keys = sample_unique(order_candidates, between(1, std::min<std::size_t>(2, order_candidates.size())));
+            auto keys = force_window_outer_order
+                            ? std::vector<std::string>{pick(window_aliases)}
+                            : sample_unique(order_candidates,
+                                            between(1, std::min<std::size_t>(2, order_candidates.size())));
             for (std::size_t i = 0; i < keys.size(); ++i) {
                 if (i != 0) {
                     sql << ", ";
@@ -278,6 +327,7 @@ public:
                 sql << keys[i] << (chance(50) ? " ASC" : " DESC");
             }
             saw_string_order_key_ = any_string_order_key(keys, select_items, all_columns);
+            has_window_outer_order_ = has_window_outer_order_ || force_window_outer_order;
         } else {
             saw_string_order_key_ = false;
         }
@@ -310,7 +360,28 @@ public:
                              has_subquery_aggregate_,
                              has_null_bearing_subquery_,
                              has_empty_subquery_,
-                             has_or_embedded_subquery_};
+                             has_or_embedded_subquery_,
+                             window_definition_count_,
+                             row_number_window_count_,
+                             rank_window_count_,
+                             dense_rank_window_count_,
+                             count_window_count_,
+                             sum_window_count_,
+                             min_window_count_,
+                             max_window_count_,
+                             partitioned_window_count_,
+                             unpartitioned_window_count_,
+                             ordered_rank_window_count_,
+                             unordered_rank_window_count_,
+                             window_definition_count_ != 0,
+                             has_null_window_key_,
+                             has_string_window_key_,
+                             has_string_window_argument_,
+                             window_definition_count_ != 0 && ranges.size() > 1,
+                             window_definition_count_ != 0 && aggregate_query,
+                             window_definition_count_ != 0 && has_having,
+                             window_definition_count_ > 1,
+                             has_window_outer_order_};
     }
 
 private:
@@ -354,9 +425,9 @@ private:
         return tables;
     }
 
-    std::vector<RangeItem> choose_ranges(const std::vector<GeneratedTable>& tables) {
+    std::vector<RangeItem> choose_ranges(const std::vector<GeneratedTable>& tables, bool force_join) {
         std::vector<RangeItem> ranges;
-        const auto range_count = between(1, 4);
+        const auto range_count = force_join ? between(2, 4) : between(1, 4);
         ranges.reserve(range_count);
         for (std::size_t i = 0; i < range_count; ++i) {
             const auto& table = pick(tables);
@@ -433,6 +504,269 @@ private:
             }
         }
         return items;
+    }
+
+    std::vector<SelectItem> window_select_items(std::size_t mode,
+                                                bool aggregate_query,
+                                                const std::vector<ColumnRef>& group_keys,
+                                                const std::vector<AggregateExpr>& aggregate_exprs,
+                                                const std::vector<ColumnRef>& all_columns,
+                                                std::vector<std::string>* aliases) {
+        const auto inputs = window_inputs(aggregate_query, group_keys, aggregate_exprs, all_columns);
+        std::vector<SelectItem> items;
+        const auto add = [&](sql::WindowFunction function) {
+            const auto item = make_window_select_item(function, mode, inputs, all_columns);
+            aliases->push_back(item.alias);
+            items.push_back(item);
+        };
+
+        if (mode == 7) {
+            add(sql::WindowFunction::RowNumber);
+            add(sql::WindowFunction::Sum);
+            add(sql::WindowFunction::Count);
+            return items;
+        }
+
+        switch (mode) {
+        case 0:
+            add(sql::WindowFunction::RowNumber);
+            break;
+        case 1:
+            add(sql::WindowFunction::Rank);
+            break;
+        case 2:
+            add(sql::WindowFunction::DenseRank);
+            break;
+        case 3:
+            add(sql::WindowFunction::Count);
+            break;
+        case 4:
+            add(sql::WindowFunction::Sum);
+            break;
+        case 5:
+            add(sql::WindowFunction::Min);
+            break;
+        default:
+            add(sql::WindowFunction::Max);
+            break;
+        }
+        return items;
+    }
+
+    std::vector<WindowInput> window_inputs(bool aggregate_query,
+                                           const std::vector<ColumnRef>& group_keys,
+                                           const std::vector<AggregateExpr>& aggregate_exprs,
+                                           const std::vector<ColumnRef>& all_columns) const {
+        std::vector<WindowInput> inputs;
+        if (aggregate_query) {
+            for (const auto& key : group_keys) {
+                inputs.push_back(WindowInput{sql_text(key), key.type, key.nullable, key.contains_null});
+            }
+            for (const auto& aggregate : aggregate_exprs) {
+                inputs.push_back(
+                    WindowInput{aggregate.expression, aggregate.type, aggregate.nullable, aggregate.contains_null});
+            }
+            if (std::none_of(inputs.begin(), inputs.end(), [](const auto& input) {
+                    return input.type == catalog::ColumnType::Int64;
+                })) {
+                inputs.push_back(WindowInput{"COUNT(*)", catalog::ColumnType::Int64, false, false});
+            }
+        } else {
+            for (const auto& column : all_columns) {
+                inputs.push_back(WindowInput{sql_text(column), column.type, column.nullable, column.contains_null});
+            }
+        }
+        if (inputs.empty()) {
+            throw std::logic_error("generator has no window inputs");
+        }
+        return inputs;
+    }
+
+    SelectItem make_window_select_item(sql::WindowFunction function,
+                                       std::size_t mode,
+                                       const std::vector<WindowInput>& inputs,
+                                       const std::vector<ColumnRef>& all_columns) {
+        std::optional<WindowInput> argument;
+        catalog::ColumnType output_type = catalog::ColumnType::Int64;
+        bool nullable = false;
+        bool count_star = false;
+        switch (function) {
+        case sql::WindowFunction::RowNumber:
+        case sql::WindowFunction::Rank:
+        case sql::WindowFunction::DenseRank:
+            break;
+        case sql::WindowFunction::Count:
+            count_star = mode == 7 || chance(35);
+            if (!count_star) {
+                argument = pick_window_input(inputs, std::nullopt, mode == 3, false);
+            }
+            break;
+        case sql::WindowFunction::Sum:
+            argument = pick_window_input(inputs, catalog::ColumnType::Int64, false, false);
+            nullable = true;
+            break;
+        case sql::WindowFunction::Min:
+            argument = pick_window_input(inputs, std::nullopt, true, false);
+            output_type = argument->type;
+            nullable = true;
+            break;
+        case sql::WindowFunction::Max:
+            argument = pick_window_input(inputs, std::nullopt, true, false);
+            output_type = argument->type;
+            nullable = true;
+            break;
+        }
+
+        std::vector<WindowInput> partition_keys;
+        const auto force_partition = mode == 0 || mode == 2 || mode == 3 || mode == 4 || mode == 5 || mode == 7;
+        if (force_partition || chance(45)) {
+            partition_keys.push_back(pick_window_input(inputs, std::nullopt, mode == 3 || mode == 5, mode == 0 || mode == 2));
+        }
+
+        std::vector<WindowInput> order_keys;
+        if (function == sql::WindowFunction::RowNumber || function == sql::WindowFunction::Rank ||
+            function == sql::WindowFunction::DenseRank) {
+            const auto force_order = function != sql::WindowFunction::DenseRank || mode == 7;
+            if (force_order || chance(55)) {
+                order_keys.push_back(pick_window_input(inputs, std::nullopt, mode == 1, mode == 0));
+            }
+        }
+
+        for (const auto& key : partition_keys) {
+            has_null_window_key_ = has_null_window_key_ || key.contains_null;
+            has_string_window_key_ = has_string_window_key_ || key.type == catalog::ColumnType::String;
+        }
+        for (const auto& key : order_keys) {
+            has_null_window_key_ = has_null_window_key_ || key.contains_null;
+            has_string_window_key_ = has_string_window_key_ || key.type == catalog::ColumnType::String;
+        }
+        if (argument.has_value() && argument->type == catalog::ColumnType::String) {
+            has_string_window_argument_ = true;
+        }
+
+        ++window_definition_count_;
+        partition_keys.empty() ? ++unpartitioned_window_count_ : ++partitioned_window_count_;
+        switch (function) {
+        case sql::WindowFunction::RowNumber:
+            ++row_number_window_count_;
+            break;
+        case sql::WindowFunction::Rank:
+            ++rank_window_count_;
+            order_keys.empty() ? ++unordered_rank_window_count_ : ++ordered_rank_window_count_;
+            break;
+        case sql::WindowFunction::DenseRank:
+            ++dense_rank_window_count_;
+            order_keys.empty() ? ++unordered_rank_window_count_ : ++ordered_rank_window_count_;
+            break;
+        case sql::WindowFunction::Count:
+            ++count_window_count_;
+            break;
+        case sql::WindowFunction::Sum:
+            ++sum_window_count_;
+            break;
+        case sql::WindowFunction::Min:
+            ++min_window_count_;
+            break;
+        case sql::WindowFunction::Max:
+            ++max_window_count_;
+            break;
+        }
+
+        const auto expression = window_expression_sql(function, count_star, argument, partition_keys, order_keys);
+        return SelectItem{expression, next_alias(all_columns), std::nullopt, output_type, nullable};
+    }
+
+    WindowInput pick_window_input(const std::vector<WindowInput>& inputs,
+                                  std::optional<catalog::ColumnType> required_type,
+                                  bool prefer_string,
+                                  bool prefer_null) {
+        std::vector<WindowInput> candidates;
+        for (const auto& input : inputs) {
+            if (!required_type.has_value() || input.type == *required_type) {
+                candidates.push_back(input);
+            }
+        }
+        if (candidates.empty()) {
+            throw std::logic_error("generator has no window input of requested type");
+        }
+        auto preferred = candidates;
+        if (prefer_string) {
+            preferred.erase(std::remove_if(preferred.begin(),
+                                           preferred.end(),
+                                           [](const auto& input) {
+                                               return input.type != catalog::ColumnType::String;
+                                           }),
+                            preferred.end());
+        }
+        if (prefer_null && !preferred.empty()) {
+            preferred.erase(std::remove_if(preferred.begin(),
+                                           preferred.end(),
+                                           [](const auto& input) {
+                                               return !input.contains_null;
+                                           }),
+                            preferred.end());
+        }
+        if (!preferred.empty()) {
+            return pick(preferred);
+        }
+        return pick(candidates);
+    }
+
+    std::string window_expression_sql(sql::WindowFunction function,
+                                      bool count_star,
+                                      const std::optional<WindowInput>& argument,
+                                      const std::vector<WindowInput>& partition_keys,
+                                      const std::vector<WindowInput>& order_keys) {
+        std::ostringstream out;
+        switch (function) {
+        case sql::WindowFunction::RowNumber:
+            out << "ROW_NUMBER()";
+            break;
+        case sql::WindowFunction::Rank:
+            out << "RANK()";
+            break;
+        case sql::WindowFunction::DenseRank:
+            out << "DENSE_RANK()";
+            break;
+        case sql::WindowFunction::Count:
+            out << (count_star ? "COUNT(*)" : "COUNT(" + argument->expression + ")");
+            break;
+        case sql::WindowFunction::Sum:
+            out << "SUM(" << argument->expression << ")";
+            break;
+        case sql::WindowFunction::Min:
+            out << "MIN(" << argument->expression << ")";
+            break;
+        case sql::WindowFunction::Max:
+            out << "MAX(" << argument->expression << ")";
+            break;
+        }
+        out << " OVER (";
+        bool wrote_clause = false;
+        if (!partition_keys.empty()) {
+            out << "PARTITION BY ";
+            for (std::size_t i = 0; i < partition_keys.size(); ++i) {
+                if (i != 0) {
+                    out << ", ";
+                }
+                out << partition_keys[i].expression;
+            }
+            wrote_clause = true;
+        }
+        if (!order_keys.empty()) {
+            if (wrote_clause) {
+                out << " ";
+            }
+            out << "ORDER BY ";
+            for (std::size_t i = 0; i < order_keys.size(); ++i) {
+                if (i != 0) {
+                    out << ", ";
+                }
+                out << order_keys[i].expression << (chance(50) ? " ASC" : " DESC");
+            }
+        }
+        out << ")";
+        return out.str();
     }
 
     std::vector<std::string> order_by_candidates(bool distinct,
@@ -620,6 +954,25 @@ private:
         has_or_embedded_subquery_ = false;
     }
 
+    void reset_window_coverage() {
+        window_definition_count_ = 0;
+        row_number_window_count_ = 0;
+        rank_window_count_ = 0;
+        dense_rank_window_count_ = 0;
+        count_window_count_ = 0;
+        sum_window_count_ = 0;
+        min_window_count_ = 0;
+        max_window_count_ = 0;
+        partitioned_window_count_ = 0;
+        unpartitioned_window_count_ = 0;
+        ordered_rank_window_count_ = 0;
+        unordered_rank_window_count_ = 0;
+        has_null_window_key_ = false;
+        has_string_window_key_ = false;
+        has_string_window_argument_ = false;
+        has_window_outer_order_ = false;
+    }
+
     std::string subquery_predicate(const std::vector<ColumnRef>& outer_columns,
                                    const std::vector<GeneratedTable>& tables) {
         const auto mode = static_cast<std::size_t>((seed_ - 1) % 10);
@@ -716,21 +1069,21 @@ private:
     AggregateExpr random_aggregate(const std::vector<ColumnRef>& columns) {
         const auto choice = between(0, 4);
         if (choice == 0) {
-            return AggregateExpr{"COUNT(*)", catalog::ColumnType::Int64, false};
+            return AggregateExpr{"COUNT(*)", catalog::ColumnType::Int64, false, false};
         }
         if (choice == 1) {
-            return AggregateExpr{"COUNT(" + sql_text(pick(columns)) + ")", catalog::ColumnType::Int64, false};
+            return AggregateExpr{"COUNT(" + sql_text(pick(columns)) + ")", catalog::ColumnType::Int64, false, false};
         }
         if (choice == 2) {
             const auto argument = sql_text(pick(columns_of_type(columns, catalog::ColumnType::Int64)));
-            return AggregateExpr{"SUM(" + argument + ")", catalog::ColumnType::Int64, true};
+            return AggregateExpr{"SUM(" + argument + ")", catalog::ColumnType::Int64, true, true};
         }
         const auto argument_column = pick(columns);
         const auto argument = sql_text(argument_column);
         if (choice == 3) {
-            return AggregateExpr{"MIN(" + argument + ")", argument_column.type, true};
+            return AggregateExpr{"MIN(" + argument + ")", argument_column.type, true, true};
         }
-        return AggregateExpr{"MAX(" + argument + ")", argument_column.type, true};
+        return AggregateExpr{"MAX(" + argument + ")", argument_column.type, true, true};
     }
 
     std::string next_alias(const std::vector<ColumnRef>& all_columns,
@@ -856,7 +1209,7 @@ private:
         std::vector<AggregateExpr> expressions;
         expressions.reserve(group_keys.size() + aggregate_exprs.size());
         for (const auto& key : group_keys) {
-            expressions.push_back(AggregateExpr{sql_text(key), key.type, key.nullable});
+            expressions.push_back(AggregateExpr{sql_text(key), key.type, key.nullable, key.contains_null});
         }
         expressions.insert(expressions.end(), aggregate_exprs.begin(), aggregate_exprs.end());
         return expressions;
@@ -1029,6 +1382,22 @@ private:
     bool has_null_bearing_subquery_{false};
     bool has_empty_subquery_{false};
     bool has_or_embedded_subquery_{false};
+    std::size_t window_definition_count_{0};
+    std::size_t row_number_window_count_{0};
+    std::size_t rank_window_count_{0};
+    std::size_t dense_rank_window_count_{0};
+    std::size_t count_window_count_{0};
+    std::size_t sum_window_count_{0};
+    std::size_t min_window_count_{0};
+    std::size_t max_window_count_{0};
+    std::size_t partitioned_window_count_{0};
+    std::size_t unpartitioned_window_count_{0};
+    std::size_t ordered_rank_window_count_{0};
+    std::size_t unordered_rank_window_count_{0};
+    bool has_null_window_key_{false};
+    bool has_string_window_key_{false};
+    bool has_string_window_argument_{false};
+    bool has_window_outer_order_{false};
 };
 
 std::optional<std::uint64_t> parse_seed_arg(int argc, char** argv) {
@@ -1251,6 +1620,27 @@ int main(int argc, char** argv) {
     std::size_t null_bearing_subquery_queries = 0;
     std::size_t empty_subquery_queries = 0;
     std::size_t or_embedded_subquery_queries = 0;
+    std::size_t window_queries = 0;
+    std::size_t window_definitions = 0;
+    std::size_t row_number_windows = 0;
+    std::size_t rank_windows = 0;
+    std::size_t dense_rank_windows = 0;
+    std::size_t count_windows = 0;
+    std::size_t sum_windows = 0;
+    std::size_t min_windows = 0;
+    std::size_t max_windows = 0;
+    std::size_t partitioned_windows = 0;
+    std::size_t unpartitioned_windows = 0;
+    std::size_t ordered_rank_windows = 0;
+    std::size_t unordered_rank_windows = 0;
+    std::size_t null_window_key_queries = 0;
+    std::size_t string_window_key_queries = 0;
+    std::size_t string_window_argument_queries = 0;
+    std::size_t joined_window_queries = 0;
+    std::size_t grouped_window_queries = 0;
+    std::size_t having_window_queries = 0;
+    std::size_t multi_window_queries = 0;
+    std::size_t window_outer_order_queries = 0;
     std::size_t exists_to_semi_firings = 0;
     std::size_t not_exists_to_anti_firings = 0;
     std::size_t in_to_semi_firings = 0;
@@ -1299,6 +1689,27 @@ int main(int argc, char** argv) {
         null_bearing_subquery_queries += generated.has_null_bearing_subquery ? 1 : 0;
         empty_subquery_queries += generated.has_empty_subquery ? 1 : 0;
         or_embedded_subquery_queries += generated.has_or_embedded_subquery ? 1 : 0;
+        window_queries += generated.has_window ? 1 : 0;
+        window_definitions += generated.window_definition_count;
+        row_number_windows += generated.row_number_window_count;
+        rank_windows += generated.rank_window_count;
+        dense_rank_windows += generated.dense_rank_window_count;
+        count_windows += generated.count_window_count;
+        sum_windows += generated.sum_window_count;
+        min_windows += generated.min_window_count;
+        max_windows += generated.max_window_count;
+        partitioned_windows += generated.partitioned_window_count;
+        unpartitioned_windows += generated.unpartitioned_window_count;
+        ordered_rank_windows += generated.ordered_rank_window_count;
+        unordered_rank_windows += generated.unordered_rank_window_count;
+        null_window_key_queries += generated.has_null_window_key ? 1 : 0;
+        string_window_key_queries += generated.has_string_window_key ? 1 : 0;
+        string_window_argument_queries += generated.has_string_window_argument ? 1 : 0;
+        joined_window_queries += generated.has_joined_window_input ? 1 : 0;
+        grouped_window_queries += generated.has_grouped_window_input ? 1 : 0;
+        having_window_queries += generated.has_having_window_input ? 1 : 0;
+        multi_window_queries += generated.has_multiple_windows ? 1 : 0;
+        window_outer_order_queries += generated.has_window_outer_order ? 1 : 0;
         exists_to_semi_firings += stats.exists_to_semi_firings;
         not_exists_to_anti_firings += stats.not_exists_to_anti_firings;
         in_to_semi_firings += stats.in_to_semi_firings;
@@ -1337,7 +1748,13 @@ int main(int argc, char** argv) {
          or_embedded_subquery_queries == 0 || exists_to_semi_firings == 0 || not_exists_to_anti_firings == 0 ||
          in_to_semi_firings == 0 || correlated_exists_to_semi_firings == 0 ||
          correlated_not_exists_to_anti_firings == 0 || correlated_in_to_semi_firings == 0 ||
-         residual_correlated_guard_paths == 0 ||
+         residual_correlated_guard_paths == 0 || window_queries == 0 || window_definitions == 0 ||
+         row_number_windows == 0 || rank_windows == 0 || dense_rank_windows == 0 || count_windows == 0 ||
+         sum_windows == 0 || min_windows == 0 || max_windows == 0 || partitioned_windows == 0 ||
+         unpartitioned_windows == 0 || ordered_rank_windows == 0 || unordered_rank_windows == 0 ||
+         null_window_key_queries == 0 || string_window_key_queries == 0 ||
+         string_window_argument_queries == 0 || joined_window_queries == 0 || grouped_window_queries == 0 ||
+         having_window_queries == 0 || multi_window_queries == 0 || window_outer_order_queries == 0 ||
          std::any_of(correlated_mode_queries.begin(), correlated_mode_queries.end(), [](auto count) {
              return count == 0;
          }))) {
@@ -1365,6 +1782,27 @@ int main(int argc, char** argv) {
                   << " correlated_not_exists_to_anti_firings=" << correlated_not_exists_to_anti_firings
                   << " correlated_in_to_semi_firings=" << correlated_in_to_semi_firings
                   << " residual_correlated_guard_paths=" << residual_correlated_guard_paths << "\n";
+        std::cerr << " window_queries=" << window_queries
+                  << " window_definitions=" << window_definitions
+                  << " row_number_windows=" << row_number_windows
+                  << " rank_windows=" << rank_windows
+                  << " dense_rank_windows=" << dense_rank_windows
+                  << " count_windows=" << count_windows
+                  << " sum_windows=" << sum_windows
+                  << " min_windows=" << min_windows
+                  << " max_windows=" << max_windows
+                  << " partitioned_windows=" << partitioned_windows
+                  << " unpartitioned_windows=" << unpartitioned_windows
+                  << " ordered_rank_windows=" << ordered_rank_windows
+                  << " unordered_rank_windows=" << unordered_rank_windows
+                  << " null_window_key_queries=" << null_window_key_queries
+                  << " string_window_key_queries=" << string_window_key_queries
+                  << " string_window_argument_queries=" << string_window_argument_queries
+                  << " joined_window_queries=" << joined_window_queries
+                  << " grouped_window_queries=" << grouped_window_queries
+                  << " having_window_queries=" << having_window_queries
+                  << " multi_window_queries=" << multi_window_queries
+                  << " window_outer_order_queries=" << window_outer_order_queries << "\n";
         return 1;
     }
 
@@ -1394,6 +1832,27 @@ int main(int argc, char** argv) {
               << " null_bearing_subquery_queries=" << null_bearing_subquery_queries
               << " empty_subquery_queries=" << empty_subquery_queries
               << " or_embedded_subquery_queries=" << or_embedded_subquery_queries
+              << " window_queries=" << window_queries
+              << " window_definitions=" << window_definitions
+              << " row_number_windows=" << row_number_windows
+              << " rank_windows=" << rank_windows
+              << " dense_rank_windows=" << dense_rank_windows
+              << " count_windows=" << count_windows
+              << " sum_windows=" << sum_windows
+              << " min_windows=" << min_windows
+              << " max_windows=" << max_windows
+              << " partitioned_windows=" << partitioned_windows
+              << " unpartitioned_windows=" << unpartitioned_windows
+              << " ordered_rank_windows=" << ordered_rank_windows
+              << " unordered_rank_windows=" << unordered_rank_windows
+              << " null_window_key_queries=" << null_window_key_queries
+              << " string_window_key_queries=" << string_window_key_queries
+              << " string_window_argument_queries=" << string_window_argument_queries
+              << " joined_window_queries=" << joined_window_queries
+              << " grouped_window_queries=" << grouped_window_queries
+              << " having_window_queries=" << having_window_queries
+              << " multi_window_queries=" << multi_window_queries
+              << " window_outer_order_queries=" << window_outer_order_queries
               << " exists_to_semi_firings=" << exists_to_semi_firings
               << " not_exists_to_anti_firings=" << not_exists_to_anti_firings
               << " in_to_semi_firings=" << in_to_semi_firings

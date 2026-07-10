@@ -360,6 +360,12 @@ std::vector<Workload> make_workloads(const execution::Catalog& catalog) {
         "fact=200000,groups=50000",
         "SELECT group_many, SUM(value) AS total "
         "FROM fact GROUP BY group_many ORDER BY group_many");
+    add("window_row_number_sum",
+        "fact=200000,partitions=100",
+        "SELECT bucket, value, "
+        "ROW_NUMBER() OVER (PARTITION BY bucket ORDER BY sort_key) AS rn, "
+        "SUM(value) OVER (PARTITION BY bucket) AS bucket_sum "
+        "FROM fact");
     add("sort",
         "fact=200000",
         "SELECT a, value FROM fact ORDER BY sort_key, a LIMIT 1000");

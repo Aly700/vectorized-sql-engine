@@ -1,4 +1,5 @@
 #include "execution/interpreter.hpp"
+#include "execution/vectorized.hpp"
 #include "sql/ast.hpp"
 #include "sql/binder.hpp"
 #include "sql/errors.hpp"
@@ -9,9 +10,11 @@
 #include <limits>
 #include <optional>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <type_traits>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace {
@@ -369,6 +372,57 @@ std::string format_error(const ExpectedError& error) {
     return out.str();
 }
 
+bool contains_window(const plan::LogicalPlan& logical);
+
+bool scalar_contains_window(const plan::BoundScalarExpr& expression) {
+    const auto* subquery = std::get_if<plan::BoundScalarSubquery>(&expression.value);
+    return subquery != nullptr && (subquery->plan == nullptr || contains_window(*subquery->plan));
+}
+
+bool predicate_contains_window(const plan::BoundPredicate& predicate) {
+    switch (predicate.kind) {
+    case sql::PredicateKind::Comparison:
+        return scalar_contains_window(predicate.comparison.left) ||
+               scalar_contains_window(predicate.comparison.right);
+    case sql::PredicateKind::IsNull:
+    case sql::PredicateKind::IsNotNull:
+        return scalar_contains_window(predicate.null_check);
+    case sql::PredicateKind::In:
+    case sql::PredicateKind::NotIn:
+        return scalar_contains_window(predicate.in_value) || predicate.subquery == nullptr ||
+               contains_window(*predicate.subquery);
+    case sql::PredicateKind::Exists:
+    case sql::PredicateKind::NotExists:
+        return predicate.subquery == nullptr || contains_window(*predicate.subquery);
+    case sql::PredicateKind::And:
+    case sql::PredicateKind::Or:
+        if (predicate.left == nullptr || predicate.right == nullptr) {
+            throw std::logic_error("bound predicate is missing a child");
+        }
+        return predicate_contains_window(*predicate.left) || predicate_contains_window(*predicate.right);
+    }
+    throw std::logic_error("unreachable predicate kind");
+}
+
+bool contains_window(const plan::LogicalPlan& logical) {
+    if (logical.kind == plan::LogicalKind::Window) {
+        return true;
+    }
+    for (const auto& projection : logical.projections) {
+        if (scalar_contains_window(projection.expression)) {
+            return true;
+        }
+    }
+    for (const auto& predicate : logical.predicates) {
+        if (predicate_contains_window(predicate)) {
+            return true;
+        }
+    }
+    return (logical.input != nullptr && contains_window(*logical.input)) ||
+           (logical.left != nullptr && contains_window(*logical.left)) ||
+           (logical.right != nullptr && contains_window(*logical.right));
+}
+
 std::string run_query(const GoldenQuery& test, const execution::Catalog& catalog) {
     try {
         auto parsed = sql::parse_select(test.sql);
@@ -384,17 +438,52 @@ std::string run_query(const GoldenQuery& test, const execution::Catalog& catalog
     }
 }
 
+std::string run_vectorized_query(const GoldenQuery& test, const execution::Catalog& catalog) {
+    try {
+        auto parsed = sql::parse_select(test.sql);
+        auto logical = sql::bind_select(parsed, catalog);
+        auto actual = execution::execute_vectorized(logical, catalog);
+        return format_result(actual);
+    } catch (const sql::ParseError& error) {
+        return format_error(ExpectedError{ErrorKind::Parse, error.position(), error.message()});
+    } catch (const sql::BindError& error) {
+        return format_error(ExpectedError{ErrorKind::Bind, error.position(), error.message()});
+    } catch (const std::exception& error) {
+        return format_error(ExpectedError{ErrorKind::Runtime, 0, error.what()});
+    }
+}
+
 bool run_case(const GoldenQuery& test, const execution::Catalog& catalog) {
     const auto actual = run_query(test, catalog);
     const auto expected = test.expects_error ? format_error(test.error) : format_result(test.result);
-    if (actual == expected) {
+    if (actual != expected) {
+        std::cerr << "golden query failed: " << test.name << "\n"
+                  << "query: " << test.sql << "\n"
+                  << "expected: " << expected << "\n"
+                  << "actual:   " << actual << "\n";
+        return false;
+    }
+
+    try {
+        auto parsed = sql::parse_select(test.sql);
+        auto logical = sql::bind_select(parsed, catalog);
+        if (!contains_window(logical)) {
+            return true;
+        }
+    } catch (const sql::ParseError&) {
+        return true;
+    } catch (const sql::BindError&) {
         return true;
     }
 
-    std::cerr << "golden query failed: " << test.name << "\n"
+    const auto vectorized = run_vectorized_query(test, catalog);
+    if (vectorized == expected) {
+        return true;
+    }
+    std::cerr << "golden window vectorized failed: " << test.name << "\n"
               << "query: " << test.sql << "\n"
-              << "expected: " << expected << "\n"
-              << "actual:   " << actual << "\n";
+              << "expected:   " << expected << "\n"
+              << "vectorized: " << vectorized << "\n";
     return false;
 }
 

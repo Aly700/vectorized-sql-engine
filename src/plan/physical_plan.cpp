@@ -55,7 +55,6 @@ bool predicate_has_residual_correlation(const BoundPredicate& predicate) {
 }
 
 bool logical_has_residual_correlation(const LogicalPlan& logical);
-bool logical_has_window(const LogicalPlan& logical);
 
 bool scalar_has_residual_correlation(const BoundScalarExpr& expression) {
     if (const auto* column = std::get_if<BoundColumnRef>(&expression.value)) {
@@ -65,54 +64,6 @@ bool scalar_has_residual_correlation(const BoundScalarExpr& expression) {
         return subquery->plan == nullptr || logical_has_residual_correlation(*subquery->plan);
     }
     return false;
-}
-
-bool scalar_has_window(const BoundScalarExpr& expression) {
-    const auto* subquery = std::get_if<BoundScalarSubquery>(&expression.value);
-    return subquery != nullptr && (subquery->plan == nullptr || logical_has_window(*subquery->plan));
-}
-
-bool predicate_has_window(const BoundPredicate& predicate) {
-    switch (predicate.kind) {
-    case sql::PredicateKind::Comparison:
-        return scalar_has_window(predicate.comparison.left) || scalar_has_window(predicate.comparison.right);
-    case sql::PredicateKind::IsNull:
-    case sql::PredicateKind::IsNotNull:
-        return scalar_has_window(predicate.null_check);
-    case sql::PredicateKind::In:
-    case sql::PredicateKind::NotIn:
-        return scalar_has_window(predicate.in_value) || predicate.subquery == nullptr ||
-               logical_has_window(*predicate.subquery);
-    case sql::PredicateKind::Exists:
-    case sql::PredicateKind::NotExists:
-        return predicate.subquery == nullptr || logical_has_window(*predicate.subquery);
-    case sql::PredicateKind::And:
-    case sql::PredicateKind::Or:
-        if (predicate.left == nullptr || predicate.right == nullptr) {
-            throw std::logic_error("bound predicate is missing a child");
-        }
-        return predicate_has_window(*predicate.left) || predicate_has_window(*predicate.right);
-    }
-    throw std::logic_error("unreachable predicate kind");
-}
-
-bool logical_has_window(const LogicalPlan& logical) {
-    if (logical.kind == LogicalKind::Window) {
-        return true;
-    }
-    for (const auto& projection : logical.projections) {
-        if (scalar_has_window(projection.expression)) {
-            return true;
-        }
-    }
-    for (const auto& predicate : logical.predicates) {
-        if (predicate_has_window(predicate)) {
-            return true;
-        }
-    }
-    return (logical.input != nullptr && logical_has_window(*logical.input)) ||
-           (logical.left != nullptr && logical_has_window(*logical.left)) ||
-           (logical.right != nullptr && logical_has_window(*logical.right));
 }
 
 bool logical_has_residual_correlation(const LogicalPlan& logical) {
@@ -157,7 +108,7 @@ PhysicalPlan lower_impl(const LogicalPlan& logical) {
                                        logical.aggregate_expressions,
                                        lower_impl(require_input(logical)));
     case LogicalKind::Window:
-        throw std::runtime_error("vectorized execution does not support window functions");
+        return PhysicalPlan::window(logical.window_expressions, lower_impl(require_input(logical)));
     case LogicalKind::Distinct:
         return PhysicalPlan::distinct(lower_impl(require_input(logical)));
     case LogicalKind::Sort:
@@ -173,9 +124,6 @@ PhysicalPlan lower_impl(const LogicalPlan& logical) {
 } // namespace
 
 PhysicalPlan lower_to_physical(const LogicalPlan& logical) {
-    if (logical_has_window(logical)) {
-        throw std::runtime_error("vectorized execution does not support window functions");
-    }
     if (logical_has_residual_correlation(logical)) {
         throw std::runtime_error("vectorized execution does not support residual correlated subqueries");
     }
