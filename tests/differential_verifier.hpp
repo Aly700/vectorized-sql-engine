@@ -16,7 +16,6 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
-#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -83,6 +82,9 @@ struct ComparisonStats {
     std::size_t max_group_expression_count{0};
     std::size_t execution_path_count{0};
     std::size_t accepted_error_path_count{0};
+    std::size_t left_join_to_inner_firings{0};
+    std::size_t join_commute_firings{0};
+    std::size_t join_associate_firings{0};
     bool hit_expression_bound{false};
     bool hit_plan_bound{false};
 };
@@ -389,32 +391,6 @@ inline bool contains_join(const plan::LogicalPlan& logical) {
     throw std::logic_error("unreachable logical plan kind");
 }
 
-inline constexpr std::string_view kOuterJoinVectorizedUnsupported =
-    "physical lowering does not support outer joins in phase 20a";
-
-inline bool contains_outer_join(const plan::LogicalPlan& logical) {
-    switch (logical.kind) {
-    case plan::LogicalKind::Scan:
-        return false;
-    case plan::LogicalKind::Join:
-        if (logical.join_kind != plan::JoinKind::Inner) {
-            return true;
-        }
-        return (logical.left != nullptr && contains_outer_join(*logical.left)) ||
-               (logical.right != nullptr && contains_outer_join(*logical.right));
-    case plan::LogicalKind::Filter:
-    case plan::LogicalKind::Project:
-    case plan::LogicalKind::Aggregate:
-    case plan::LogicalKind::Sort:
-    case plan::LogicalKind::Distinct:
-    case plan::LogicalKind::Limit:
-        return logical.input != nullptr && contains_outer_join(*logical.input);
-    case plan::LogicalKind::Explain:
-        return false;
-    }
-    throw std::logic_error("unreachable logical plan kind");
-}
-
 inline std::size_t join_keyword_count(const std::string& sql) {
     std::size_t count = 0;
     std::size_t pos = 0;
@@ -581,123 +557,6 @@ inline bool verify_result_pair(const storage::ColumnarBatch& unrewritten_oracle,
     return false;
 }
 
-inline bool verify_outer_join_vectorized_guard(const plan::LogicalPlan& candidate_plan,
-                                               const execution::Catalog& catalog,
-                                               const std::string& sql,
-                                               const std::string& table_text,
-                                               const std::string& path_label,
-                                               const plan::LogicalPlan& original_plan,
-                                               const std::string& memo_text = {}) {
-    try {
-        (void)execution::execute_vectorized(candidate_plan, catalog);
-    } catch (const std::runtime_error& error) {
-        if (error.what() == std::string(kOuterJoinVectorizedUnsupported)) {
-            return true;
-        }
-        std::cerr << "outer join vectorized guard used the wrong error\n"
-                  << "path: " << path_label << "\n"
-                  << "sql: " << sql << "\n"
-                  << table_text << "\n"
-                  << "expected: " << kOuterJoinVectorizedUnsupported << "\n"
-                  << "actual:   " << error.what() << "\n"
-                  << "original plan:\n"
-                  << plan::to_string(original_plan) << "\n";
-        if (!memo_text.empty()) {
-            std::cerr << memo_text;
-        }
-        std::cerr << "candidate plan:\n"
-                  << plan::to_string(candidate_plan) << "\n";
-        return false;
-    } catch (const std::exception& error) {
-        std::cerr << "outer join vectorized guard threw the wrong exception type\n"
-                  << "path: " << path_label << "\n"
-                  << "sql: " << sql << "\n"
-                  << table_text << "\n"
-                  << "exception: " << error.what() << "\n"
-                  << "original plan:\n"
-                  << plan::to_string(original_plan) << "\n";
-        if (!memo_text.empty()) {
-            std::cerr << memo_text;
-        }
-        std::cerr << "candidate plan:\n"
-                  << plan::to_string(candidate_plan) << "\n";
-        return false;
-    }
-
-    std::cerr << "outer join vectorized guard did not fire\n"
-              << "path: " << path_label << "\n"
-              << "sql: " << sql << "\n"
-              << table_text << "\n"
-              << "original plan:\n"
-              << plan::to_string(original_plan) << "\n";
-    if (!memo_text.empty()) {
-        std::cerr << memo_text;
-    }
-    std::cerr << "candidate plan:\n"
-              << plan::to_string(candidate_plan) << "\n";
-    return false;
-}
-
-inline bool verify_outer_join_oracle_result_pair(const storage::ColumnarBatch& unrewritten_oracle,
-                                                 const storage::ColumnarBatch& full_unlimited_oracle,
-                                                 const ExecutionOutcome& candidate_oracle,
-                                                 const std::string& sql,
-                                                 const std::string& table_text,
-                                                 const std::string& path_label,
-                                                 const plan::LogicalPlan& original_plan,
-                                                 const plan::LogicalPlan& candidate_plan,
-                                                 bool is_join_query,
-                                                 bool is_ordered_query,
-                                                 const std::vector<plan::SortKey>* order_keys,
-                                                 std::optional<std::size_t> limit_count,
-                                                 const std::string& memo_text = {}) {
-    const auto* candidate_order_keys = root_sort_keys(candidate_plan);
-    const auto candidate_has_results = candidate_oracle.batch.has_value();
-    const auto ordered_outputs_are_sorted =
-        candidate_has_results &&
-        (!is_ordered_query ||
-         (candidate_order_keys != nullptr && is_sorted_by_keys(unrewritten_oracle, *order_keys) &&
-          is_sorted_by_keys(*candidate_oracle.batch, *candidate_order_keys)));
-    const auto cross_plan_equal =
-        candidate_has_results &&
-        (limit_count.has_value()
-             ? valid_limit_answer(*candidate_oracle.batch, full_unlimited_oracle, *limit_count, order_keys)
-             : is_ordered_query || is_join_query ? same_sorted_bag(unrewritten_oracle, *candidate_oracle.batch)
-                                                 : same_batch(unrewritten_oracle, *candidate_oracle.batch));
-    const auto column_sets_match =
-        candidate_has_results && same_column_identity_set(unrewritten_oracle, *candidate_oracle.batch);
-    const auto output_order_matches =
-        candidate_has_results && same_column_order(unrewritten_oracle, *candidate_oracle.batch);
-
-    if (cross_plan_equal && column_sets_match && output_order_matches && ordered_outputs_are_sorted) {
-        return true;
-    }
-
-    std::cerr << "memo/rewrite outer-join oracle divergence\n"
-              << "path: " << path_label << "\n"
-              << "sql: " << sql << "\n"
-              << table_text << "\n"
-              << "original plan:\n"
-              << plan::to_string(original_plan) << "\n";
-    if (!memo_text.empty()) {
-        std::cerr << memo_text;
-    }
-    std::cerr << "candidate plan:\n"
-              << plan::to_string(candidate_plan) << "\n"
-              << "unrewritten oracle:     " << format_batch(unrewritten_oracle) << "\n"
-              << "full unlimited oracle:  " << format_batch(full_unlimited_oracle) << "\n"
-              << "unrewritten bag:        " << format_sorted_bag(unrewritten_oracle) << "\n"
-              << "candidate oracle:       " << format_outcome(candidate_oracle) << "\n";
-    if (candidate_oracle.batch.has_value()) {
-        std::cerr << "candidate oracle bag:   " << format_sorted_bag(*candidate_oracle.batch) << "\n";
-    }
-    std::cerr << "cross plan equal:       " << (cross_plan_equal ? "yes" : "no") << "\n"
-              << "column sets match:      " << (column_sets_match ? "yes" : "no") << "\n"
-              << "output order matches:   " << (output_order_matches ? "yes" : "no") << "\n"
-              << "ordered outputs sorted: " << (ordered_outputs_are_sorted ? "yes" : "no") << "\n";
-    return false;
-}
-
 inline bool compare_engines(const std::string& sql,
                             const execution::Catalog& catalog,
                             const std::string& table_text,
@@ -728,7 +587,6 @@ inline bool compare_engines(const std::string& sql,
             return false;
         }
         const auto is_join_query = contains_join(logical);
-        const auto has_outer_join = contains_outer_join(logical);
         const auto* order_keys = root_sort_keys(logical);
         const auto limit_count = root_limit_count(logical);
         const auto is_ordered_query = order_keys != nullptr;
@@ -756,6 +614,12 @@ inline bool compare_engines(const std::string& sql,
         if (stats != nullptr) {
             stats->alternative_count = alternatives.plans.size();
             stats->max_group_expression_count = alternatives.max_group_expression_count;
+            stats->left_join_to_inner_firings =
+                std::count(explored.fired_rules.begin(), explored.fired_rules.end(), "LeftJoinToInnerRule");
+            stats->join_commute_firings =
+                std::count(explored.fired_rules.begin(), explored.fired_rules.end(), "JoinCommuteRule");
+            stats->join_associate_firings =
+                std::count(explored.fired_rules.begin(), explored.fired_rules.end(), "JoinAssociateRule");
             stats->hit_expression_bound = alternatives.hit_expression_bound;
             stats->hit_plan_bound = alternatives.hit_plan_bound;
         }
@@ -793,15 +657,6 @@ inline bool compare_engines(const std::string& sql,
                 return false;
             }
         }
-        if (has_outer_join && !verify_outer_join_vectorized_guard(logical,
-                                                                  catalog,
-                                                                  sql,
-                                                                  table_text,
-                                                                  "unrewritten vectorized",
-                                                                  logical)) {
-            return false;
-        }
-
         const auto verify_path_pair = [&](const std::string& path_label,
                                           const plan::LogicalPlan& candidate_plan,
                                           const std::string& memo_text = {}) {
@@ -809,52 +664,6 @@ inline bool compare_engines(const std::string& sql,
                 path_label + " interpreted",
                 [&] { return execution::execute_interpreted(candidate_plan, catalog); },
                 stats);
-            if (has_outer_join) {
-                if (!verify_outer_join_vectorized_guard(candidate_plan,
-                                                        catalog,
-                                                        sql,
-                                                        table_text,
-                                                        path_label + " vectorized",
-                                                        logical,
-                                                        memo_text)) {
-                    return false;
-                }
-                if (!unrewritten_oracle.batch.has_value()) {
-                    if (same_accepted_error(unrewritten_oracle, candidate_oracle)) {
-                        return true;
-                    }
-                    std::cerr << "outer-join oracle runtime error divergence\n"
-                              << "path: " << path_label << "\n"
-                              << "sql: " << sql << "\n"
-                              << table_text << "\n"
-                              << "original plan:\n"
-                              << plan::to_string(logical) << "\n";
-                    if (!memo_text.empty()) {
-                        std::cerr << memo_text;
-                    }
-                    std::cerr << "candidate plan:\n"
-                              << plan::to_string(candidate_plan) << "\n"
-                              << "unrewritten oracle: " << format_outcome(unrewritten_oracle) << "\n"
-                              << "candidate oracle:   " << format_outcome(candidate_oracle) << "\n";
-                    return false;
-                }
-                if (!full_unlimited_oracle.has_value() || !full_unlimited_oracle->batch.has_value()) {
-                    throw std::logic_error("missing unlimited oracle result");
-                }
-                return verify_outer_join_oracle_result_pair(*unrewritten_oracle.batch,
-                                                            *full_unlimited_oracle->batch,
-                                                            candidate_oracle,
-                                                            sql,
-                                                            table_text,
-                                                            path_label,
-                                                            logical,
-                                                            candidate_plan,
-                                                            is_join_query,
-                                                            is_ordered_query,
-                                                            order_keys,
-                                                            limit_count,
-                                                            memo_text);
-            }
             const auto candidate_vectorized = run_execution_path(
                 path_label + " vectorized",
                 [&] { return execution::execute_vectorized(candidate_plan, catalog); },

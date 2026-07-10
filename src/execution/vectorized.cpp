@@ -1296,6 +1296,16 @@ void append_joined_row(JoinOutputBuilder& builder,
     }
 }
 
+void append_null_extended_left_row(JoinOutputBuilder& builder, std::size_t left_row) {
+    std::size_t output_index = 0;
+    for (const auto& column : builder.left_columns) {
+        append_cell(builder.columns[output_index++], column.cell(left_row));
+    }
+    for (const auto& column : builder.right_columns) {
+        append_cell(builder.columns[output_index++], null_cell(column.type));
+    }
+}
+
 storage::ColumnarBatch finish_join_output(JoinOutputBuilder builder) {
     storage::ColumnarBatch out;
     for (std::size_t i = 0; i < builder.names.size(); ++i) {
@@ -1304,21 +1314,32 @@ storage::ColumnarBatch finish_join_output(JoinOutputBuilder builder) {
     return out;
 }
 
+template <bool EmitUnmatchedLeft>
 storage::ColumnarBatch execute_nested_loop_join(const BatchView& left,
                                                 const BatchView& right,
                                                 const std::vector<plan::BoundPredicate>& predicates) {
     const auto compiled_predicates = compile_join_predicates(predicates, *left.batch, *right.batch);
     auto builder = make_join_output_builder(*left.batch, *right.batch);
     for (auto left_row : *left.selection) {
+        bool matched = false;
         for (auto right_row : *right.selection) {
             if (evaluate_join_predicates(compiled_predicates, left_row, right_row) == TruthValue::True) {
                 append_joined_row(builder, left_row, right_row);
+                if constexpr (EmitUnmatchedLeft) {
+                    matched = true;
+                }
+            }
+        }
+        if constexpr (EmitUnmatchedLeft) {
+            if (!matched) {
+                append_null_extended_left_row(builder, left_row);
             }
         }
     }
     return finish_join_output(std::move(builder));
 }
 
+template <bool EmitUnmatchedLeft>
 storage::ColumnarBatch execute_hash_join(const BatchView& left,
                                          const BatchView& right,
                                          const JoinPredicateSplit& predicates) {
@@ -1347,18 +1368,24 @@ storage::ColumnarBatch execute_hash_join(const BatchView& left,
 
     auto builder = make_join_output_builder(*left.batch, *right.batch);
     for (auto left_row : *left.selection) {
+        bool matched = false;
         auto key = make_non_null_key(left_row, compiled_left_key_columns);
-        if (!key.has_value()) {
-            continue;
+        if (key.has_value()) {
+            const auto matching_right_rows = right_rows_by_key.find(*key);
+            if (matching_right_rows != right_rows_by_key.end()) {
+                for (auto right_row : matching_right_rows->second) {
+                    if (evaluate_join_predicates(compiled_residuals, left_row, right_row) == TruthValue::True) {
+                        append_joined_row(builder, left_row, right_row);
+                        if constexpr (EmitUnmatchedLeft) {
+                            matched = true;
+                        }
+                    }
+                }
+            }
         }
-        const auto matching_right_rows = right_rows_by_key.find(*key);
-        if (matching_right_rows == right_rows_by_key.end()) {
-            continue;
-        }
-
-        for (auto right_row : matching_right_rows->second) {
-            if (evaluate_join_predicates(compiled_residuals, left_row, right_row) == TruthValue::True) {
-                append_joined_row(builder, left_row, right_row);
+        if constexpr (EmitUnmatchedLeft) {
+            if (!matched) {
+                append_null_extended_left_row(builder, left_row);
             }
         }
     }
@@ -1464,9 +1491,15 @@ BatchView execute_join(const plan::PhysicalPlan& plan, const Catalog& catalog) {
     validate_view(right);
 
     const auto predicates = split_join_predicates(plan.predicates, *left.batch, *right.batch);
-    auto materialized = std::make_shared<const storage::ColumnarBatch>(
-        predicates.equi_keys.empty() ? execute_nested_loop_join(left, right, predicates.residuals)
-                                     : execute_hash_join(left, right, predicates));
+    const auto materialized_batch = [&] {
+        if (plan.join_kind == plan::JoinKind::Left) {
+            return predicates.equi_keys.empty() ? execute_nested_loop_join<true>(left, right, predicates.residuals)
+                                                : execute_hash_join<true>(left, right, predicates);
+        }
+        return predicates.equi_keys.empty() ? execute_nested_loop_join<false>(left, right, predicates.residuals)
+                                            : execute_hash_join<false>(left, right, predicates);
+    }();
+    auto materialized = std::make_shared<const storage::ColumnarBatch>(std::move(materialized_batch));
 
     BatchView view;
     view.owned_batch = materialized;

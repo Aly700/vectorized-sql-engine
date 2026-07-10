@@ -761,7 +761,7 @@ bool run_join_oracle_corpus() {
     return ok;
 }
 
-bool run_outer_join_oracle_corpus() {
+bool run_outer_join_corpus() {
     const auto catalog = make_golden_catalog();
     const auto table_text =
         "outer join tables: t1 rows=[[1,10],[2,20],[2,30]], "
@@ -770,6 +770,8 @@ bool run_outer_join_oracle_corpus() {
         "j2 rows=[[NULL,100],[1,101],[2,102],[NULL,103]]";
     const std::vector<std::string> outer_sqls{
         "SELECT t1.a, t1.b, t2.c FROM t1 LEFT JOIN t2 ON t1.a = t2.a AND t2.c = 201",
+        "SELECT t1.a, t1.b, t2.c FROM t1 LEFT JOIN t2 ON t1.a = t2.a AND t2.c = 999",
+        "SELECT t1.a, t1.b, t2.c FROM t1 LEFT JOIN t2 ON t1.b < t2.c AND t2.c < 0",
         "SELECT t1.a, t1.b, t2.c FROM t1 LEFT JOIN t2 ON t1.a = t2.a WHERE t2.c = 201",
         "SELECT t1.b, t2.c FROM t1 LEFT JOIN t2 ON t1.a = t2.a WHERE t2.c IS NULL",
         "SELECT t2.c, COUNT(*), COUNT(t2.c), SUM(t2.c) FROM t1 LEFT JOIN t2 ON t1.a = t2.a "
@@ -784,7 +786,7 @@ bool run_outer_join_oracle_corpus() {
     for (const auto& sql : outer_sqls) {
         ComparisonStats stats;
         ok = compare_engines(sql, catalog, table_text, &stats) && ok;
-        std::cout << "outer-join oracle alternatives verified: sql=\"" << sql << "\" alternatives="
+        std::cout << "outer-join alternatives verified: sql=\"" << sql << "\" alternatives="
                   << stats.alternative_count << " max_group_expressions=" << stats.max_group_expression_count
                   << " hit_expression_bound=" << (stats.hit_expression_bound ? "yes" : "no")
                   << " hit_plan_bound=" << (stats.hit_plan_bound ? "yes" : "no") << "\n";
@@ -1031,18 +1033,16 @@ void assert_physical_lowering_accepts_string_touching_plans() {
     assert(differential::same_batch(literal_interpreted, literal_vectorized));
 }
 
-void assert_outer_join_physical_lowering_is_guarded() {
+void assert_outer_join_physical_lowering_preserves_kind() {
     const auto catalog = make_golden_catalog();
     const auto logical =
         sql::bind_select(sql::parse_select("SELECT t1.b, t2.c FROM t1 LEFT JOIN t2 ON t1.a = t2.a"), catalog);
 
-    try {
-        (void)plan::lower_to_physical(logical);
-    } catch (const std::runtime_error& error) {
-        assert(error.what() == std::string(differential::kOuterJoinVectorizedUnsupported));
-        return;
-    }
-    throw std::logic_error("expected outer join physical lowering guard");
+    const auto physical = plan::lower_to_physical(logical);
+    assert(physical.kind == plan::PhysicalKind::Project);
+    assert(physical.input != nullptr);
+    assert(physical.input->kind == plan::PhysicalKind::Join);
+    assert(physical.input->join_kind == plan::JoinKind::Left);
 }
 
 } // namespace
@@ -1050,12 +1050,12 @@ void assert_outer_join_physical_lowering_is_guarded() {
 int main() {
     assert_physical_lowering_shape();
     assert_physical_lowering_accepts_string_touching_plans();
-    assert_outer_join_physical_lowering_is_guarded();
+    assert_outer_join_physical_lowering_preserves_kind();
 
     bool ok = true;
     ok = run_result_golden_queries() && ok;
     ok = run_join_oracle_corpus() && ok;
-    ok = run_outer_join_oracle_corpus() && ok;
+    ok = run_outer_join_corpus() && ok;
     ok = run_vectorized_string_corpus() && ok;
     ok = run_generated_corpus() && ok;
     return ok ? 0 : 1;
