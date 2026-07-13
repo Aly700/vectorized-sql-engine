@@ -580,6 +580,8 @@ plan::BoundColumnRef ensure_window_expression(const WindowCall& window,
 
     const auto name = output_name(window);
     const auto type = bind_window_output_type(window, argument);
+    const auto frame = window.explicit_frame.value_or(
+        window.order_by.empty() ? WindowFrame::WholePartition : WindowFrame::RangeCumulative);
     for (const auto& existing : window_expressions) {
         if (existing.output_name == name) {
             return plan::BoundColumnRef{"", existing.output_name, window.position, existing.type};
@@ -592,6 +594,7 @@ plan::BoundColumnRef ensure_window_expression(const WindowCall& window,
                                                         std::move(argument),
                                                         std::move(partition_keys),
                                                         std::move(order_keys),
+                                                        frame,
                                                         window.position,
                                                         type});
     return plan::BoundColumnRef{"", name, window.position, type};
@@ -970,11 +973,54 @@ void mark_deterministic_order(plan::LogicalPlan& logical) {
     }
 }
 
+bool aggregate_has_checked_sum(const plan::LogicalPlan& logical) {
+    return logical.kind == plan::LogicalKind::Aggregate &&
+           std::any_of(logical.aggregate_expressions.begin(),
+                       logical.aggregate_expressions.end(),
+                       [](const auto& aggregate) {
+                           return aggregate.function == AggregateFunction::Sum;
+                       });
+}
+
 bool window_requires_deterministic_input(const plan::LogicalPlan& logical) {
-    return logical.kind == plan::LogicalKind::Window &&
-           std::any_of(logical.window_expressions.begin(), logical.window_expressions.end(), [](const auto& window) {
-               return window.function == WindowFunction::RowNumber || window.function == WindowFunction::Sum;
-           });
+    if (logical.kind != plan::LogicalKind::Window) {
+        return false;
+    }
+    const auto frame_or_function_is_sensitive =
+        std::any_of(logical.window_expressions.begin(), logical.window_expressions.end(), [](const auto& window) {
+            const auto aggregate = window.function == WindowFunction::Count ||
+                                   window.function == WindowFunction::Sum ||
+                                   window.function == WindowFunction::Min ||
+                                   window.function == WindowFunction::Max;
+            return window.function == WindowFunction::RowNumber ||
+                   (aggregate && window.frame == WindowFrame::RowsCumulative) ||
+                   (window.function == WindowFunction::Sum &&
+                    window.frame == WindowFrame::WholePartition);
+        });
+    return frame_or_function_is_sensitive;
+}
+
+void protect_checked_sum_aggregate_inputs(plan::LogicalPlan& logical) {
+    if (aggregate_has_checked_sum(logical)) {
+        if (logical.input == nullptr) {
+            throw std::logic_error("Aggregate logical plan is missing its input");
+        }
+        // Checked SUM exposes input accumulation order through intermediate
+        // overflow. Pin its complete relational input in every independently
+        // bound query block, including predicate-owned subqueries that may be
+        // spliced into the memo by decorrelation.
+        mark_deterministic_order(*logical.input);
+        return;
+    }
+    if (logical.input != nullptr) {
+        protect_checked_sum_aggregate_inputs(*logical.input);
+    }
+    if (logical.left != nullptr) {
+        protect_checked_sum_aggregate_inputs(*logical.left);
+    }
+    if (logical.right != nullptr) {
+        protect_checked_sum_aggregate_inputs(*logical.right);
+    }
 }
 
 void protect_order_sensitive_window_inputs(plan::LogicalPlan& logical) {
@@ -982,11 +1028,12 @@ void protect_order_sensitive_window_inputs(plan::LogicalPlan& logical) {
         if (logical.input == nullptr) {
             throw std::logic_error("Window logical plan is missing its input");
         }
-        // ROW_NUMBER exposes stable child order whenever OVER keys tie. SUM's
-        // checked intermediate overflow can likewise depend on accumulation
-        // order even when the mathematical total is representable. Without a
-        // uniqueness or order-independent overflow proof, order-changing join
-        // commute/associate rules must fail closed throughout this child.
+        // ROW_NUMBER exposes stable child order whenever OVER keys tie. Every
+        // ROWS aggregate exposes a stable per-row prefix, and whole-partition
+        // SUM's checked intermediate overflow follows input accumulation
+        // order. RANGE publishes only peer-boundary values; its own SUM
+        // evaluator canonicalizes peer arguments before checked updates. A
+        // Without these explicit proofs, order-changing join rules fail closed.
         mark_deterministic_order(*logical.input);
         return;
     }
@@ -998,6 +1045,39 @@ void protect_order_sensitive_window_inputs(plan::LogicalPlan& logical) {
     }
     if (logical.right != nullptr) {
         protect_order_sensitive_window_inputs(*logical.right);
+    }
+}
+
+void assert_deterministic_order_subtree(const plan::LogicalPlan& logical) {
+    if (logical.order_permission != plan::OrderPermission::Deterministic) {
+        throw std::logic_error("order-sensitive logical plan input is not pinned");
+    }
+    if (logical.input != nullptr) {
+        assert_deterministic_order_subtree(*logical.input);
+    }
+    if (logical.left != nullptr) {
+        assert_deterministic_order_subtree(*logical.left);
+    }
+    if (logical.right != nullptr) {
+        assert_deterministic_order_subtree(*logical.right);
+    }
+}
+
+void assert_order_sensitive_inputs_are_pinned(const plan::LogicalPlan& logical) {
+    if (aggregate_has_checked_sum(logical) || window_requires_deterministic_input(logical)) {
+        if (logical.input == nullptr) {
+            throw std::logic_error("order-sensitive logical plan is missing its input");
+        }
+        assert_deterministic_order_subtree(*logical.input);
+    }
+    if (logical.input != nullptr) {
+        assert_order_sensitive_inputs_are_pinned(*logical.input);
+    }
+    if (logical.left != nullptr) {
+        assert_order_sensitive_inputs_are_pinned(*logical.left);
+    }
+    if (logical.right != nullptr) {
+        assert_order_sensitive_inputs_are_pinned(*logical.right);
     }
 }
 
@@ -1136,7 +1216,9 @@ plan::LogicalPlan bind_select_impl(const SelectQuery& query,
         bound = plan::LogicalPlan::distinct(std::move(bound));
     }
     mark_arbitrary_order(bound);
+    protect_checked_sum_aggregate_inputs(bound);
     protect_order_sensitive_window_inputs(bound);
+    assert_order_sensitive_inputs_are_pinned(bound);
     if (!sort_keys.empty()) {
         bound = plan::LogicalPlan::sort(std::move(sort_keys), std::move(bound));
     }

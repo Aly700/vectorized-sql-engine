@@ -977,6 +977,10 @@ void assert_window_round_trips_and_is_a_filter_pushdown_barrier() {
             "FROM t1 JOIN t2 ON t1.a = t2.a"),
         catalog);
     assert(memo.insert(different) != root);
+    auto different_frame = memo.extract(root);
+    assert(different_frame.input != nullptr && different_frame.input->kind == plan::LogicalKind::Window);
+    different_frame.input->window_expressions.front().frame = sql::WindowFrame::RowsCumulative;
+    assert(memo.insert(different_frame) != root);
     const auto explored = optimizer::explore_memo_to_fixpoint(memo, optimizer::default_memo_rules());
     const auto extracted = memo.extract(root);
     assert(plan::to_string(extracted) == plan::to_string(logical));
@@ -1055,6 +1059,78 @@ void assert_order_sensitive_windows_pin_order_changing_join_transforms() {
     assert(!trace_contains(sum_trace.fired_rules, "JoinCommuteRule"));
     assert(sum_memo.extract_alternatives(sum_root).plans.size() == 1);
     sum_memo.assert_invariants();
+
+    const auto rows_logical = sql::bind_select(
+        sql::parse_select(
+            "SELECT t1.b, t2.c, t3.d, "
+            "COUNT(*) OVER (ORDER BY t2.c ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_n "
+            "FROM t1 JOIN t2 ON t1.a = t2.a JOIN t3 ON t2.c = t3.c"),
+        catalog);
+    assert(rows_logical.input != nullptr && rows_logical.input->kind == plan::LogicalKind::Window);
+    assert(rows_logical.input->input != nullptr && rows_logical.input->input->kind == plan::LogicalKind::Join);
+    assert(rows_logical.input->input->order_permission == plan::OrderPermission::Deterministic);
+
+    optimizer::Memo rows_memo;
+    const auto rows_root = rows_memo.insert(rows_logical);
+    const auto rows_trace =
+        optimizer::explore_memo_to_fixpoint(rows_memo, optimizer::default_memo_rules());
+    assert(!trace_contains(rows_trace.fired_rules, "JoinCommuteRule"));
+    assert(!trace_contains(rows_trace.fired_rules, "JoinAssociateRule"));
+    const auto rows_alternatives = rows_memo.extract_alternatives(rows_root);
+    assert(rows_alternatives.plans.size() == 1);
+    const auto rows_oracle = execution::execute_interpreted(rows_alternatives.plans.front(), catalog);
+    const auto rows_vectorized = execution::execute_vectorized(rows_alternatives.plans.front(), catalog);
+    assert(format_batch(rows_oracle) == format_batch(rows_vectorized));
+    rows_memo.assert_invariants();
+
+    const auto range_logical = sql::bind_select(
+        sql::parse_select(
+            "SELECT t1.b, t2.c, t3.d, COUNT(*) OVER (ORDER BY t2.c) AS running_n "
+            "FROM t1 JOIN t2 ON t1.a = t2.a JOIN t3 ON t2.c = t3.c"),
+        catalog);
+    assert(range_logical.input != nullptr && range_logical.input->kind == plan::LogicalKind::Window);
+    assert(range_logical.input->input != nullptr && range_logical.input->input->kind == plan::LogicalKind::Join);
+    assert(range_logical.input->input->order_permission == plan::OrderPermission::Arbitrary);
+
+    optimizer::Memo range_memo;
+    const auto range_root = range_memo.insert(range_logical);
+    const auto range_trace =
+        optimizer::explore_memo_to_fixpoint(range_memo, optimizer::default_memo_rules());
+    assert(trace_contains(range_trace.fired_rules, "JoinCommuteRule"));
+    assert(trace_contains(range_trace.fired_rules, "JoinAssociateRule"));
+    const auto range_alternatives = range_memo.extract_alternatives(range_root);
+    assert(range_alternatives.plans.size() > 1);
+    for (const auto& alternative : range_alternatives.plans) {
+        const auto oracle = execution::execute_interpreted(alternative, catalog);
+        const auto vectorized = execution::execute_vectorized(alternative, catalog);
+        assert(format_batch(oracle) == format_batch(vectorized));
+    }
+    range_memo.assert_invariants();
+
+    const auto grouped_sum = sql::bind_select(
+        sql::parse_select(
+            "SELECT t1.b, SUM(t2.c), SUM(SUM(t2.c)) OVER (ORDER BY t1.b) AS running_sum "
+            "FROM t1 JOIN t2 ON t1.a = t2.a GROUP BY t1.b"),
+        catalog);
+    assert(grouped_sum.input != nullptr && grouped_sum.input->kind == plan::LogicalKind::Window);
+    assert(grouped_sum.input->input != nullptr && grouped_sum.input->input->kind == plan::LogicalKind::Aggregate);
+    assert(grouped_sum.input->input->input != nullptr &&
+           grouped_sum.input->input->input->kind == plan::LogicalKind::Join);
+    assert(grouped_sum.input->input->input->order_permission == plan::OrderPermission::Deterministic);
+
+    optimizer::Memo grouped_sum_memo;
+    const auto grouped_sum_root = grouped_sum_memo.insert(grouped_sum);
+    const auto grouped_sum_trace =
+        optimizer::explore_memo_to_fixpoint(grouped_sum_memo, optimizer::default_memo_rules());
+    assert(!trace_contains(grouped_sum_trace.fired_rules, "JoinCommuteRule"));
+    const auto grouped_sum_alternatives = grouped_sum_memo.extract_alternatives(grouped_sum_root);
+    assert(grouped_sum_alternatives.plans.size() == 1);
+    const auto grouped_sum_oracle =
+        execution::execute_interpreted(grouped_sum_alternatives.plans.front(), catalog);
+    const auto grouped_sum_vectorized =
+        execution::execute_vectorized(grouped_sum_alternatives.plans.front(), catalog);
+    assert(format_batch(grouped_sum_oracle) == format_batch(grouped_sum_vectorized));
+    grouped_sum_memo.assert_invariants();
 }
 
 } // namespace

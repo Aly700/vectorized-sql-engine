@@ -231,6 +231,68 @@ execution::Catalog make_golden_catalog() {
     storage::ColumnarBatch empty;
     empty.add_column("a", storage::Int64Column{});
     catalog.add_table("empty", std::move(empty));
+
+    storage::Int64Column range_order_id;
+    storage::Int64Column range_order_peer;
+    for (auto value : {0, 1, 2}) {
+        range_order_id.append(value);
+        range_order_peer.append(0);
+    }
+    storage::ColumnarBatch range_order;
+    range_order.add_column("id", std::move(range_order_id));
+    range_order.add_column("peer", std::move(range_order_peer));
+    catalog.add_table("range_order", std::move(range_order));
+
+    storage::Int64Column range_values_id;
+    for (auto value : {0, 2, 1}) {
+        range_values_id.append(value);
+    }
+    storage::Int64Column range_values_v;
+    range_values_v.append(std::numeric_limits<std::int64_t>::max());
+    range_values_v.append(-1);
+    range_values_v.append(1);
+    storage::ColumnarBatch range_values;
+    range_values.add_column("id", std::move(range_values_id));
+    range_values.add_column("v", std::move(range_values_v));
+    catalog.add_table("range_values", std::move(range_values));
+
+    storage::Int64Column range_overflow_k;
+    range_overflow_k.append(0);
+    range_overflow_k.append(1);
+    storage::Int64Column range_overflow_v;
+    range_overflow_v.append(std::numeric_limits<std::int64_t>::max());
+    range_overflow_v.append(1);
+    storage::ColumnarBatch range_overflow;
+    range_overflow.add_column("k", std::move(range_overflow_k));
+    range_overflow.add_column("v", std::move(range_overflow_v));
+    catalog.add_table("range_overflow", std::move(range_overflow));
+
+    storage::Int64Column checked_sum_outer_k;
+    checked_sum_outer_k.append(0);
+    storage::ColumnarBatch checked_sum_outer;
+    checked_sum_outer.add_column("k", std::move(checked_sum_outer_k));
+    catalog.add_table("checked_sum_outer", std::move(checked_sum_outer));
+
+    storage::Int64Column checked_sum_left_id;
+    storage::Int64Column checked_sum_left_v;
+    checked_sum_left_id.append(0);
+    checked_sum_left_v.append(std::numeric_limits<std::int64_t>::max());
+    checked_sum_left_id.append(1);
+    checked_sum_left_v.append(-1);
+    checked_sum_left_id.append(2);
+    checked_sum_left_v.append(1);
+    storage::ColumnarBatch checked_sum_left;
+    checked_sum_left.add_column("id", std::move(checked_sum_left_id));
+    checked_sum_left.add_column("v", std::move(checked_sum_left_v));
+    catalog.add_table("checked_sum_left", std::move(checked_sum_left));
+
+    storage::Int64Column checked_sum_right_id;
+    for (auto value : {0, 2, 1}) {
+        checked_sum_right_id.append(value);
+    }
+    storage::ColumnarBatch checked_sum_right;
+    checked_sum_right.add_column("id", std::move(checked_sum_right_id));
+    catalog.add_table("checked_sum_right", std::move(checked_sum_right));
     return catalog;
 }
 
@@ -1271,6 +1333,102 @@ void assert_window_paths_and_vectorized_execution() {
     assert_path(memo.extract_best(root, catalog));
 }
 
+void assert_running_window_paths_and_error_equivalence() {
+    const auto catalog = make_golden_catalog();
+    const std::string context = "phase23 deterministic running-frame catalog";
+
+    differential::ComparisonStats range_stats;
+    const auto range_sql =
+        "SELECT o.id, v.v, SUM(v.v) OVER (ORDER BY o.peer) AS running_sum "
+        "FROM range_order AS o JOIN range_values AS v ON o.id = v.id";
+    assert(differential::compare_engines(range_sql, catalog, context, &range_stats));
+    assert(range_stats.alternative_count > 1);
+    assert(range_stats.join_commute_firings > 0);
+    assert(range_stats.accepted_error_path_count == 0);
+
+    differential::ComparisonStats rows_overflow_stats;
+    const auto rows_overflow_sql =
+        "SELECT o.id, v.v, "
+        "SUM(v.v) OVER (ORDER BY o.peer ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_sum "
+        "FROM range_order AS o JOIN range_values AS v ON o.id = v.id";
+    assert(differential::compare_engines(
+        rows_overflow_sql, catalog, context, &rows_overflow_stats));
+    assert(rows_overflow_stats.join_commute_firings == 0);
+    assert(rows_overflow_stats.execution_path_count > 0);
+    assert(rows_overflow_stats.accepted_error_path_count ==
+           rows_overflow_stats.execution_path_count);
+
+    differential::ComparisonStats range_overflow_stats;
+    const auto range_overflow_sql =
+        "SELECT SUM(v) OVER (ORDER BY k) AS running_sum FROM range_overflow";
+    assert(differential::compare_engines(
+        range_overflow_sql, catalog, context, &range_overflow_stats));
+    assert(range_overflow_stats.execution_path_count > 0);
+    assert(range_overflow_stats.accepted_error_path_count ==
+           range_overflow_stats.execution_path_count);
+
+    assert(differential::compare_engines(
+        "SELECT a, "
+        "SUM(a) OVER (ORDER BY b ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_sum "
+        "FROM t WHERE a <> 2",
+        catalog,
+        context));
+}
+
+void assert_plain_checked_sum_pins_join_order() {
+    const auto catalog = make_golden_catalog();
+    const std::string context =
+        "checked_sum_left(id,v)=[(0,INT64_MAX),(1,-1),(2,1)]; "
+        "checked_sum_right(id)=[(0),(2),(1)]";
+    differential::ComparisonStats stats;
+    const auto sql_text =
+        "SELECT SUM(a.v) AS total "
+        "FROM checked_sum_left AS a "
+        "JOIN checked_sum_right AS b ON a.id = b.id";
+
+    assert(differential::compare_engines(sql_text, catalog, context, &stats));
+    assert(stats.execution_path_count > 0);
+    assert(stats.join_commute_firings == 0);
+    assert(stats.accepted_error_path_count == 0);
+}
+
+void assert_opaque_checked_sum_subquery_pins_after_decorrelation() {
+    const auto catalog = make_golden_catalog();
+    const std::string context =
+        "checked_sum_outer(k)=[(0)]; "
+        "checked_sum_left(id,v)=[(0,INT64_MAX),(1,-1),(2,1)]; "
+        "checked_sum_right(id)=[(0),(2),(1)]";
+    differential::ComparisonStats stats;
+    const auto sql_text =
+        "SELECT o.k, COUNT(*) OVER (ORDER BY o.k) AS running_n "
+        "FROM checked_sum_outer AS o "
+        "WHERE EXISTS ("
+        "SELECT SUM(a.v) FROM checked_sum_left AS a "
+        "JOIN checked_sum_right AS b ON a.id = b.id)";
+
+    assert(differential::compare_engines(sql_text, catalog, context, &stats));
+    assert(stats.execution_path_count > 0);
+    assert(stats.alternative_count > 1);
+    assert(stats.exists_to_semi_firings > 0);
+    assert(stats.join_commute_firings == 0);
+    assert(stats.accepted_error_path_count == 0);
+}
+
+void assert_order_insensitive_aggregate_keeps_join_alternatives() {
+    const auto catalog = make_golden_catalog();
+    const std::string context = "checked SUM pin negative control";
+    differential::ComparisonStats stats;
+    const auto sql_text =
+        "SELECT COUNT(*) AS n "
+        "FROM checked_sum_left AS a "
+        "JOIN checked_sum_right AS b ON a.id = b.id";
+
+    assert(differential::compare_engines(sql_text, catalog, context, &stats));
+    assert(stats.alternative_count > 1);
+    assert(stats.join_commute_firings > 0);
+    assert(stats.accepted_error_path_count == 0);
+}
+
 } // namespace
 
 int main() {
@@ -1282,6 +1440,10 @@ int main() {
     assert_residual_correlated_subquery_is_rejected_at_physical_lowering();
     assert_correlated_scalar_error_is_equivalent_on_every_oracle_path();
     assert_window_paths_and_vectorized_execution();
+    assert_running_window_paths_and_error_equivalence();
+    assert_opaque_checked_sum_subquery_pins_after_decorrelation();
+    assert_plain_checked_sum_pins_join_order();
+    assert_order_insensitive_aggregate_keeps_join_alternatives();
 
     bool ok = true;
     ok = run_result_golden_queries() && ok;

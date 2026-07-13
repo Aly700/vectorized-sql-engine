@@ -758,28 +758,74 @@ void assert_grouped_windows_consume_post_having_rows() {
     }
 }
 
-void assert_window_parse_errors_are_positioned_and_named() {
-    const std::string running = "SELECT SUM(a) OVER (ORDER BY b) FROM t";
-    try {
-        (void)sql::parse_select(running);
-    } catch (const sql::ParseError& error) {
-        assert(error.position() == running.find("ORDER"));
-        assert(error.message() == "aggregate window ORDER BY is unsupported (running frames)");
-        goto frame;
-    }
-    throw std::logic_error("expected aggregate running-window parse error");
+void assert_running_window_frames_parse_and_bind() {
+    auto catalog = make_schema_catalog();
 
-frame:
-    const std::string framed =
-        "SELECT RANK() OVER (ORDER BY a ROWS BETWEEN 1 AND 2) FROM t";
+    const auto default_range = sql::bind_select(
+        sql::parse_select("SELECT SUM(a) OVER (PARTITION BY b ORDER BY a) AS running FROM t"),
+        catalog);
+    assert(default_range.input != nullptr && default_range.input->kind == plan::LogicalKind::Window);
+    assert(default_range.input->window_expressions.size() == 1);
+    assert(default_range.input->window_expressions.front().frame == sql::WindowFrame::RangeCumulative);
+    assert(default_range.input->input != nullptr);
+    assert(default_range.input->input->order_permission == plan::OrderPermission::Arbitrary);
+    assert(default_range.input->window_expressions.front().output_name ==
+           "SUM(a) OVER (PARTITION BY b ORDER BY a ASC)");
+
+    const auto explicit_range = sql::bind_select(
+        sql::parse_select(
+            "SELECT SUM(a) OVER (ORDER BY b RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running "
+            "FROM t"),
+        catalog);
+    assert(explicit_range.input != nullptr && explicit_range.input->kind == plan::LogicalKind::Window);
+    assert(explicit_range.input->window_expressions.front().frame == sql::WindowFrame::RangeCumulative);
+    assert(explicit_range.input->window_expressions.front().output_name ==
+           "SUM(a) OVER (ORDER BY b ASC RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)");
+
+    const auto explicit_rows = sql::bind_select(
+        sql::parse_select(
+            "SELECT COUNT(*) OVER (ORDER BY b ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running "
+            "FROM t"),
+        catalog);
+    assert(explicit_rows.input != nullptr && explicit_rows.input->kind == plan::LogicalKind::Window);
+    assert(explicit_rows.input->window_expressions.front().frame == sql::WindowFrame::RowsCumulative);
+    assert(explicit_rows.input->input != nullptr);
+    assert(explicit_rows.input->input->order_permission == plan::OrderPermission::Deterministic);
+    assert(explicit_rows.input->window_expressions.front().output_name ==
+           "COUNT(*) OVER (ORDER BY b ASC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)");
+
+    const auto whole_partition = sql::bind_select(
+        sql::parse_select("SELECT SUM(a) OVER (PARTITION BY b) AS total FROM t"), catalog);
+    assert(whole_partition.input != nullptr && whole_partition.input->kind == plan::LogicalKind::Window);
+    assert(whole_partition.input->window_expressions.front().frame == sql::WindowFrame::WholePartition);
+    assert(whole_partition.input->input != nullptr);
+    assert(whole_partition.input->input->order_permission == plan::OrderPermission::Deterministic);
+    assert(whole_partition.input->window_expressions.front().output_name == "SUM(a) OVER (PARTITION BY b)");
+}
+
+void assert_window_parse_errors_are_positioned_and_named() {
+    const std::string bounded =
+        "SELECT SUM(a) OVER (ORDER BY b ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t";
     try {
-        (void)sql::parse_select(framed);
+        (void)sql::parse_select(bounded);
     } catch (const sql::ParseError& error) {
-        assert(error.position() == framed.find("ROWS"));
-        assert(error.message() == "window frames are unsupported");
+        assert(error.position() == bounded.find("1 PRECEDING"));
+        assert(error.message() == "unsupported frame");
+        goto following;
+    }
+    throw std::logic_error("expected bounded window-frame parse error");
+
+following:
+    const std::string following =
+        "SELECT MAX(a) OVER (ORDER BY b RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM t";
+    try {
+        (void)sql::parse_select(following);
+    } catch (const sql::ParseError& error) {
+        assert(error.position() == following.rfind("UNBOUNDED"));
+        assert(error.message() == "unsupported frame");
         goto nested;
     }
-    throw std::logic_error("expected window-frame parse error");
+    throw std::logic_error("expected FOLLOWING window-frame parse error");
 
 nested:
     const std::string nested = "SELECT SUM(ROW_NUMBER() OVER ()) FROM t";
@@ -866,7 +912,8 @@ void assert_window_binding_enforces_grouped_scope_types_and_names() {
     throw std::logic_error("expected grouped window input bind error");
 
 type:
-    const std::string string_sum = "SELECT SUM(s) OVER () FROM strings";
+    const std::string string_sum =
+        "SELECT SUM(s) OVER (ORDER BY s ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM strings";
     try {
         (void)sql::bind_select(sql::parse_select(string_sum), catalog);
     } catch (const sql::BindError& error) {
@@ -937,6 +984,7 @@ int main() {
     assert_subquery_parse_errors_are_positioned();
     assert_window_functions_bind_between_having_and_project();
     assert_grouped_windows_consume_post_having_rows();
+    assert_running_window_frames_parse_and_bind();
     assert_window_parse_errors_are_positioned_and_named();
     assert_window_misplacement_errors_are_positioned();
     assert_aggregate_window_in_group_by_has_window_misplacement_error();

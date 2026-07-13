@@ -76,6 +76,13 @@ struct WindowInput {
     bool contains_null{false};
 };
 
+enum class GeneratedAggregateWindowFrame {
+    WholePartition,
+    DefaultRange,
+    ExplicitRange,
+    ExplicitRows,
+};
+
 struct GeneratedCase {
     execution::Catalog catalog;
     std::string sql;
@@ -114,6 +121,10 @@ struct GeneratedCase {
     std::size_t unpartitioned_window_count{0};
     std::size_t ordered_rank_window_count{0};
     std::size_t unordered_rank_window_count{0};
+    std::size_t whole_partition_aggregate_window_count{0};
+    std::size_t default_range_window_count{0};
+    std::size_t explicit_range_window_count{0};
+    std::size_t explicit_rows_window_count{0};
     bool has_window{false};
     bool has_null_window_key{false};
     bool has_string_window_key{false};
@@ -145,6 +156,21 @@ std::string comparison_op_text(sql::ComparisonOp op) {
         return ">=";
     }
     throw std::logic_error("unreachable comparison operator");
+}
+
+bool is_aggregate_window_function(sql::WindowFunction function) {
+    switch (function) {
+    case sql::WindowFunction::RowNumber:
+    case sql::WindowFunction::Rank:
+    case sql::WindowFunction::DenseRank:
+        return false;
+    case sql::WindowFunction::Count:
+    case sql::WindowFunction::Sum:
+    case sql::WindowFunction::Min:
+    case sql::WindowFunction::Max:
+        return true;
+    }
+    throw std::logic_error("unreachable window function");
 }
 
 storage::ColumnarBatch make_batch(const GeneratedTable& table) {
@@ -241,6 +267,8 @@ public:
         reset_window_coverage();
         const auto window_mode = static_cast<std::size_t>((seed_ - 1) % 8);
         const auto window_query = static_cast<std::size_t>((seed_ - 1) % 16) < 8;
+        const auto aggregate_window_frame =
+            static_cast<GeneratedAggregateWindowFrame>(static_cast<std::size_t>((seed_ - 1) / 16) % 4);
         const auto force_window_join = window_query && (window_mode == 0 || window_mode == 7);
         const auto force_grouped_window = window_query && (window_mode == 4 || window_mode == 7);
         auto tables = generate_tables();
@@ -268,8 +296,13 @@ public:
             select_items = scalar_select_items(all_columns);
         }
         if (window_query) {
-            auto window_items = window_select_items(
-                window_mode, aggregate_query, group_keys, aggregate_exprs, all_columns, &window_aliases);
+            auto window_items = window_select_items(window_mode,
+                                                    aggregate_window_frame,
+                                                    aggregate_query,
+                                                    group_keys,
+                                                    aggregate_exprs,
+                                                    all_columns,
+                                                    &window_aliases);
             select_items.insert(select_items.end(),
                                 std::make_move_iterator(window_items.begin()),
                                 std::make_move_iterator(window_items.end()));
@@ -373,6 +406,10 @@ public:
                              unpartitioned_window_count_,
                              ordered_rank_window_count_,
                              unordered_rank_window_count_,
+                             whole_partition_aggregate_window_count_,
+                             default_range_window_count_,
+                             explicit_range_window_count_,
+                             explicit_rows_window_count_,
                              window_definition_count_ != 0,
                              has_null_window_key_,
                              has_string_window_key_,
@@ -507,6 +544,7 @@ private:
     }
 
     std::vector<SelectItem> window_select_items(std::size_t mode,
+                                                GeneratedAggregateWindowFrame aggregate_frame,
                                                 bool aggregate_query,
                                                 const std::vector<ColumnRef>& group_keys,
                                                 const std::vector<AggregateExpr>& aggregate_exprs,
@@ -515,7 +553,7 @@ private:
         const auto inputs = window_inputs(aggregate_query, group_keys, aggregate_exprs, all_columns);
         std::vector<SelectItem> items;
         const auto add = [&](sql::WindowFunction function) {
-            const auto item = make_window_select_item(function, mode, inputs, all_columns);
+            const auto item = make_window_select_item(function, mode, aggregate_frame, inputs, all_columns);
             aliases->push_back(item.alias);
             items.push_back(item);
         };
@@ -584,6 +622,7 @@ private:
 
     SelectItem make_window_select_item(sql::WindowFunction function,
                                        std::size_t mode,
+                                       GeneratedAggregateWindowFrame aggregate_frame,
                                        const std::vector<WindowInput>& inputs,
                                        const std::vector<ColumnRef>& all_columns) {
         std::optional<WindowInput> argument;
@@ -630,6 +669,9 @@ private:
             if (force_order || chance(55)) {
                 order_keys.push_back(pick_window_input(inputs, std::nullopt, mode == 1, mode == 0));
             }
+        } else if (aggregate_frame != GeneratedAggregateWindowFrame::WholePartition) {
+            order_keys.push_back(
+                pick_window_input(inputs, std::nullopt, mode == 5 || mode == 6, mode == 3 || mode == 4));
         }
 
         for (const auto& key : partition_keys) {
@@ -672,7 +714,25 @@ private:
             break;
         }
 
-        const auto expression = window_expression_sql(function, count_star, argument, partition_keys, order_keys);
+        if (is_aggregate_window_function(function)) {
+            switch (aggregate_frame) {
+            case GeneratedAggregateWindowFrame::WholePartition:
+                ++whole_partition_aggregate_window_count_;
+                break;
+            case GeneratedAggregateWindowFrame::DefaultRange:
+                ++default_range_window_count_;
+                break;
+            case GeneratedAggregateWindowFrame::ExplicitRange:
+                ++explicit_range_window_count_;
+                break;
+            case GeneratedAggregateWindowFrame::ExplicitRows:
+                ++explicit_rows_window_count_;
+                break;
+            }
+        }
+
+        const auto expression =
+            window_expression_sql(function, count_star, argument, partition_keys, order_keys, aggregate_frame);
         return SelectItem{expression, next_alias(all_columns), std::nullopt, output_type, nullable};
     }
 
@@ -716,7 +776,8 @@ private:
                                       bool count_star,
                                       const std::optional<WindowInput>& argument,
                                       const std::vector<WindowInput>& partition_keys,
-                                      const std::vector<WindowInput>& order_keys) {
+                                      const std::vector<WindowInput>& order_keys,
+                                      GeneratedAggregateWindowFrame aggregate_frame) {
         std::ostringstream out;
         switch (function) {
         case sql::WindowFunction::RowNumber:
@@ -763,6 +824,26 @@ private:
                     out << ", ";
                 }
                 out << order_keys[i].expression << (chance(50) ? " ASC" : " DESC");
+            }
+            wrote_clause = true;
+        }
+        if (is_aggregate_window_function(function)) {
+            switch (aggregate_frame) {
+            case GeneratedAggregateWindowFrame::WholePartition:
+            case GeneratedAggregateWindowFrame::DefaultRange:
+                break;
+            case GeneratedAggregateWindowFrame::ExplicitRange:
+                if (wrote_clause) {
+                    out << " ";
+                }
+                out << "RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW";
+                break;
+            case GeneratedAggregateWindowFrame::ExplicitRows:
+                if (wrote_clause) {
+                    out << " ";
+                }
+                out << "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW";
+                break;
             }
         }
         out << ")";
@@ -967,6 +1048,10 @@ private:
         unpartitioned_window_count_ = 0;
         ordered_rank_window_count_ = 0;
         unordered_rank_window_count_ = 0;
+        whole_partition_aggregate_window_count_ = 0;
+        default_range_window_count_ = 0;
+        explicit_range_window_count_ = 0;
+        explicit_rows_window_count_ = 0;
         has_null_window_key_ = false;
         has_string_window_key_ = false;
         has_string_window_argument_ = false;
@@ -1394,6 +1479,10 @@ private:
     std::size_t unpartitioned_window_count_{0};
     std::size_t ordered_rank_window_count_{0};
     std::size_t unordered_rank_window_count_{0};
+    std::size_t whole_partition_aggregate_window_count_{0};
+    std::size_t default_range_window_count_{0};
+    std::size_t explicit_range_window_count_{0};
+    std::size_t explicit_rows_window_count_{0};
     bool has_null_window_key_{false};
     bool has_string_window_key_{false};
     bool has_string_window_argument_{false};
@@ -1633,6 +1722,10 @@ int main(int argc, char** argv) {
     std::size_t unpartitioned_windows = 0;
     std::size_t ordered_rank_windows = 0;
     std::size_t unordered_rank_windows = 0;
+    std::size_t whole_partition_aggregate_windows = 0;
+    std::size_t default_range_windows = 0;
+    std::size_t explicit_range_windows = 0;
+    std::size_t explicit_rows_windows = 0;
     std::size_t null_window_key_queries = 0;
     std::size_t string_window_key_queries = 0;
     std::size_t string_window_argument_queries = 0;
@@ -1702,6 +1795,10 @@ int main(int argc, char** argv) {
         unpartitioned_windows += generated.unpartitioned_window_count;
         ordered_rank_windows += generated.ordered_rank_window_count;
         unordered_rank_windows += generated.unordered_rank_window_count;
+        whole_partition_aggregate_windows += generated.whole_partition_aggregate_window_count;
+        default_range_windows += generated.default_range_window_count;
+        explicit_range_windows += generated.explicit_range_window_count;
+        explicit_rows_windows += generated.explicit_rows_window_count;
         null_window_key_queries += generated.has_null_window_key ? 1 : 0;
         string_window_key_queries += generated.has_string_window_key ? 1 : 0;
         string_window_argument_queries += generated.has_string_window_argument ? 1 : 0;
@@ -1752,6 +1849,8 @@ int main(int argc, char** argv) {
          row_number_windows == 0 || rank_windows == 0 || dense_rank_windows == 0 || count_windows == 0 ||
          sum_windows == 0 || min_windows == 0 || max_windows == 0 || partitioned_windows == 0 ||
          unpartitioned_windows == 0 || ordered_rank_windows == 0 || unordered_rank_windows == 0 ||
+         whole_partition_aggregate_windows == 0 || default_range_windows == 0 || explicit_range_windows == 0 ||
+         explicit_rows_windows == 0 ||
          null_window_key_queries == 0 || string_window_key_queries == 0 ||
          string_window_argument_queries == 0 || joined_window_queries == 0 || grouped_window_queries == 0 ||
          having_window_queries == 0 || multi_window_queries == 0 || window_outer_order_queries == 0 ||
@@ -1795,6 +1894,10 @@ int main(int argc, char** argv) {
                   << " unpartitioned_windows=" << unpartitioned_windows
                   << " ordered_rank_windows=" << ordered_rank_windows
                   << " unordered_rank_windows=" << unordered_rank_windows
+                  << " whole_partition_aggregate_windows=" << whole_partition_aggregate_windows
+                  << " default_range_windows=" << default_range_windows
+                  << " explicit_range_windows=" << explicit_range_windows
+                  << " explicit_rows_windows=" << explicit_rows_windows
                   << " null_window_key_queries=" << null_window_key_queries
                   << " string_window_key_queries=" << string_window_key_queries
                   << " string_window_argument_queries=" << string_window_argument_queries
@@ -1845,6 +1948,10 @@ int main(int argc, char** argv) {
               << " unpartitioned_windows=" << unpartitioned_windows
               << " ordered_rank_windows=" << ordered_rank_windows
               << " unordered_rank_windows=" << unordered_rank_windows
+              << " whole_partition_aggregate_windows=" << whole_partition_aggregate_windows
+              << " default_range_windows=" << default_range_windows
+              << " explicit_range_windows=" << explicit_range_windows
+              << " explicit_rows_windows=" << explicit_rows_windows
               << " null_window_key_queries=" << null_window_key_queries
               << " string_window_key_queries=" << string_window_key_queries
               << " string_window_argument_queries=" << string_window_argument_queries

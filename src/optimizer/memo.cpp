@@ -136,6 +136,7 @@ void hash_sort_key(std::size_t& seed, const plan::SortKey& key) {
 void hash_window_expression(std::size_t& seed, const plan::WindowExpression& window) {
     hash_string(seed, window.output_name);
     hash_combine(seed, static_cast<std::size_t>(window.function));
+    hash_combine(seed, static_cast<std::size_t>(window.frame));
     hash_combine(seed, window.count_star ? 1 : 0);
     hash_combine(seed, static_cast<std::size_t>(window.type));
     hash_combine(seed, window.argument.has_value() ? 1 : 0);
@@ -339,7 +340,7 @@ bool sort_key_equal(const plan::SortKey& left, const plan::SortKey& right) {
 
 bool window_expression_equal(const plan::WindowExpression& left, const plan::WindowExpression& right) {
     if (left.output_name != right.output_name || left.function != right.function ||
-        left.count_star != right.count_star || left.type != right.type ||
+        left.frame != right.frame || left.count_star != right.count_star || left.type != right.type ||
         left.argument.has_value() != right.argument.has_value()) {
         return false;
     }
@@ -1078,7 +1079,7 @@ RelationEstimate window_estimate(const std::vector<plan::WindowExpression>& wind
     estimate.rows = child.rows;
     estimate.cost = child.cost;
     // Each definition is evaluated independently over the same input and pays
-    // one linear partition/emit pass. Ordered ranking definitions additionally
+    // one linear partition/emit pass. Ordered definitions additionally
     // pay n*log2(n) over the whole input: a deterministic conservative upper
     // bound for the sum of per-partition stable sorts.
     const auto linear_pass = safe_multiply(child.rows, static_cast<double>(window_expressions.size()));

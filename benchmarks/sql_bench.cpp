@@ -366,6 +366,11 @@ std::vector<Workload> make_workloads(const execution::Catalog& catalog) {
         "ROW_NUMBER() OVER (PARTITION BY bucket ORDER BY sort_key) AS rn, "
         "SUM(value) OVER (PARTITION BY bucket) AS bucket_sum "
         "FROM fact");
+    add("window_running_sum",
+        "fact=200000,partitions=100",
+        "SELECT bucket, sort_key, value, "
+        "SUM(value) OVER (PARTITION BY bucket ORDER BY sort_key) AS running_sum "
+        "FROM fact");
     add("sort",
         "fact=200000",
         "SELECT a, value FROM fact ORDER BY sort_key, a LIMIT 1000");
