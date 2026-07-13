@@ -248,3 +248,15 @@ phase.
 | workload | rows | correctness | interpreted min ms | interpreted median ms | vectorized min ms | vectorized median ms | median speedup |
 |---|---:|---|---:|---:|---:|---:|---:|
 | window_row_number_sum | fact=200000,partitions=100 | match rows=200000 checksum=0x1f5b8dc9ce10a38c | 725.385 | 732.916 | 108.253 | 109.029 | 6.722x |
+
+## Phase 23 Running Window Frame (2026-07-13)
+
+Same optimized build, five-repetition min/median, deterministic-data, and
+checksum-before-timing methodology as above. This workload measures the
+default cumulative `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` frame
+for `SUM(value) OVER (PARTITION BY bucket ORDER BY sort_key)` across the
+200,000-row `fact` table and its 100 partitions.
+
+| workload | rows | correctness | interpreted min ms | interpreted median ms | vectorized min ms | vectorized median ms | median speedup |
+|---|---:|---|---:|---:|---:|---:|---:|
+| window_running_sum | fact=200000,partitions=100 | match rows=200000 checksum=0xefdfa729da68f560 | 704.578 | 711.366 | 102.685 | 105.883 | 6.718x |

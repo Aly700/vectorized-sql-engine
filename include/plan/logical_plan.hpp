@@ -156,6 +156,7 @@ struct WindowExpression {
     std::optional<BoundColumnRef> argument;
     std::vector<BoundColumnRef> partition_keys;
     std::vector<SortKey> order_keys;
+    sql::WindowFrame frame{sql::WindowFrame::WholePartition};
     std::size_t position{0};
     catalog::ColumnType type{catalog::ColumnType::Int64};
 };

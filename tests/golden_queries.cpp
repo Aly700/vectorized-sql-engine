@@ -213,6 +213,19 @@ execution::Catalog make_catalog() {
     overflow.add_column("v", std::move(overflow_value));
     catalog.add_table("overflow", std::move(overflow));
 
+    storage::Int64Column range_cancel_key;
+    for (auto value : {0, 1, 1}) {
+        range_cancel_key.append(value);
+    }
+    storage::Int64Column range_cancel_value;
+    range_cancel_value.append(std::numeric_limits<std::int64_t>::max());
+    range_cancel_value.append(1);
+    range_cancel_value.append(-1);
+    storage::ColumnarBatch range_cancel;
+    range_cancel.add_column("k", std::move(range_cancel_key));
+    range_cancel.add_column("v", std::move(range_cancel_value));
+    catalog.add_table("range_cancel", std::move(range_cancel));
+
     storage::StringColumn strings_s;
     strings_s.append("beta");
     strings_s.append("");
@@ -453,7 +466,7 @@ std::string run_vectorized_query(const GoldenQuery& test, const execution::Catal
     }
 }
 
-bool run_case(const GoldenQuery& test, const execution::Catalog& catalog) {
+bool run_oracle_case(const GoldenQuery& test, const execution::Catalog& catalog) {
     const auto actual = run_query(test, catalog);
     const auto expected = test.expects_error ? format_error(test.error) : format_result(test.result);
     if (actual != expected) {
@@ -463,6 +476,14 @@ bool run_case(const GoldenQuery& test, const execution::Catalog& catalog) {
                   << "actual:   " << actual << "\n";
         return false;
     }
+    return true;
+}
+
+bool run_case(const GoldenQuery& test, const execution::Catalog& catalog) {
+    if (!run_oracle_case(test, catalog)) {
+        return false;
+    }
+    const auto expected = test.expects_error ? format_error(test.error) : format_result(test.result);
 
     try {
         auto parsed = sql::parse_select(test.sql);
@@ -588,18 +609,11 @@ int main() {
             ExpectedError{ErrorKind::Runtime, 0, "SUM(v) OVER () overflowed int64"},
         },
         GoldenQuery{
-            "aggregate window ORDER BY rejects running-frame semantics",
-            "SELECT SUM(a) OVER (ORDER BY b) FROM t",
+            "bounded window frame is unsupported at the offending bound",
+            "SELECT SUM(a) OVER (ORDER BY b ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t",
             ExpectedResult{},
             true,
-            ExpectedError{ErrorKind::Parse, 20, "aggregate window ORDER BY is unsupported (running frames)"},
-        },
-        GoldenQuery{
-            "explicit window frame is unsupported at the frame token",
-            "SELECT RANK() OVER (ORDER BY a ROWS BETWEEN 1 AND 2) FROM t",
-            ExpectedResult{},
-            true,
-            ExpectedError{ErrorKind::Parse, 31, "window frames are unsupported"},
+            ExpectedError{ErrorKind::Parse, 44, "unsupported frame"},
         },
         GoldenQuery{
             "window function in WHERE has positioned SELECT-item-only error",
@@ -1856,8 +1870,101 @@ int main() {
         },
     };
 
+    const std::vector<GoldenQuery> running_frame_oracle_tests{
+        GoldenQuery{
+            "default RANGE and explicit RANGE share peer-boundary values",
+            "SELECT a, b, SUM(a) OVER (ORDER BY b) AS default_s, "
+            "SUM(a) OVER (ORDER BY b RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS explicit_s FROM t",
+            ExpectedResult{{"a", "b", "default_s", "explicit_s"},
+                           {{1, 10, 1, 1}, {2, 20, 6, 6}, {3, 20, 6, 6}, {4, 40, 10, 10}}},
+        },
+        GoldenQuery{
+            "RANGE peers compare every ORDER BY key and direction",
+            "SELECT a, b, SUM(a) OVER (ORDER BY b, a DESC) AS s FROM t",
+            ExpectedResult{{"a", "b", "s"}, {{1, 10, 1}, {2, 20, 6}, {3, 20, 4}, {4, 40, 10}}},
+        },
+        GoldenQuery{
+            "ROWS cumulative SUM uses input order inside peers",
+            "SELECT a, b, SUM(a) OVER (ORDER BY b ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS s FROM t",
+            ExpectedResult{{"a", "b", "s"}, {{1, 10, 1}, {2, 20, 3}, {3, 20, 6}, {4, 40, 10}}},
+        },
+        GoldenQuery{
+            "explicit frames without ORDER BY use input ROWS and one RANGE peer",
+            "SELECT a, "
+            "SUM(a) OVER (ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS rows_s, "
+            "SUM(a) OVER (RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS range_s FROM t",
+            ExpectedResult{{"a", "rows_s", "range_s"},
+                           {{1, 1, 10}, {2, 3, 10}, {3, 6, 10}, {4, 10, 10}}},
+        },
+        GoldenQuery{
+            "ranking functions accept supported frames without changing peer ranks",
+            "SELECT a, b, "
+            "RANK() OVER (ORDER BY b ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS r, "
+            "DENSE_RANK() OVER (ORDER BY b RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS d FROM t",
+            ExpectedResult{{"a", "b", "r", "d"},
+                           {{1, 10, 1, 1}, {2, 20, 2, 2}, {3, 20, 2, 2}, {4, 40, 4, 3}}},
+        },
+        GoldenQuery{
+            "ROWS NULL prefixes preserve COUNT and typed MIN MAX semantics",
+            "SELECT g, h, x, "
+            "COUNT(*) OVER (PARTITION BY g ORDER BY h ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS all_n, "
+            "COUNT(x) OVER (PARTITION BY g ORDER BY h ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS n, "
+            "MIN(x) OVER (PARTITION BY g ORDER BY h ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS lo, "
+            "MAX(x) OVER (PARTITION BY g ORDER BY h ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS hi "
+            "FROM agg_null",
+            ExpectedResult{{"g", "h", "x", "all_n", "n", "lo", "hi"},
+                           {{std::nullopt, 1, std::nullopt, 1, 0, std::nullopt, std::nullopt},
+                            {std::nullopt, 1, 10, 2, 1, 10, 10},
+                            {1, 1, std::nullopt, 1, 0, std::nullopt, std::nullopt},
+                            {1, 2, 5, 2, 1, 5, 5},
+                            {2, 1, std::nullopt, 1, 0, std::nullopt, std::nullopt},
+                            {2, 1, std::nullopt, 2, 0, std::nullopt, std::nullopt},
+                            {std::nullopt, 2, 20, 3, 2, 10, 20}}},
+        },
+        GoldenQuery{
+            "ROWS string MIN MAX use byte order and retain a leading NULL prefix",
+            "SELECT s, "
+            "MIN(s) OVER (ORDER BY s DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS lo, "
+            "MAX(s) OVER (ORDER BY s DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS hi FROM strings",
+            ExpectedResult{{"s", "lo", "hi"},
+                           {{"beta", "beta", "beta"},
+                            {"", "", "beta"},
+                            {std::nullopt, std::nullopt, std::nullopt},
+                            {"alpha", "alpha", "beta"},
+                            {"a'b", "a'b", "beta"}}},
+        },
+        GoldenQuery{
+            "RANGE SUM canonicalizes peer arguments before checked updates",
+            "SELECT k, v, SUM(v) OVER (ORDER BY k) AS s FROM range_cancel",
+            ExpectedResult{{"k", "v", "s"},
+                           {{0, std::numeric_limits<std::int64_t>::max(), std::numeric_limits<std::int64_t>::max()},
+                            {1, 1, std::numeric_limits<std::int64_t>::max()},
+                            {1, -1, std::numeric_limits<std::int64_t>::max()}}},
+        },
+        GoldenQuery{
+            "ROWS SUM overflow follows stable peer input order",
+            "SELECT SUM(v) OVER (ORDER BY k ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM range_cancel",
+            ExpectedResult{},
+            true,
+            ExpectedError{ErrorKind::Runtime,
+                          0,
+                          "SUM(v) OVER (ORDER BY k ASC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) "
+                          "overflowed int64"},
+        },
+        GoldenQuery{
+            "default RANGE SUM overflow fails at a peer boundary prefix",
+            "SELECT SUM(v) OVER (ORDER BY v) FROM overflow",
+            ExpectedResult{},
+            true,
+            ExpectedError{ErrorKind::Runtime, 0, "SUM(v) OVER (ORDER BY v ASC) overflowed int64"},
+        },
+    };
+
     bool ok = true;
     for (const auto& test : tests) {
+        ok = run_case(test, catalog) && ok;
+    }
+    for (const auto& test : running_frame_oracle_tests) {
         ok = run_case(test, catalog) && ok;
     }
     return ok ? 0 : 1;

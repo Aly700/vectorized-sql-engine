@@ -580,6 +580,8 @@ plan::BoundColumnRef ensure_window_expression(const WindowCall& window,
 
     const auto name = output_name(window);
     const auto type = bind_window_output_type(window, argument);
+    const auto frame = window.explicit_frame.value_or(
+        window.order_by.empty() ? WindowFrame::WholePartition : WindowFrame::RangeCumulative);
     for (const auto& existing : window_expressions) {
         if (existing.output_name == name) {
             return plan::BoundColumnRef{"", existing.output_name, window.position, existing.type};
@@ -592,6 +594,7 @@ plan::BoundColumnRef ensure_window_expression(const WindowCall& window,
                                                         std::move(argument),
                                                         std::move(partition_keys),
                                                         std::move(order_keys),
+                                                        frame,
                                                         window.position,
                                                         type});
     return plan::BoundColumnRef{"", name, window.position, type};
@@ -970,11 +973,38 @@ void mark_deterministic_order(plan::LogicalPlan& logical) {
     }
 }
 
+bool plan_contains_checked_sum_aggregate(const plan::LogicalPlan& logical) {
+    if (logical.kind == plan::LogicalKind::Aggregate &&
+        std::any_of(logical.aggregate_expressions.begin(),
+                    logical.aggregate_expressions.end(),
+                    [](const auto& aggregate) {
+                        return aggregate.function == AggregateFunction::Sum;
+                    })) {
+        return true;
+    }
+    return (logical.input != nullptr && plan_contains_checked_sum_aggregate(*logical.input)) ||
+           (logical.left != nullptr && plan_contains_checked_sum_aggregate(*logical.left)) ||
+           (logical.right != nullptr && plan_contains_checked_sum_aggregate(*logical.right));
+}
+
 bool window_requires_deterministic_input(const plan::LogicalPlan& logical) {
-    return logical.kind == plan::LogicalKind::Window &&
-           std::any_of(logical.window_expressions.begin(), logical.window_expressions.end(), [](const auto& window) {
-               return window.function == WindowFunction::RowNumber || window.function == WindowFunction::Sum;
-           });
+    if (logical.kind != plan::LogicalKind::Window) {
+        return false;
+    }
+    const auto frame_or_function_is_sensitive =
+        std::any_of(logical.window_expressions.begin(), logical.window_expressions.end(), [](const auto& window) {
+            const auto aggregate = window.function == WindowFunction::Count ||
+                                   window.function == WindowFunction::Sum ||
+                                   window.function == WindowFunction::Min ||
+                                   window.function == WindowFunction::Max;
+            return window.function == WindowFunction::RowNumber ||
+                   (aggregate && window.frame == WindowFrame::RowsCumulative) ||
+                   (window.function == WindowFunction::Sum &&
+                    window.frame == WindowFrame::WholePartition);
+        });
+    const auto child_has_checked_sum =
+        logical.input != nullptr && plan_contains_checked_sum_aggregate(*logical.input);
+    return frame_or_function_is_sensitive || child_has_checked_sum;
 }
 
 void protect_order_sensitive_window_inputs(plan::LogicalPlan& logical) {
@@ -982,11 +1012,14 @@ void protect_order_sensitive_window_inputs(plan::LogicalPlan& logical) {
         if (logical.input == nullptr) {
             throw std::logic_error("Window logical plan is missing its input");
         }
-        // ROW_NUMBER exposes stable child order whenever OVER keys tie. SUM's
-        // checked intermediate overflow can likewise depend on accumulation
-        // order even when the mathematical total is representable. Without a
-        // uniqueness or order-independent overflow proof, order-changing join
-        // commute/associate rules must fail closed throughout this child.
+        // ROW_NUMBER exposes stable child order whenever OVER keys tie. Every
+        // ROWS aggregate exposes a stable per-row prefix, and whole-partition
+        // SUM's checked intermediate overflow follows input accumulation
+        // order. RANGE publishes only peer-boundary values; its own SUM
+        // evaluator canonicalizes peer arguments before checked updates. A
+        // checked SUM in an Aggregate below Window still follows child order,
+        // so that dependency pins independently of the outer frame. Without
+        // these explicit proofs, order-changing join rules fail closed.
         mark_deterministic_order(*logical.input);
         return;
     }

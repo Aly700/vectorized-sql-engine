@@ -842,12 +842,8 @@ private:
     }
 
     bool is_window_frame_keyword() const {
-        return is_keyword("ROWS") || is_keyword("RANGE") || is_keyword("BETWEEN");
-    }
-
-    static bool is_ranking_window_function(WindowFunction function) {
-        return function == WindowFunction::RowNumber || function == WindowFunction::Rank ||
-               function == WindowFunction::DenseRank;
+        return is_keyword("ROWS") || is_keyword("RANGE") || is_keyword("GROUPS") ||
+               is_keyword("BETWEEN") || is_keyword("UNBOUNDED") || is_keyword("CURRENT");
     }
 
     WindowInputExpr parse_window_input_expr(const std::string& message) {
@@ -876,6 +872,26 @@ private:
         return WindowOrderKey{std::move(expression), direction};
     }
 
+    WindowFrame parse_window_frame() {
+        const auto frame = is_keyword("ROWS") ? WindowFrame::RowsCumulative
+                                               : WindowFrame::RangeCumulative;
+        advance();
+
+        const auto consume = [&](const std::string& keyword) {
+            if (!is_keyword(keyword)) {
+                throw ParseError(current_.position, "unsupported frame");
+            }
+            advance();
+        };
+        consume("BETWEEN");
+        consume("UNBOUNDED");
+        consume("PRECEDING");
+        consume("AND");
+        consume("CURRENT");
+        consume("ROW");
+        return frame;
+    }
+
     WindowCall parse_window_specification(WindowCall window) {
         window.over_position = current_.position;
         expect_keyword("OVER", "expected OVER after window function");
@@ -892,11 +908,6 @@ private:
         }
 
         if (is_keyword("ORDER")) {
-            const auto order_position = current_.position;
-            if (!is_ranking_window_function(window.function)) {
-                throw ParseError(order_position,
-                                 "aggregate window ORDER BY is unsupported (running frames)");
-            }
             advance();
             expect_keyword("BY", "expected BY after ORDER");
             window.order_by.push_back(parse_window_order_key());
@@ -906,8 +917,14 @@ private:
             }
         }
 
-        if (is_window_frame_keyword()) {
-            throw ParseError(current_.position, "window frames are unsupported");
+        if (is_keyword("ROWS") || is_keyword("RANGE")) {
+            window.frame_position = current_.position;
+            window.explicit_frame = parse_window_frame();
+            if (current_.kind != TokenKind::RightParen) {
+                throw ParseError(current_.position, "unsupported frame");
+            }
+        } else if (is_window_frame_keyword()) {
+            throw ParseError(current_.position, "unsupported frame");
         }
         expect_token(TokenKind::RightParen, "expected ')' after window specification");
         return window;

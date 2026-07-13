@@ -1343,6 +1343,15 @@ std::int64_t checked_sum(std::int64_t left, std::int64_t right, const std::strin
     return result;
 }
 
+void update_sum(AggregateValue& value, std::int64_t argument, const std::string& output_name) {
+    if (!value.has_value) {
+        value.sum = argument;
+        value.has_value = true;
+        return;
+    }
+    value.sum = checked_sum(value.sum, argument, output_name);
+}
+
 CompiledAggregateExpression compile_aggregate_expression(const plan::AggregateExpression& aggregate,
                                                          const storage::ColumnarBatch& batch) {
     CompiledAggregateExpression compiled;
@@ -1406,12 +1415,7 @@ void update_aggregate(AggregateValue& value,
         if (argument.is_null) {
             return;
         }
-        if (!value.has_value) {
-            value.sum = argument.int_value;
-            value.has_value = true;
-            return;
-        }
-        value.sum = checked_sum(value.sum, argument.int_value, aggregate.output_name);
+        update_sum(value, argument.int_value, aggregate.output_name);
         return;
     }
     case sql::AggregateFunction::Min: {
@@ -2138,24 +2142,30 @@ std::int64_t checked_window_ordinal(std::size_t ordinal, const std::string& outp
     return static_cast<std::int64_t>(ordinal);
 }
 
+std::vector<std::size_t> ordered_window_rows(const WindowPartition& partition,
+                                             const std::vector<CompiledSortKey>& order_keys) {
+    auto ordered_rows = partition.rows;
+    std::stable_sort(ordered_rows.begin(), ordered_rows.end(), [&](std::size_t left, std::size_t right) {
+        for (const auto& key : order_keys) {
+            const auto left_value = sort_key_cell(key, left);
+            const auto right_value = sort_key_cell(key, right);
+            if (left_value == right_value) {
+                continue;
+            }
+            return sort_cell_less(left_value, right_value, key.direction);
+        }
+        return false;
+    });
+    return ordered_rows;
+}
+
 void evaluate_ranking_window(const plan::WindowExpression& window,
                              const storage::ColumnarBatch& batch,
                              const std::vector<WindowPartition>& partitions,
                              std::vector<TypedCell>& values) {
     const auto order_keys = compile_sort_keys(window.order_keys, batch);
     for (const auto& partition : partitions) {
-        auto ordered_rows = partition.rows;
-        std::stable_sort(ordered_rows.begin(), ordered_rows.end(), [&](std::size_t left, std::size_t right) {
-            for (const auto& key : order_keys) {
-                const auto left_value = sort_key_cell(key, left);
-                const auto right_value = sort_key_cell(key, right);
-                if (left_value == right_value) {
-                    continue;
-                }
-                return sort_cell_less(left_value, right_value, key.direction);
-            }
-            return false;
-        });
+        const auto ordered_rows = ordered_window_rows(partition, order_keys);
 
         std::size_t rank = 1;
         std::size_t dense_rank = 1;
@@ -2172,20 +2182,76 @@ void evaluate_ranking_window(const plan::WindowExpression& window,
     }
 }
 
+void update_range_peer(AggregateValue& state,
+                       const CompiledAggregateExpression& aggregate,
+                       const std::vector<std::size_t>& ordered_rows,
+                       std::size_t begin,
+                       std::size_t end) {
+    if (aggregate.aggregate->function != sql::AggregateFunction::Sum) {
+        for (std::size_t index = begin; index < end; ++index) {
+            update_aggregate(state, aggregate, ordered_rows[index]);
+        }
+        return;
+    }
+
+    std::vector<std::int64_t> arguments;
+    arguments.reserve(end - begin);
+    for (std::size_t index = begin; index < end; ++index) {
+        const auto argument = aggregate_argument_value(aggregate, ordered_rows[index]);
+        if (!argument.is_null) {
+            arguments.push_back(argument.int_value);
+        }
+    }
+    std::sort(arguments.begin(), arguments.end());
+    for (const auto argument : arguments) {
+        update_sum(state, argument, aggregate.aggregate->output_name);
+    }
+}
+
 void evaluate_aggregate_window(const plan::WindowExpression& window,
                                const storage::ColumnarBatch& batch,
                                const std::vector<WindowPartition>& partitions,
                                std::vector<TypedCell>& values) {
     const auto aggregate = aggregate_expression_for_window(window);
     const auto compiled = compile_aggregate_expression(aggregate, batch);
+    const auto order_keys = compile_sort_keys(window.order_keys, batch);
     for (const auto& partition : partitions) {
         AggregateValue state;
-        for (auto row : partition.rows) {
-            update_aggregate(state, compiled, row);
+        if (window.frame == sql::WindowFrame::WholePartition) {
+            for (auto row : partition.rows) {
+                update_aggregate(state, compiled, row);
+            }
+            const auto value = finalize_aggregate(state, aggregate);
+            for (auto row : partition.rows) {
+                values.at(row) = value;
+            }
+            continue;
         }
-        const auto value = finalize_aggregate(state, aggregate);
-        for (auto row : partition.rows) {
-            values.at(row) = value;
+
+        const auto ordered_rows = ordered_window_rows(partition, order_keys);
+        if (window.frame == sql::WindowFrame::RowsCumulative) {
+            for (const auto row : ordered_rows) {
+                update_aggregate(state, compiled, row);
+                values.at(row) = finalize_aggregate(state, aggregate);
+            }
+            continue;
+        }
+
+        std::size_t peer_begin = 0;
+        while (peer_begin < ordered_rows.size()) {
+            auto peer_end = peer_begin + 1;
+            while (peer_end < ordered_rows.size() &&
+                   window_rows_are_peers(order_keys,
+                                         ordered_rows[peer_begin],
+                                         ordered_rows[peer_end])) {
+                ++peer_end;
+            }
+            update_range_peer(state, compiled, ordered_rows, peer_begin, peer_end);
+            const auto value = finalize_aggregate(state, aggregate);
+            for (auto index = peer_begin; index < peer_end; ++index) {
+                values.at(ordered_rows[index]) = value;
+            }
+            peer_begin = peer_end;
         }
     }
 }

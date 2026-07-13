@@ -55,6 +55,7 @@ struct AggregateCall {
 enum class SortDirection { Asc, Desc };
 
 enum class WindowFunction { RowNumber, Rank, DenseRank, Count, Sum, Min, Max };
+enum class WindowFrame { WholePartition, RangeCumulative, RowsCumulative };
 
 using WindowInputExpr = std::variant<ColumnRef, AggregateCall>;
 
@@ -71,6 +72,8 @@ struct WindowCall {
     std::optional<WindowInputExpr> argument;
     std::vector<WindowInputExpr> partition_by;
     std::vector<WindowOrderKey> order_by;
+    std::optional<WindowFrame> explicit_frame;
+    std::size_t frame_position{0};
 };
 
 using SelectExpr = std::variant<ScalarExpr, AggregateCall, WindowCall>;
@@ -350,6 +353,18 @@ inline std::string window_function_name(WindowFunction function) {
     return "<unknown window function>";
 }
 
+inline std::string window_frame_name(WindowFrame frame) {
+    switch (frame) {
+    case WindowFrame::WholePartition:
+        return "WHOLE PARTITION";
+    case WindowFrame::RangeCumulative:
+        return "RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW";
+    case WindowFrame::RowsCumulative:
+        return "ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW";
+    }
+    return "<unknown window frame>";
+}
+
 inline std::string quote_string_literal(const std::string& value) {
     std::string quoted = "'";
     for (const auto ch : value) {
@@ -418,6 +433,7 @@ inline std::string output_name(const WindowCall& window) {
         name += window_input_output_name(*window.argument);
     }
     name += ") OVER (";
+    bool wrote_clause = false;
     if (!window.partition_by.empty()) {
         name += "PARTITION BY ";
         for (std::size_t i = 0; i < window.partition_by.size(); ++i) {
@@ -426,9 +442,10 @@ inline std::string output_name(const WindowCall& window) {
             }
             name += window_input_output_name(window.partition_by[i]);
         }
+        wrote_clause = true;
     }
     if (!window.order_by.empty()) {
-        if (!window.partition_by.empty()) {
+        if (wrote_clause) {
             name += " ";
         }
         name += "ORDER BY ";
@@ -439,6 +456,13 @@ inline std::string output_name(const WindowCall& window) {
             name += window_input_output_name(window.order_by[i].expression);
             name += window.order_by[i].direction == SortDirection::Asc ? " ASC" : " DESC";
         }
+        wrote_clause = true;
+    }
+    if (window.explicit_frame.has_value()) {
+        if (wrote_clause) {
+            name += " ";
+        }
+        name += window_frame_name(*window.explicit_frame);
     }
     name += ")";
     return name;
