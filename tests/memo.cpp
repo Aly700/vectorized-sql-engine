@@ -1008,6 +1008,20 @@ plan::BoundPredicate membership_equality(std::string left_binding,
     });
 }
 
+void assert_non_join_null_aware_membership_fails_memo_ingestion() {
+    auto malformed = plan::LogicalPlan::scan("t");
+    malformed.null_aware_predicate = membership_equality("t", "a", "t1", "a");
+    optimizer::Memo memo;
+    try {
+        (void)memo.insert(malformed);
+        throw std::logic_error("expected non-join NullAwareAnti membership memo-ingest guard");
+    } catch (const std::invalid_argument& error) {
+        assert(std::string(error.what()) ==
+               "non-join logical plan node owns a NullAwareAnti membership equality");
+    }
+    assert(memo.group_count() == 0);
+}
+
 void assert_null_aware_membership_is_structural_memo_identity() {
     const auto first = plan::LogicalPlan::null_aware_anti(
         membership_equality("t1", "a", "t2", "a"),
@@ -1272,6 +1286,7 @@ int main() {
     assert_filter_through_aggregate_pushes_only_group_keys();
     assert_filter_through_aggregate_moves_group_key_or_but_pins_aggregate_or();
     assert_semi_anti_join_kinds_are_distinct_memo_identity();
+    assert_non_join_null_aware_membership_fails_memo_ingestion();
     assert_null_aware_membership_is_structural_memo_identity();
     assert_top_level_subquery_decorrelation_rules_and_guards();
     assert_correlated_subquery_decorrelation_rules_and_guards();

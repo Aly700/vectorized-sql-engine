@@ -1207,6 +1207,18 @@ plan::BoundPredicate literal_membership_predicate(std::int64_t value,
     });
 }
 
+void assert_non_join_null_aware_membership_fails_physical_lowering() {
+    auto malformed = plan::LogicalPlan::scan("t");
+    malformed.null_aware_predicate = equi_join_predicate("t", "a", "t1", "a");
+    try {
+        (void)plan::lower_to_physical(malformed);
+        throw std::logic_error("expected non-join NullAwareAnti membership lowering guard");
+    } catch (const std::invalid_argument& error) {
+        assert(std::string(error.what()) ==
+               "non-join logical plan node owns a NullAwareAnti membership equality");
+    }
+}
+
 void assert_interpreted_semi_anti_join_contract() {
     const auto catalog = make_golden_catalog();
 
@@ -1730,6 +1742,7 @@ int main() {
     assert_physical_lowering_shape();
     assert_physical_lowering_accepts_string_touching_plans();
     assert_outer_join_physical_lowering_preserves_kind();
+    assert_non_join_null_aware_membership_fails_physical_lowering();
     assert_interpreted_semi_anti_join_contract();
     assert_null_aware_anti_join_contract();
     assert_string_null_aware_anti_join_contract();

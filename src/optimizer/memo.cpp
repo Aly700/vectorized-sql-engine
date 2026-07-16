@@ -1440,6 +1440,10 @@ GroupId Memo::insert(const plan::LogicalPlan& logical) {
     // helpers include their full trees, while ordinary relational ingest follows
     // only input/left/right. Phase 21b rules explicitly call insert() only after
     // proving a top-level EXISTS/IN leaf can be lifted to SEMI/ANTI algebra.
+    if (logical.kind != plan::LogicalKind::Join && logical.null_aware_predicate.has_value()) {
+        throw std::invalid_argument(
+            "non-join logical plan node owns a NullAwareAnti membership equality");
+    }
     MemoExpression expression;
     expression.order_permission = logical.order_permission;
     switch (logical.kind) {

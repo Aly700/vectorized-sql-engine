@@ -121,6 +121,10 @@ std::optional<std::size_t> logical_residual_correlation_position(const LogicalPl
 }
 
 PhysicalPlan lower_impl(const LogicalPlan& logical) {
+    if (logical.kind != LogicalKind::Join && logical.null_aware_predicate.has_value()) {
+        throw std::invalid_argument(
+            "non-join logical plan node owns a NullAwareAnti membership equality");
+    }
     switch (logical.kind) {
     case LogicalKind::Scan:
         return PhysicalPlan::scan(logical.table, logical.binding_name);
