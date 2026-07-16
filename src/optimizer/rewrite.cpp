@@ -131,6 +131,117 @@ bool predicate_contains_subquery(const plan::BoundPredicate& predicate) {
     throw std::logic_error("unreachable predicate kind");
 }
 
+bool logical_plan_contains_owned_subquery(const plan::LogicalPlan& logical) {
+    if (std::any_of(logical.projections.begin(), logical.projections.end(), [](const auto& projection) {
+            return scalar_contains_subquery(projection.expression);
+        }) ||
+        std::any_of(logical.predicates.begin(), logical.predicates.end(), predicate_contains_subquery) ||
+        (logical.null_aware_predicate.has_value() &&
+         predicate_contains_subquery(*logical.null_aware_predicate))) {
+        return true;
+    }
+    return (logical.input != nullptr && logical_plan_contains_owned_subquery(*logical.input)) ||
+           (logical.left != nullptr && logical_plan_contains_owned_subquery(*logical.left)) ||
+           (logical.right != nullptr && logical_plan_contains_owned_subquery(*logical.right));
+}
+
+std::string bound_column_name(const plan::BoundColumnRef& column) {
+    return column.binding.empty() ? column.column : column.binding + "." + column.column;
+}
+
+bool logical_may_output_name(const plan::LogicalPlan& logical, const std::string& name) {
+    switch (logical.kind) {
+    case plan::LogicalKind::Scan:
+        return !logical.binding_name.empty() && name.starts_with(logical.binding_name + ".");
+    case plan::LogicalKind::Filter:
+    case plan::LogicalKind::Distinct:
+    case plan::LogicalKind::Sort:
+    case plan::LogicalKind::Limit:
+    case plan::LogicalKind::Explain:
+        return logical.input != nullptr && logical_may_output_name(*logical.input, name);
+    case plan::LogicalKind::Project:
+        return std::any_of(logical.projections.begin(), logical.projections.end(), [&](const auto& projection) {
+            return projection.output_name == name;
+        });
+    case plan::LogicalKind::Aggregate:
+        return std::any_of(logical.group_keys.begin(), logical.group_keys.end(), [&](const auto& key) {
+                   return bound_column_name(key) == name;
+               }) ||
+               std::any_of(logical.aggregate_expressions.begin(),
+                           logical.aggregate_expressions.end(),
+                           [&](const auto& aggregate) { return aggregate.output_name == name; });
+    case plan::LogicalKind::Window:
+        return (logical.input != nullptr && logical_may_output_name(*logical.input, name)) ||
+               std::any_of(logical.window_expressions.begin(),
+                           logical.window_expressions.end(),
+                           [&](const auto& window) { return window.output_name == name; });
+    case plan::LogicalKind::Join:
+        if (logical.left != nullptr && logical_may_output_name(*logical.left, name)) {
+            return true;
+        }
+        return (logical.join_kind == plan::JoinKind::Inner || logical.join_kind == plan::JoinKind::Left) &&
+               logical.right != nullptr && logical_may_output_name(*logical.right, name);
+    }
+    throw std::logic_error("unreachable logical plan kind");
+}
+
+std::string unique_internal_output_name(const plan::LogicalPlan& left,
+                                        const std::vector<plan::Projection>& right_projections) {
+    for (std::size_t index = 0;; ++index) {
+        auto name = "__not_in_value_" + std::to_string(index);
+        if (!logical_may_output_name(left, name) &&
+            !std::any_of(right_projections.begin(), right_projections.end(), [&](const auto& projection) {
+                return projection.output_name == name;
+            })) {
+            return name;
+        }
+    }
+}
+
+bool memo_group_contains_owned_subquery(const Memo& memo,
+                                        GroupId group,
+                                        std::vector<GroupId>& stack) {
+    group = memo.representative(group);
+    if (std::find(stack.begin(), stack.end(), group) != stack.end()) {
+        throw std::logic_error("memo subquery-presence derivation encountered a cycle");
+    }
+    stack.push_back(group);
+    for (const auto& stored : memo.group(group).expressions) {
+        const auto& expression = stored.expression;
+        if (std::any_of(expression.projections.begin(), expression.projections.end(), [](const auto& projection) {
+                return scalar_contains_subquery(projection.expression);
+            }) ||
+            std::any_of(expression.predicates.begin(), expression.predicates.end(), predicate_contains_subquery) ||
+            (expression.null_aware_predicate.has_value() &&
+             predicate_contains_subquery(*expression.null_aware_predicate))) {
+            stack.pop_back();
+            return true;
+        }
+        for (const auto child : expression.children) {
+            if (memo_group_contains_owned_subquery(memo, child, stack)) {
+                stack.pop_back();
+                return true;
+            }
+        }
+    }
+    stack.pop_back();
+    return false;
+}
+
+bool memo_group_contains_owned_subquery(const Memo& memo, GroupId group) {
+    std::vector<GroupId> stack;
+    return memo_group_contains_owned_subquery(memo, group, stack);
+}
+
+bool has_other_subquery_predicate(const MemoExpression& filter, std::size_t excluded_index) {
+    for (std::size_t i = 0; i < filter.predicates.size(); ++i) {
+        if (i != excluded_index && predicate_contains_subquery(filter.predicates[i])) {
+            return true;
+        }
+    }
+    return false;
+}
+
 MemoExpression filter_expression(std::vector<plan::BoundPredicate> predicates,
                                  GroupId child,
                                  plan::OrderPermission order_permission) {
@@ -146,12 +257,17 @@ MemoExpression join_expression(std::vector<plan::BoundPredicate> predicates,
                                GroupId left,
                                GroupId right,
                                plan::OrderPermission order_permission,
-                               plan::JoinKind join_kind = plan::JoinKind::Inner) {
+                               plan::JoinKind join_kind = plan::JoinKind::Inner,
+                               std::optional<plan::BoundPredicate> null_aware_predicate = std::nullopt) {
+    if ((join_kind == plan::JoinKind::NullAwareAnti) != null_aware_predicate.has_value()) {
+        throw std::logic_error("memo join expression has an invalid NullAwareAnti membership field");
+    }
     MemoExpression expression;
     expression.kind = MemoExpressionKind::Join;
     expression.order_permission = order_permission;
     expression.join_kind = join_kind;
     expression.predicates = std::move(predicates);
+    expression.null_aware_predicate = std::move(null_aware_predicate);
     expression.children.push_back(left);
     expression.children.push_back(right);
     return expression;
@@ -274,6 +390,10 @@ bool plan_references_outer_owner(const plan::LogicalPlan& logical) {
             return true;
         }
     }
+    if (logical.null_aware_predicate.has_value() &&
+        predicate_references_outer_owner(*logical.null_aware_predicate)) {
+        return true;
+    }
     return (logical.input != nullptr && plan_references_outer_owner(*logical.input)) ||
            (logical.left != nullptr && plan_references_outer_owner(*logical.left)) ||
            (logical.right != nullptr && plan_references_outer_owner(*logical.right));
@@ -309,7 +429,8 @@ struct DecorrelatedSubquery {
 };
 
 std::optional<DecorrelatedSubquery> decorrelate_equality_where(
-    const std::shared_ptr<const plan::LogicalPlan>& subquery) {
+    const std::shared_ptr<const plan::LogicalPlan>& subquery,
+    const plan::LogicalPlan* left_output = nullptr) {
     if (subquery == nullptr || subquery->correlation_columns.empty() ||
         subquery->kind != plan::LogicalKind::Project || subquery->input == nullptr ||
         subquery->input->kind != plan::LogicalKind::Filter || subquery->input->input == nullptr ||
@@ -367,7 +488,7 @@ std::optional<DecorrelatedSubquery> decorrelate_equality_where(
         auto hidden_name = "__corr_key_" + std::to_string(i);
         while (std::any_of(decorrelated.projections.begin(), decorrelated.projections.end(), [&](const auto& projection) {
             return projection.output_name == hidden_name;
-        })) {
+        }) || (left_output != nullptr && logical_may_output_name(*left_output, hidden_name))) {
             hidden_name += "_";
         }
         const auto& equality = equalities[i];
@@ -393,7 +514,8 @@ bool insert_decorrelated_filter_alternative(Memo& memo,
                                             std::size_t predicate_index,
                                             plan::JoinKind join_kind,
                                             std::vector<plan::BoundPredicate> join_predicates,
-                                            const std::shared_ptr<const plan::LogicalPlan>& subquery) {
+                                            const std::shared_ptr<const plan::LogicalPlan>& subquery,
+                                            std::optional<plan::BoundPredicate> null_aware_predicate = std::nullopt) {
     if (subquery == nullptr) {
         throw std::logic_error("decorrelatable predicate is missing its bound subquery");
     }
@@ -403,7 +525,8 @@ bool insert_decorrelated_filter_alternative(Memo& memo,
                                                                    filter.children.at(0),
                                                                    right_group,
                                                                    filter.order_permission,
-                                                                   join_kind));
+                                                                   join_kind,
+                                                                   std::move(null_aware_predicate)));
 
     std::vector<plan::BoundPredicate> residuals;
     residuals.reserve(filter.predicates.size() - 1);
@@ -643,7 +766,9 @@ std::vector<std::string> output_tables_for_expression(const Memo& memo,
     case MemoExpressionKind::GroupRef:
         return output_tables_for_group(memo, expression.children.at(0), stack);
     case MemoExpressionKind::Join:
-        if (expression.join_kind == plan::JoinKind::Semi || expression.join_kind == plan::JoinKind::Anti) {
+        if (expression.join_kind == plan::JoinKind::Semi ||
+            expression.join_kind == plan::JoinKind::Anti ||
+            expression.join_kind == plan::JoinKind::NullAwareAnti) {
             return output_tables_for_group(memo, expression.children.at(0), stack);
         }
         return merge_tables(output_tables_for_group(memo, expression.children.at(0), stack),
@@ -1092,6 +1217,73 @@ bool InToSemiJoinRule::apply(Memo& memo, GroupId group, const MemoExpression& ex
     return changed;
 }
 
+bool NotInToNullAwareAntiJoinRule::apply(Memo& memo,
+                                         GroupId group,
+                                         const MemoExpression& expression) const {
+    if (expression.kind != MemoExpressionKind::Filter) {
+        return false;
+    }
+    bool changed = false;
+    for (std::size_t i = 0; i < expression.predicates.size(); ++i) {
+        const auto& predicate = expression.predicates[i];
+        if (predicate.kind != sql::PredicateKind::NotIn ||
+            scalar_contains_subquery(predicate.in_value)) {
+            continue;
+        }
+        if (predicate.subquery == nullptr) {
+            throw std::logic_error("decorrelatable NOT IN predicate is missing its bound subquery");
+        }
+        if (!predicate.subquery->correlation_columns.empty()) {
+            continue;
+        }
+        // The materialized owner executes Q before preparing its relational
+        // input, and prepares sibling subquery predicates in source order.
+        // The native join cannot preserve those competing eager-error orders,
+        // so retain the materialized shape whenever either is present.
+        if (has_other_subquery_predicate(expression, i) ||
+            memo_group_contains_owned_subquery(memo, expression.children.at(0))) {
+            continue;
+        }
+        const auto& output = single_subquery_output(*predicate.subquery);
+        const auto left_plan = memo.extract(expression.children.at(0));
+        auto right_plan = predicate.subquery;
+        auto membership_output_name = output.output_name;
+        if (logical_may_output_name(left_plan, membership_output_name)) {
+            membership_output_name = unique_internal_output_name(left_plan, {});
+            auto aliased = plan::LogicalPlan::project(
+                {plan::Projection{
+                    membership_output_name,
+                    plan::BoundScalarExpr{
+                        plan::BoundColumnRef{
+                            "", output.output_name, predicate.operator_position, output.type},
+                        output.type},
+                    output.type}},
+                *predicate.subquery);
+            aliased.order_permission = predicate.subquery->order_permission;
+            right_plan = std::make_shared<const plan::LogicalPlan>(std::move(aliased));
+        }
+        auto membership = plan::BoundPredicate::comparison_expr(plan::BoundComparisonExpr{
+            predicate.in_value,
+            sql::ComparisonOp::Equal,
+            plan::BoundScalarExpr{
+                plan::BoundColumnRef{
+                    "", membership_output_name, predicate.operator_position, output.type},
+                output.type},
+            predicate.operator_position,
+        });
+        changed = insert_decorrelated_filter_alternative(memo,
+                                                         group,
+                                                         expression,
+                                                         i,
+                                                         plan::JoinKind::NullAwareAnti,
+                                                         {},
+                                                         right_plan,
+                                                         std::move(membership)) ||
+                  changed;
+    }
+    return changed;
+}
+
 bool CorrelatedExistsToSemiJoinRule::apply(Memo& memo,
                                            GroupId group,
                                            const MemoExpression& expression) const {
@@ -1185,6 +1377,69 @@ bool CorrelatedInToSemiJoinRule::apply(Memo& memo,
     return changed;
 }
 
+bool CorrelatedNotInToNullAwareAntiJoinRule::apply(
+    Memo& memo,
+    GroupId group,
+    const MemoExpression& expression) const {
+    if (expression.kind != MemoExpressionKind::Filter) {
+        return false;
+    }
+    bool changed = false;
+    for (std::size_t i = 0; i < expression.predicates.size(); ++i) {
+        const auto& predicate = expression.predicates[i];
+        if (predicate.kind != sql::PredicateKind::NotIn ||
+            scalar_contains_subquery(predicate.in_value) || predicate.subquery == nullptr) {
+            continue;
+        }
+        // Nested subqueries in the correlated right plan would move from
+        // per-owner-row evaluation to eager build-time evaluation. Sibling
+        // subquery predicates can likewise expose a different per-row error
+        // order after the NOT IN leaf becomes a join.
+        if (logical_plan_contains_owned_subquery(*predicate.subquery) ||
+            has_other_subquery_predicate(expression, i)) {
+            continue;
+        }
+        const auto& output = single_subquery_output(*predicate.subquery);
+        const auto left_plan = memo.extract(expression.children.at(0));
+        auto decorrelated = decorrelate_equality_where(predicate.subquery, &left_plan);
+        if (!decorrelated.has_value()) {
+            continue;
+        }
+        auto membership_output_name = output.output_name;
+        if (logical_may_output_name(left_plan, membership_output_name)) {
+            auto right = *decorrelated->plan;
+            if (right.kind != plan::LogicalKind::Project) {
+                throw std::logic_error("decorrelated NOT IN right plan lost its Project root");
+            }
+            membership_output_name = unique_internal_output_name(left_plan, right.projections);
+            right.projections.push_back(
+                plan::Projection{membership_output_name, output.expression, output.type});
+            decorrelated->plan =
+                std::make_shared<const plan::LogicalPlan>(std::move(right));
+        }
+        auto membership = plan::BoundPredicate::comparison_expr(plan::BoundComparisonExpr{
+            predicate.in_value,
+            sql::ComparisonOp::Equal,
+            plan::BoundScalarExpr{
+                plan::BoundColumnRef{
+                    "", membership_output_name, predicate.operator_position, output.type},
+                output.type},
+            predicate.operator_position,
+        });
+        changed = insert_decorrelated_filter_alternative(
+                      memo,
+                      group,
+                      expression,
+                      i,
+                      plan::JoinKind::NullAwareAnti,
+                      std::move(decorrelated->join_predicates),
+                      decorrelated->plan,
+                      std::move(membership)) ||
+                  changed;
+    }
+    return changed;
+}
+
 bool LeftJoinToInnerRule::apply(Memo& memo, GroupId group, const MemoExpression& expression) const {
     // Independently bound subplans contribute no right-side outer references;
     // null rejection is proved only from the owning predicate's outer operand.
@@ -1245,7 +1500,8 @@ bool FilterIntoJoinRule::apply(Memo& memo, GroupId group, const MemoExpression& 
         const auto right_tables = output_tables_for_group(memo, right_group);
 
         if (child_expression.join_kind == plan::JoinKind::Semi ||
-            child_expression.join_kind == plan::JoinKind::Anti) {
+            child_expression.join_kind == plan::JoinKind::Anti ||
+            child_expression.join_kind == plan::JoinKind::NullAwareAnti) {
             std::vector<plan::BoundPredicate> left_predicates;
             std::vector<plan::BoundPredicate> residual_predicates;
             for (const auto& predicate : expression.predicates) {
@@ -1269,7 +1525,8 @@ bool FilterIntoJoinRule::apply(Memo& memo, GroupId group, const MemoExpression& 
                                                                                    pushed_left_group,
                                                                                    right_group,
                                                                                    expression.order_permission,
-                                                                                   child_expression.join_kind));
+                                                                                   child_expression.join_kind,
+                                                                                   child_expression.null_aware_predicate));
             const auto inserted = residual_predicates.empty()
                                       ? memo.insert_group_ref_equivalent(group, pushed_join_group)
                                       : memo.insert_equivalent(group,
@@ -1638,9 +1895,11 @@ std::vector<std::reference_wrapper<const MemoRule>> default_memo_rules() {
     static const ExistsToSemiJoinRule exists_to_semi;
     static const NotExistsToAntiJoinRule not_exists_to_anti;
     static const InToSemiJoinRule in_to_semi;
+    static const NotInToNullAwareAntiJoinRule not_in_to_null_aware_anti;
     static const CorrelatedExistsToSemiJoinRule correlated_exists_to_semi;
     static const CorrelatedNotExistsToAntiJoinRule correlated_not_exists_to_anti;
     static const CorrelatedInToSemiJoinRule correlated_in_to_semi;
+    static const CorrelatedNotInToNullAwareAntiJoinRule correlated_not_in_to_null_aware_anti;
     static const LeftJoinToInnerRule left_join_to_inner;
     static const FilterIntoJoinRule filter_into_join;
     static const FilterThroughAggregateRule filter_through_aggregate;
@@ -1653,9 +1912,11 @@ std::vector<std::reference_wrapper<const MemoRule>> default_memo_rules() {
             std::cref(exists_to_semi),
             std::cref(not_exists_to_anti),
             std::cref(in_to_semi),
+            std::cref(not_in_to_null_aware_anti),
             std::cref(correlated_exists_to_semi),
             std::cref(correlated_not_exists_to_anti),
             std::cref(correlated_in_to_semi),
+            std::cref(correlated_not_in_to_null_aware_anti),
             std::cref(left_join_to_inner),
             std::cref(filter_into_join),
             std::cref(filter_through_aggregate),

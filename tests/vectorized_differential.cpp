@@ -1186,9 +1186,21 @@ void assert_outer_join_physical_lowering_preserves_kind() {
 plan::BoundPredicate equi_join_predicate(std::string left_binding,
                                          std::string left_column,
                                          std::string right_binding,
-                                         std::string right_column) {
+                                         std::string right_column,
+                                         catalog::ColumnType type = catalog::ColumnType::Int64) {
     return plan::BoundPredicate::comparison_expr(plan::BoundComparisonExpr{
-        plan::BoundColumnRef{std::move(left_binding), std::move(left_column), 0},
+        plan::BoundColumnRef{std::move(left_binding), std::move(left_column), 0, type},
+        sql::ComparisonOp::Equal,
+        plan::BoundColumnRef{std::move(right_binding), std::move(right_column), 0, type},
+        0,
+    });
+}
+
+plan::BoundPredicate literal_membership_predicate(std::int64_t value,
+                                                  std::string right_binding,
+                                                  std::string right_column) {
+    return plan::BoundPredicate::comparison_expr(plan::BoundComparisonExpr{
+        plan::BoundScalarExpr{sql::IntLiteral{value, 0}},
         sql::ComparisonOp::Equal,
         plan::BoundColumnRef{std::move(right_binding), std::move(right_column), 0},
         0,
@@ -1223,6 +1235,191 @@ void assert_interpreted_semi_anti_join_contract() {
     assert(plan::lower_to_physical(anti).join_kind == plan::JoinKind::Anti);
 }
 
+void assert_null_aware_anti_join_contract() {
+    const auto catalog = make_golden_catalog();
+    const auto assert_same = [&](const plan::LogicalPlan& logical, const std::string& expected) {
+        const auto interpreted = execution::execute_interpreted(logical, catalog);
+        const auto vectorized = execution::execute_vectorized(logical, catalog);
+        const auto physical_vectorized = execution::execute_vectorized(plan::lower_to_physical(logical), catalog);
+        assert(format_batch(interpreted) == expected);
+        assert(differential::same_batch(interpreted, vectorized));
+        assert(differential::same_batch(interpreted, physical_vectorized));
+    };
+
+    const auto empty_right = plan::LogicalPlan::null_aware_anti(
+        equi_join_predicate("nullable", "k", "empty", "a"),
+        plan::LogicalPlan::scan("nullable"),
+        plan::LogicalPlan::scan("empty"));
+    assert_same(empty_right,
+                "columns=[nullable.k,nullable.v]; "
+                "rows=[[1,10],[NULL,20],[2,NULL],[NULL,30]]");
+    assert(plan::to_string(empty_right) ==
+           "NullAwareAntiJoin[candidates=[], membership=col(nullable.k) = col(empty.a)]\n"
+           "  Scan[nullable]\n"
+           "  Scan[empty]");
+    const auto empty_physical = plan::lower_to_physical(empty_right);
+    assert(empty_physical.join_kind == plan::JoinKind::NullAwareAnti);
+    assert(empty_physical.null_aware_predicate.has_value());
+
+    const auto null_bearing_right = plan::LogicalPlan::null_aware_anti(
+        equi_join_predicate("j1", "k", "j2", "k"),
+        plan::LogicalPlan::scan("j1"),
+        plan::LogicalPlan::scan("j2"));
+    assert_same(null_bearing_right, "columns=[j1.k,j1.v]; rows=[]");
+
+    const auto null_free_right = plan::LogicalPlan::null_aware_anti(
+        equi_join_predicate("t", "a", "t1", "a"),
+        plan::LogicalPlan::scan("t"),
+        plan::LogicalPlan::scan("t1"));
+    assert_same(null_free_right, "columns=[t.a,t.b,t.c]; rows=[[3,20,7],[4,40,8]]");
+
+    const auto null_left_nonempty_right = plan::LogicalPlan::null_aware_anti(
+        equi_join_predicate("nullable", "k", "t1", "a"),
+        plan::LogicalPlan::scan("nullable"),
+        plan::LogicalPlan::scan("t1"));
+    assert_same(null_left_nonempty_right, "columns=[nullable.k,nullable.v]; rows=[]");
+
+    const auto correlated = plan::LogicalPlan::null_aware_anti(
+        equi_join_predicate("l", "v", "r", "v"),
+        plan::LogicalPlan::scan("nullable", "l"),
+        plan::LogicalPlan::scan("nullable", "r"),
+        {equi_join_predicate("l", "k", "r", "k")});
+    assert_same(correlated, "columns=[l.k,l.v]; rows=[[NULL,20],[NULL,30]]");
+
+    const auto right_non_null = plan::LogicalPlan::filter(
+        {plan::BoundPredicate::null_check_expr(
+            sql::PredicateKind::IsNotNull,
+            plan::BoundScalarExpr{plan::BoundColumnRef{"r", "v", 0}},
+            0)},
+        plan::LogicalPlan::scan("nullable", "r"));
+    const auto correlated_empty_for_null_membership = plan::LogicalPlan::null_aware_anti(
+        equi_join_predicate("l", "v", "r", "v"),
+        plan::LogicalPlan::scan("nullable", "l"),
+        right_non_null,
+        {equi_join_predicate("l", "k", "r", "k")});
+    assert_same(correlated_empty_for_null_membership,
+                "columns=[l.k,l.v]; rows=[[NULL,20],[2,NULL],[NULL,30]]");
+
+    const auto fallback = plan::LogicalPlan::null_aware_anti(
+        literal_membership_predicate(5, "t1", "a"),
+        plan::LogicalPlan::scan("t"),
+        plan::LogicalPlan::scan("t1"));
+    assert_same(fallback,
+                "columns=[t.a,t.b,t.c]; rows=[[1,10,5],[2,20,6],[3,20,7],[4,40,8]]");
+
+    const auto plain_anti = plan::LogicalPlan::join(
+        {equi_join_predicate("j1", "k", "j2", "k")},
+        plan::LogicalPlan::scan("j1"),
+        plan::LogicalPlan::scan("j2"),
+        plan::JoinKind::Anti);
+    assert(format_batch(execution::execute_interpreted(plain_anti, catalog)) ==
+           "columns=[j1.k,j1.v]; rows=[[NULL,20],[NULL,40]]");
+    assert(differential::same_batch(execution::execute_interpreted(plain_anti, catalog),
+                                    execution::execute_vectorized(plain_anti, catalog)));
+    assert(format_batch(execution::execute_interpreted(null_bearing_right, catalog)) ==
+           "columns=[j1.k,j1.v]; rows=[]");
+
+    try {
+        (void)plan::LogicalPlan::join({},
+                                     plan::LogicalPlan::scan("t"),
+                                     plan::LogicalPlan::scan("t1"),
+                                     plan::JoinKind::NullAwareAnti);
+        throw std::logic_error("expected explicit NullAwareAnti factory guard");
+    } catch (const std::invalid_argument& error) {
+        assert(std::string(error.what()) ==
+               "NullAwareAnti must be constructed with an explicit membership equality");
+    }
+
+    const auto non_equality = plan::BoundPredicate::comparison_expr(plan::BoundComparisonExpr{
+        plan::BoundColumnRef{"t", "a", 0},
+        sql::ComparisonOp::Less,
+        plan::BoundColumnRef{"t1", "a", 0},
+        0,
+    });
+    try {
+        (void)plan::LogicalPlan::null_aware_anti(
+            non_equality, plan::LogicalPlan::scan("t"), plan::LogicalPlan::scan("t1"));
+        throw std::logic_error("expected NullAwareAnti equality guard");
+    } catch (const std::invalid_argument& error) {
+        assert(std::string(error.what()) ==
+               "NullAwareAnti membership predicate must be an equality");
+    }
+
+    const auto mismatched_equality = plan::BoundPredicate::comparison_expr(plan::BoundComparisonExpr{
+        plan::BoundColumnRef{"t", "a", 0, catalog::ColumnType::Int64},
+        sql::ComparisonOp::Equal,
+        plan::BoundColumnRef{"string_right", "k", 0, catalog::ColumnType::String},
+        0,
+    });
+    try {
+        (void)plan::LogicalPlan::null_aware_anti(
+            mismatched_equality,
+            plan::LogicalPlan::scan("t"),
+            plan::LogicalPlan::scan("string_right"));
+        throw std::logic_error("expected NullAwareAnti type guard");
+    } catch (const std::invalid_argument& error) {
+        assert(std::string(error.what()) ==
+               "NullAwareAnti membership equality must have matching types");
+    }
+
+    auto missing_membership = plan::LogicalPlan::join(
+        {}, plan::LogicalPlan::scan("t"), plan::LogicalPlan::scan("t1"));
+    missing_membership.join_kind = plan::JoinKind::NullAwareAnti;
+    try {
+        (void)plan::lower_to_physical(missing_membership);
+        throw std::logic_error("expected malformed NullAwareAnti lowering guard");
+    } catch (const std::invalid_argument& error) {
+        assert(std::string(error.what()) ==
+               "NullAwareAnti join is missing its membership equality");
+    }
+
+    auto extra_membership = plan::LogicalPlan::join(
+        {}, plan::LogicalPlan::scan("t"), plan::LogicalPlan::scan("t1"));
+    extra_membership.null_aware_predicate = equi_join_predicate("t", "a", "t1", "a");
+    try {
+        (void)plan::lower_to_physical(extra_membership);
+        throw std::logic_error("expected non-NullAwareAnti membership-field guard");
+    } catch (const std::invalid_argument& error) {
+        assert(std::string(error.what()) ==
+               "non-NullAwareAnti join owns a membership equality");
+    }
+}
+
+void assert_string_null_aware_anti_join_contract() {
+    storage::StringColumn left_k;
+    left_k.append("a");
+    left_k.append_null();
+    left_k.append("c");
+    storage::Int64Column left_v;
+    for (auto value : {1, 2, 3}) {
+        left_v.append(value);
+    }
+    storage::ColumnarBatch left;
+    left.add_column("k", std::move(left_k));
+    left.add_column("v", std::move(left_v));
+
+    storage::StringColumn right_k;
+    right_k.append("a");
+    right_k.append("b");
+    storage::ColumnarBatch right;
+    right.add_column("k", std::move(right_k));
+
+    execution::Catalog catalog;
+    catalog.add_table("string_na_left", std::move(left));
+    catalog.add_table("string_na_right", std::move(right));
+    const auto logical = plan::LogicalPlan::null_aware_anti(
+        equi_join_predicate(
+            "string_na_left", "k", "string_na_right", "k", catalog::ColumnType::String),
+        plan::LogicalPlan::scan("string_na_left"),
+        plan::LogicalPlan::scan("string_na_right"));
+    const auto interpreted = execution::execute_interpreted(logical, catalog);
+    const auto vectorized = execution::execute_vectorized(logical, catalog);
+    assert(differential::same_batch(interpreted, vectorized));
+    assert(interpreted.row_count() == 1);
+    assert(interpreted.string_column("string_na_left.k").at(0) == "c");
+    assert(interpreted.column("string_na_left.v").at(0) == 3);
+}
+
 void assert_subquery_physical_lowering_and_vectorized_execution_are_supported() {
     const auto catalog = make_golden_catalog();
     const auto logical =
@@ -1238,16 +1435,26 @@ void assert_subquery_physical_lowering_and_vectorized_execution_are_supported() 
 
 void assert_residual_correlated_subquery_is_rejected_at_physical_lowering() {
     const auto catalog = make_golden_catalog();
-    const auto logical = sql::bind_select(
-        sql::parse_select("SELECT a FROM t WHERE EXISTS (SELECT t1.a FROM t1 WHERE t1.a > t.a)"), catalog);
-    try {
-        (void)plan::lower_to_physical(logical);
-    } catch (const std::exception& error) {
-        assert(std::string(error.what()) ==
-               "vectorized execution does not support residual correlated subqueries");
-        return;
+    const std::vector<std::pair<std::string, std::size_t>> blocked{
+        {"SELECT a FROM t WHERE EXISTS (SELECT t1.a FROM t1 WHERE t1.a > t.a)", 22},
+        {"SELECT b FROM t WHERE b NOT IN (SELECT t1.b FROM t1 WHERE t1.a > t.a)", 28},
+    };
+    for (const auto& [sql_text, position] : blocked) {
+        const auto logical = sql::bind_select(sql::parse_select(sql_text), catalog);
+        try {
+            (void)plan::lower_to_physical(logical);
+        } catch (const std::exception& error) {
+            const auto expected =
+                "vectorized execution does not support residual correlated subqueries at position " +
+                std::to_string(position);
+            if (std::string(error.what()) != expected) {
+                throw std::logic_error("unexpected residual correlation guard: " +
+                                       std::string(error.what()));
+            }
+            continue;
+        }
+        throw std::logic_error("expected residual correlated subquery lowering guard");
     }
-    throw std::logic_error("expected residual correlated subquery lowering guard");
 }
 
 void assert_correlated_scalar_error_is_equivalent_on_every_oracle_path() {
@@ -1270,7 +1477,7 @@ void assert_correlated_scalar_error_is_equivalent_on_every_oracle_path() {
             (void)plan::lower_to_physical(candidate);
         } catch (const std::runtime_error& error) {
             assert(std::string(error.what()) ==
-                   "vectorized execution does not support residual correlated subqueries");
+                   "vectorized execution does not support residual correlated subqueries at position 22");
             return;
         }
         throw std::logic_error("expected correlated scalar lowering guard");
@@ -1414,6 +1621,94 @@ void assert_opaque_checked_sum_subquery_pins_after_decorrelation() {
     assert(stats.accepted_error_path_count == 0);
 }
 
+const plan::LogicalPlan* find_null_aware_anti(const plan::LogicalPlan& logical) {
+    if (logical.kind == plan::LogicalKind::Join &&
+        logical.join_kind == plan::JoinKind::NullAwareAnti) {
+        return &logical;
+    }
+    if (logical.input != nullptr) {
+        if (const auto* found = find_null_aware_anti(*logical.input); found != nullptr) {
+            return found;
+        }
+    }
+    if (logical.left != nullptr) {
+        if (const auto* found = find_null_aware_anti(*logical.left); found != nullptr) {
+            return found;
+        }
+    }
+    if (logical.right != nullptr) {
+        return find_null_aware_anti(*logical.right);
+    }
+    return nullptr;
+}
+
+const plan::LogicalPlan* find_aggregate(const plan::LogicalPlan& logical) {
+    if (logical.kind == plan::LogicalKind::Aggregate) {
+        return &logical;
+    }
+    if (logical.input != nullptr) {
+        if (const auto* found = find_aggregate(*logical.input); found != nullptr) {
+            return found;
+        }
+    }
+    if (logical.left != nullptr) {
+        if (const auto* found = find_aggregate(*logical.left); found != nullptr) {
+            return found;
+        }
+    }
+    if (logical.right != nullptr) {
+        return find_aggregate(*logical.right);
+    }
+    return nullptr;
+}
+
+void assert_not_in_checked_sum_subplan_keeps_order_pin() {
+    const auto catalog = make_golden_catalog();
+    const auto sql_text =
+        "SELECT o.k FROM checked_sum_outer AS o WHERE o.k NOT IN ("
+        "SELECT SUM(a.v) FROM checked_sum_left AS a "
+        "JOIN checked_sum_right AS b ON a.id = b.id)";
+    const auto logical = sql::bind_select(sql::parse_select(sql_text), catalog);
+    const auto expected = execution::execute_interpreted(logical, catalog);
+    assert(format_batch(expected) == "columns=[o.k]; rows=[[0]]");
+
+    optimizer::Memo memo;
+    const auto root = memo.insert(logical);
+    const auto explored =
+        optimizer::explore_memo_to_fixpoint(memo, optimizer::default_memo_rules());
+    assert(std::find(explored.fired_rules.begin(),
+                     explored.fired_rules.end(),
+                     "NotInToNullAwareAntiJoinRule") != explored.fired_rules.end());
+    assert(std::find(explored.fired_rules.begin(), explored.fired_rules.end(), "JoinCommuteRule") ==
+           explored.fired_rules.end());
+    assert(std::find(explored.fired_rules.begin(), explored.fired_rules.end(), "JoinAssociateRule") ==
+           explored.fired_rules.end());
+
+    const auto alternatives = memo.extract_alternatives(
+        root, optimizer::AlternativeExtractionOptions{128, 1024});
+    bool saw_materialized = false;
+    bool saw_native = false;
+    for (const auto& alternative : alternatives.plans) {
+        saw_materialized = saw_materialized ||
+                           plan::to_string(alternative).find("NOT IN subquery(") != std::string::npos;
+        const auto* null_aware = find_null_aware_anti(alternative);
+        if (null_aware != nullptr) {
+            saw_native = true;
+            assert(null_aware->right != nullptr);
+            const auto* aggregate = find_aggregate(*null_aware->right);
+            assert(aggregate != nullptr && aggregate->input != nullptr);
+            assert(aggregate->input->kind == plan::LogicalKind::Join);
+            assert(aggregate->input->order_permission == plan::OrderPermission::Deterministic);
+        }
+        const auto oracle = execution::execute_interpreted(alternative, catalog);
+        const auto vectorized = execution::execute_vectorized(alternative, catalog);
+        assert(differential::same_batch(expected, oracle));
+        assert(differential::same_batch(expected, vectorized));
+    }
+    assert(saw_materialized && saw_native);
+    memo.assert_invariants();
+}
+
 void assert_order_insensitive_aggregate_keeps_join_alternatives() {
     const auto catalog = make_golden_catalog();
     const std::string context = "checked SUM pin negative control";
@@ -1436,12 +1731,15 @@ int main() {
     assert_physical_lowering_accepts_string_touching_plans();
     assert_outer_join_physical_lowering_preserves_kind();
     assert_interpreted_semi_anti_join_contract();
+    assert_null_aware_anti_join_contract();
+    assert_string_null_aware_anti_join_contract();
     assert_subquery_physical_lowering_and_vectorized_execution_are_supported();
     assert_residual_correlated_subquery_is_rejected_at_physical_lowering();
     assert_correlated_scalar_error_is_equivalent_on_every_oracle_path();
     assert_window_paths_and_vectorized_execution();
     assert_running_window_paths_and_error_equivalence();
     assert_opaque_checked_sum_subquery_pins_after_decorrelation();
+    assert_not_in_checked_sum_subplan_keeps_order_pin();
     assert_plain_checked_sum_pins_join_order();
     assert_order_insensitive_aggregate_keeps_join_alternatives();
 

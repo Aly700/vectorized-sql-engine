@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <cstddef>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -29,6 +30,7 @@ struct MemoExpression {
     std::vector<plan::WindowExpression> window_expressions;
     std::vector<plan::SortKey> sort_keys;
     std::vector<plan::BoundPredicate> predicates;
+    std::optional<plan::BoundPredicate> null_aware_predicate;
     plan::JoinKind join_kind{plan::JoinKind::Inner};
     std::size_t limit_count{0};
     std::vector<GroupId> children;

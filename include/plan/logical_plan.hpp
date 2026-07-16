@@ -7,6 +7,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <variant>
@@ -18,7 +19,7 @@ struct LogicalPlan;
 
 enum class LogicalKind { Scan, Join, Filter, Project, Aggregate, Window, Distinct, Sort, Limit, Explain };
 enum class OrderPermission { Deterministic, Arbitrary };
-enum class JoinKind { Inner, Left, Semi, Anti };
+enum class JoinKind { Inner, Left, Semi, Anti, NullAwareAnti };
 
 struct BoundColumnRef {
     std::string binding;
@@ -174,6 +175,9 @@ struct LogicalPlan {
     std::vector<WindowExpression> window_expressions;
     std::vector<SortKey> sort_keys;
     std::vector<BoundPredicate> predicates;
+    // Structural only for NullAwareAnti. `predicates` identify the candidate
+    // right rows; this equality carries NOT IN's distinct UNKNOWN semantics.
+    std::optional<BoundPredicate> null_aware_predicate;
     // Set only on a bound subplan root. Empty is the structural Phase 21a
     // dispatch; non-empty means execution requires the listed outer values.
     std::vector<BoundColumnRef> correlation_columns;
@@ -196,19 +200,44 @@ struct LogicalPlan {
     }
 
     // INNER/LEFT output identity/order is deterministic: all columns from the
-    // left child followed by all columns from the right child. SEMI/ANTI emit
-    // exactly the left child's identities and order; right identities exist
-    // only while evaluating join predicates. Expressions in a bound logical
-    // plan refer to identities by binding and column name; downstream layers
-    // must not re-resolve parsed SQL names.
+    // left child followed by all columns from the right child. SEMI/ANTI and
+    // NULL-aware ANTI emit exactly the left child's identities and order;
+    // right identities exist only while evaluating join predicates.
+    // Expressions in a bound logical plan refer to identities by binding and
+    // column name; downstream layers must not re-resolve parsed SQL names.
     static LogicalPlan join(std::vector<BoundPredicate> predicates,
                             LogicalPlan left,
                             LogicalPlan right,
                             JoinKind join_kind = JoinKind::Inner) {
+        if (join_kind == JoinKind::NullAwareAnti) {
+            throw std::invalid_argument(
+                "NullAwareAnti must be constructed with an explicit membership equality");
+        }
         LogicalPlan p;
         p.kind = LogicalKind::Join;
         p.join_kind = join_kind;
         p.predicates = std::move(predicates);
+        p.left = std::make_shared<LogicalPlan>(std::move(left));
+        p.right = std::make_shared<LogicalPlan>(std::move(right));
+        return p;
+    }
+
+    static LogicalPlan null_aware_anti(BoundPredicate membership,
+                                       LogicalPlan left,
+                                       LogicalPlan right,
+                                       std::vector<BoundPredicate> candidate_predicates = {}) {
+        if (membership.kind != sql::PredicateKind::Comparison ||
+            membership.comparison.op != sql::ComparisonOp::Equal) {
+            throw std::invalid_argument("NullAwareAnti membership predicate must be an equality");
+        }
+        if (membership.comparison.left.type != membership.comparison.right.type) {
+            throw std::invalid_argument("NullAwareAnti membership equality must have matching types");
+        }
+        LogicalPlan p;
+        p.kind = LogicalKind::Join;
+        p.join_kind = JoinKind::NullAwareAnti;
+        p.predicates = std::move(candidate_predicates);
+        p.null_aware_predicate = std::move(membership);
         p.left = std::make_shared<LogicalPlan>(std::move(left));
         p.right = std::make_shared<LogicalPlan>(std::move(right));
         return p;

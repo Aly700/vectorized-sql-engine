@@ -703,6 +703,41 @@ void assert_semi_anti_costs_use_complementary_selectivity_and_linear_probe_work(
     assert(anti_estimate.cost == 2004.0);
 }
 
+void assert_null_aware_anti_costs_hash_and_fallback_deterministically() {
+    const auto catalog = make_skewed_catalog();
+    const auto hash_membership = plan::BoundPredicate::comparison_expr(plan::BoundComparisonExpr{
+        plan::BoundColumnRef{"big", "k", 0},
+        sql::ComparisonOp::Equal,
+        plan::BoundColumnRef{"tiny", "k", 0},
+        0,
+    });
+    const auto fallback_membership = plan::BoundPredicate::comparison_expr(plan::BoundComparisonExpr{
+        plan::BoundScalarExpr{sql::IntLiteral{5, 0}},
+        sql::ComparisonOp::Equal,
+        plan::BoundColumnRef{"tiny", "k", 0},
+        0,
+    });
+    const auto hash = plan::LogicalPlan::null_aware_anti(
+        hash_membership, plan::LogicalPlan::scan("big"), plan::LogicalPlan::scan("tiny"));
+    const auto fallback = plan::LogicalPlan::null_aware_anti(
+        fallback_membership, plan::LogicalPlan::scan("big"), plan::LogicalPlan::scan("tiny"));
+    const auto correlated_fallback = plan::LogicalPlan::null_aware_anti(
+        fallback_membership,
+        plan::LogicalPlan::scan("big"),
+        plan::LogicalPlan::scan("tiny"),
+        {hash_membership});
+
+    const auto hash_estimate = optimizer::estimate_cost(hash, catalog);
+    const auto fallback_estimate = optimizer::estimate_cost(fallback, catalog);
+    const auto correlated_fallback_estimate = optimizer::estimate_cost(correlated_fallback, catalog);
+    assert(hash_estimate.rows == 500.0);
+    assert(hash_estimate.cost == 2004.0);
+    assert(fallback_estimate.rows == 500.0);
+    assert(fallback_estimate.cost == 3002.0);
+    assert(correlated_fallback_estimate.rows == 500.0);
+    assert(correlated_fallback_estimate.cost == 3002.0);
+}
+
 void assert_window_cost_is_row_preserving_and_charges_each_specification() {
     const auto catalog = make_skewed_catalog();
     const auto logical = sql::bind_select(
@@ -745,6 +780,7 @@ int main() {
     assert_subquery_cost_is_added_once_to_owning_filter();
     assert_correlated_subquery_cost_scales_by_outer_rows_and_decorrelation_wins();
     assert_semi_anti_costs_use_complementary_selectivity_and_linear_probe_work();
+    assert_null_aware_anti_costs_hash_and_fallback_deterministically();
     assert_window_cost_is_row_preserving_and_charges_each_specification();
     return 0;
 }

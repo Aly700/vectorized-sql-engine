@@ -116,6 +116,11 @@ optimizer::MemoExpression join_expression(optimizer::GroupId left, optimizer::Gr
     return expression;
 }
 
+plan::BoundPredicate membership_equality(std::string left_binding,
+                                         std::string left_column,
+                                         std::string right_binding,
+                                         std::string right_column);
+
 bool trace_contains(const std::vector<std::string>& trace, const std::string& rule_name) {
     for (const auto& fired : trace) {
         if (fired == rule_name) {
@@ -560,6 +565,12 @@ void assert_top_level_subquery_decorrelation_rules_and_guards() {
         {"SELECT a FROM t WHERE a IN (SELECT a FROM t1)",
          "InToSemiJoinRule",
          "SemiJoin[col(t.a) = col(a)]"},
+        {"SELECT a FROM t WHERE a NOT IN (SELECT a FROM t1)",
+         "NotInToNullAwareAntiJoinRule",
+         "NullAwareAntiJoin[candidates=[], membership=col(t.a) = col(a)]"},
+        {"SELECT a FROM t WHERE a NOT IN (SELECT t.a FROM t WHERE t.a < 3)",
+         "NotInToNullAwareAntiJoinRule",
+         "NullAwareAntiJoin[candidates=[], membership=col(t.a) = col(__not_in_value_0)]"},
     };
 
     for (const auto& test : positive_cases) {
@@ -579,7 +590,9 @@ void assert_top_level_subquery_decorrelation_rules_and_guards() {
             std::terminate();
         }
         for (const auto& alternative : alternatives.plans) {
-            if (format_batch(execution::execute_interpreted(alternative, catalog)) != expected) {
+            const auto interpreted = execution::execute_interpreted(alternative, catalog);
+            const auto vectorized = execution::execute_vectorized(alternative, catalog);
+            if (format_batch(interpreted) != expected || format_batch(vectorized) != expected) {
                 std::cerr << "decorrelated memo alternative changed oracle results\n"
                           << "sql: " << test.sql << "\n"
                           << "alternative:\n" << plan::to_string(alternative) << "\n"
@@ -593,7 +606,12 @@ void assert_top_level_subquery_decorrelation_rules_and_guards() {
     const std::vector<std::string> blocked_sqls{
         "SELECT a FROM t WHERE a = 1 OR EXISTS (SELECT a FROM t1)",
         "SELECT a FROM t WHERE a = 1 OR a IN (SELECT a FROM t1)",
-        "SELECT a FROM t WHERE a NOT IN (SELECT a FROM t1)",
+        "SELECT a FROM t WHERE a = 1 OR a NOT IN (SELECT a FROM t1)",
+        "SELECT a FROM t WHERE (SELECT MAX(a) FROM t) NOT IN (SELECT a FROM t1)",
+        "SELECT a FROM t WHERE a NOT IN (SELECT a FROM t1) AND "
+        "a = (SELECT MAX(a) FROM t1)",
+        "SELECT a FROM t WHERE a = (SELECT MAX(a) FROM t1) "
+        "GROUP BY a HAVING a NOT IN (SELECT a FROM t1)",
         "SELECT a FROM t WHERE a = (SELECT MAX(a) FROM t1)",
     };
     for (const auto& sql_text : blocked_sqls) {
@@ -606,8 +624,10 @@ void assert_top_level_subquery_decorrelation_rules_and_guards() {
         if (trace_contains(explored.fired_rules, "ExistsToSemiJoinRule") ||
             trace_contains(explored.fired_rules, "NotExistsToAntiJoinRule") ||
             trace_contains(explored.fired_rules, "InToSemiJoinRule") ||
+            trace_contains(explored.fired_rules, "NotInToNullAwareAntiJoinRule") ||
             contains_plan_text(alternatives.plans, "SemiJoin[") ||
-            contains_plan_text(alternatives.plans, "AntiJoin[")) {
+            contains_plan_text(alternatives.plans, "AntiJoin[") ||
+            contains_plan_text(alternatives.plans, "NullAwareAntiJoin[")) {
             std::cerr << "blocked subquery form was decorrelated\n"
                       << "sql: " << sql_text << "\n"
                       << "memo dump:\n" << memo.dump();
@@ -663,6 +683,30 @@ void assert_top_level_subquery_decorrelation_rules_and_guards() {
         std::terminate();
     }
 
+    const auto null_aware_sql =
+        "SELECT a FROM t WHERE a > 1 AND a NOT IN (SELECT a FROM t1 WHERE a = 999)";
+    const auto null_aware = sql::bind_select(sql::parse_select(null_aware_sql), catalog);
+    optimizer::Memo null_aware_memo;
+    const auto null_aware_root = null_aware_memo.insert(null_aware);
+    const auto null_aware_explored =
+        optimizer::explore_memo_to_fixpoint(null_aware_memo, optimizer::default_memo_rules());
+    const auto null_aware_alternatives = null_aware_memo.extract_alternatives(
+        null_aware_root, optimizer::AlternativeExtractionOptions{128, 1024});
+    if (!trace_contains(null_aware_explored.fired_rules, "NotInToNullAwareAntiJoinRule") ||
+        !trace_contains(null_aware_explored.fired_rules, "FilterIntoJoinRule") ||
+        !contains_plan_text(
+            null_aware_alternatives.plans,
+            "NullAwareAntiJoin[candidates=[], membership=col(t.a) = col(a)]\n"
+            "    Filter[col(t.a) > lit(1)]") ||
+        trace_contains(null_aware_explored.fired_rules, "JoinCommuteRule") ||
+        trace_contains(null_aware_explored.fired_rules, "JoinAssociateRule") ||
+        trace_contains(null_aware_explored.fired_rules, "LeftJoinToInnerRule")) {
+        std::cerr << "NullAwareAnti transform guards or preserved-side pushdown failed\n"
+                  << "sql: " << null_aware_sql << "\n"
+                  << "memo dump:\n" << null_aware_memo.dump();
+        std::terminate();
+    }
+
     const auto right_only = plan::BoundPredicate::comparison_expr(plan::BoundComparisonExpr{
         plan::BoundColumnRef{"t2", "c", 0},
         sql::ComparisonOp::Greater,
@@ -677,14 +721,20 @@ void assert_top_level_subquery_decorrelation_rules_and_guards() {
     });
     const auto empty_reference = plan::BoundPredicate::null_check_expr(
         sql::PredicateKind::IsNull, plan::BoundScalarExpr{sql::IntLiteral{1, 0}}, 0);
-    for (const auto kind : {plan::JoinKind::Semi, plan::JoinKind::Anti}) {
+    for (const auto kind :
+         {plan::JoinKind::Semi, plan::JoinKind::Anti, plan::JoinKind::NullAwareAnti}) {
         for (const auto& pinned : {right_only, mixed, empty_reference}) {
+            auto child = kind == plan::JoinKind::NullAwareAnti
+                             ? plan::LogicalPlan::null_aware_anti(
+                                   membership_equality("t1", "a", "t2", "a"),
+                                   plan::LogicalPlan::scan("t1"),
+                                   plan::LogicalPlan::scan("t2"))
+                             : plan::LogicalPlan::join({},
+                                                       plan::LogicalPlan::scan("t1"),
+                                                       plan::LogicalPlan::scan("t2"),
+                                                       kind);
             const auto logical = plan::LogicalPlan::filter(
-                {pinned},
-                plan::LogicalPlan::join({},
-                                        plan::LogicalPlan::scan("t1"),
-                                        plan::LogicalPlan::scan("t2"),
-                                        kind));
+                {pinned}, std::move(child));
             optimizer::Memo guard_memo;
             const auto guard_root = guard_memo.insert(logical);
             const auto guard_explored =
@@ -696,7 +746,7 @@ void assert_top_level_subquery_decorrelation_rules_and_guards() {
                 trace_contains(guard_explored.fired_rules, "JoinAssociateRule") ||
                 trace_contains(guard_explored.fired_rules, "LeftJoinToInnerRule") ||
                 guard_alternatives.plans.size() != 1) {
-                std::cerr << "non-left-only predicate crossed a Semi/Anti transform guard\n"
+                std::cerr << "non-left-only predicate crossed a preserved-left transform guard\n"
                           << "plan:\n" << plan::to_string(logical) << "\n"
                           << "memo dump:\n" << guard_memo.dump();
                 std::terminate();
@@ -719,6 +769,12 @@ void assert_correlated_subquery_decorrelation_rules_and_guards() {
          "CorrelatedNotExistsToAntiJoinRule", "AntiJoin["},
         {"SELECT b FROM t WHERE b IN (SELECT t1.b FROM t1 WHERE t1.a = t.a)",
          "CorrelatedInToSemiJoinRule", "SemiJoin["},
+        {"SELECT b FROM t WHERE b NOT IN (SELECT t1.b FROM t1 WHERE t1.a = t.a)",
+         "CorrelatedNotInToNullAwareAntiJoinRule", "NullAwareAntiJoin["},
+        {"SELECT o.b FROM t AS o JOIN t1 AS shadow ON o.a = shadow.a "
+         "WHERE o.b NOT IN (SELECT shadow.b FROM t1 AS shadow WHERE shadow.a = o.a)",
+         "CorrelatedNotInToNullAwareAntiJoinRule",
+         "membership=col(o.b) = col(__not_in_value_0)"},
         {"SELECT a FROM t WHERE EXISTS (SELECT t1.b FROM t1 WHERE t1.a = t.a AND t1.b > 10)",
          "CorrelatedExistsToSemiJoinRule", "Filter[col(t1.b) > lit(10)]"},
     };
@@ -765,7 +821,15 @@ void assert_correlated_subquery_decorrelation_rules_and_guards() {
         "SELECT a FROM t WHERE EXISTS (SELECT t1.a FROM t1 JOIN t2 ON t1.a = t2.a AND t2.a = t.a)",
         "SELECT a FROM t WHERE EXISTS (SELECT t1.a FROM t1 ORDER BY t.a LIMIT 1)",
         "SELECT a FROM t WHERE EXISTS (SELECT MAX(t1.b) FROM t1 WHERE t1.a = t.a)",
-        "SELECT a FROM t WHERE a NOT IN (SELECT t1.a FROM t1 WHERE t1.a = t.a)",
+        "SELECT b FROM t WHERE b NOT IN (SELECT t1.b FROM t1 WHERE t1.a > t.a)",
+        "SELECT b FROM t WHERE b NOT IN (SELECT t1.b FROM t1 WHERE t1.a = t.a OR t1.b = 999)",
+        "SELECT b FROM t WHERE b NOT IN (SELECT t.a FROM t1)",
+        "SELECT b FROM t WHERE b NOT IN (SELECT MAX(t.a) FROM t1)",
+        "SELECT b FROM t WHERE b NOT IN (SELECT MAX(t1.b) FROM t1 GROUP BY t1.a HAVING t1.a = t.a)",
+        "SELECT b FROM t WHERE b NOT IN (SELECT t1.b FROM t1 JOIN t2 ON t1.a = t2.a AND t2.a = t.a)",
+        "SELECT b FROM t WHERE b NOT IN (SELECT t1.b FROM t1 WHERE t1.a = t.a ORDER BY t1.b LIMIT 1)",
+        "SELECT b FROM t WHERE b NOT IN (SELECT t1.b FROM t1 WHERE t1.a = t.a AND "
+        "t1.b = (SELECT MAX(t2.a) FROM t2))",
     };
     for (const auto& sql_text : blocked_sqls) {
         const auto logical = sql::bind_select(sql::parse_select(sql_text), catalog);
@@ -776,11 +840,15 @@ void assert_correlated_subquery_decorrelation_rules_and_guards() {
         const auto fired = trace_contains(explored.fired_rules, "CorrelatedExistsToSemiJoinRule") ||
                            trace_contains(explored.fired_rules, "CorrelatedNotExistsToAntiJoinRule") ||
                            trace_contains(explored.fired_rules, "CorrelatedInToSemiJoinRule") ||
+                           trace_contains(explored.fired_rules,
+                                          "CorrelatedNotInToNullAwareAntiJoinRule") ||
                            trace_contains(explored.fired_rules, "ExistsToSemiJoinRule") ||
                            trace_contains(explored.fired_rules, "NotExistsToAntiJoinRule") ||
-                           trace_contains(explored.fired_rules, "InToSemiJoinRule");
+                           trace_contains(explored.fired_rules, "InToSemiJoinRule") ||
+                           trace_contains(explored.fired_rules, "NotInToNullAwareAntiJoinRule");
         if (fired || contains_plan_text(alternatives.plans, "SemiJoin[") ||
-            contains_plan_text(alternatives.plans, "AntiJoin[")) {
+            contains_plan_text(alternatives.plans, "AntiJoin[") ||
+            contains_plan_text(alternatives.plans, "NullAwareAntiJoin[")) {
             std::cerr << "blocked correlated shape was decorrelated\n"
                       << "sql: " << sql_text << "\nmemo dump:\n" << memo.dump();
             std::terminate();
@@ -905,17 +973,71 @@ void assert_semi_anti_join_kinds_are_distinct_memo_identity() {
         {}, plan::LogicalPlan::scan("t1"), plan::LogicalPlan::scan("t2"), plan::JoinKind::Semi);
     const auto anti = plan::LogicalPlan::join(
         {}, plan::LogicalPlan::scan("t1"), plan::LogicalPlan::scan("t2"), plan::JoinKind::Anti);
+    const auto null_aware = plan::LogicalPlan::null_aware_anti(
+        membership_equality("t1", "a", "t2", "a"),
+        plan::LogicalPlan::scan("t1"),
+        plan::LogicalPlan::scan("t2"));
 
     optimizer::Memo memo;
     const auto semi_root = memo.insert(semi);
     const auto anti_root = memo.insert(anti);
+    const auto null_aware_root = memo.insert(null_aware);
     assert(semi_root != anti_root);
-    assert(memo.group_count() == 4);
+    assert(semi_root != null_aware_root);
+    assert(anti_root != null_aware_root);
+    assert(memo.group_count() == 5);
     assert(memo.extract(semi_root).join_kind == plan::JoinKind::Semi);
     assert(memo.extract(anti_root).join_kind == plan::JoinKind::Anti);
+    assert(memo.extract(null_aware_root).join_kind == plan::JoinKind::NullAwareAnti);
     const auto dump = memo.dump();
     assert(dump.find("SemiJoin[]") != std::string::npos);
     assert(dump.find("AntiJoin[]") != std::string::npos);
+    assert(dump.find("NullAwareAntiJoin[") != std::string::npos);
+    memo.assert_invariants();
+}
+
+plan::BoundPredicate membership_equality(std::string left_binding,
+                                         std::string left_column,
+                                         std::string right_binding,
+                                         std::string right_column) {
+    return plan::BoundPredicate::comparison_expr(plan::BoundComparisonExpr{
+        plan::BoundColumnRef{std::move(left_binding), std::move(left_column), 0},
+        sql::ComparisonOp::Equal,
+        plan::BoundColumnRef{std::move(right_binding), std::move(right_column), 0},
+        0,
+    });
+}
+
+void assert_null_aware_membership_is_structural_memo_identity() {
+    const auto first = plan::LogicalPlan::null_aware_anti(
+        membership_equality("t1", "a", "t2", "a"),
+        plan::LogicalPlan::scan("t1"),
+        plan::LogicalPlan::scan("t2"));
+    const auto second = plan::LogicalPlan::null_aware_anti(
+        membership_equality("t1", "b", "t2", "c"),
+        plan::LogicalPlan::scan("t1"),
+        plan::LogicalPlan::scan("t2"));
+
+    optimizer::Memo memo;
+    const auto first_root = memo.insert(first);
+    const auto second_root = memo.insert(second);
+    assert(first_root != second_root);
+    assert(memo.group_count() == 4);
+    const auto first_extracted = memo.extract(first_root);
+    const auto second_extracted = memo.extract(second_root);
+    assert(first_extracted.join_kind == plan::JoinKind::NullAwareAnti);
+    assert(first_extracted.null_aware_predicate.has_value());
+    assert(second_extracted.null_aware_predicate.has_value());
+    assert(plan::to_string(first_extracted) == plan::to_string(first));
+    assert(plan::to_string(second_extracted) == plan::to_string(second));
+    const auto alternatives = memo.extract_alternatives(first_root);
+    assert(alternatives.plans.size() == 1);
+    assert(plan::to_string(alternatives.plans.front()) == plan::to_string(first));
+    const auto dump = memo.dump();
+    assert(dump.find("NullAwareAntiJoin[candidates=[], membership=col(t1.a) = col(t2.a)]") !=
+           std::string::npos);
+    assert(dump.find("NullAwareAntiJoin[candidates=[], membership=col(t1.b) = col(t2.c)]") !=
+           std::string::npos);
     memo.assert_invariants();
 }
 
@@ -1150,6 +1272,7 @@ int main() {
     assert_filter_through_aggregate_pushes_only_group_keys();
     assert_filter_through_aggregate_moves_group_key_or_but_pins_aggregate_or();
     assert_semi_anti_join_kinds_are_distinct_memo_identity();
+    assert_null_aware_membership_is_structural_memo_identity();
     assert_top_level_subquery_decorrelation_rules_and_guards();
     assert_correlated_subquery_decorrelation_rules_and_guards();
     assert_subquery_subplans_are_structural_but_opaque_memo_fields();

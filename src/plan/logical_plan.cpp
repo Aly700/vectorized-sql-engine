@@ -146,6 +146,8 @@ std::string join_kind_to_string(JoinKind kind) {
         return "SemiJoin";
     case JoinKind::Anti:
         return "AntiJoin";
+    case JoinKind::NullAwareAnti:
+        return "NullAwareAntiJoin";
     }
     throw std::logic_error("unreachable join kind");
 }
@@ -262,17 +264,37 @@ void append_plan(std::ostringstream& out,
         return;
     case LogicalKind::Join: {
         out << join_kind_to_string(logical.join_kind) << "[";
-        for (std::size_t i = 0; i < logical.predicates.size(); ++i) {
-            if (i != 0) {
-                out << " AND ";
+        if (logical.join_kind == JoinKind::NullAwareAnti) {
+            if (!logical.null_aware_predicate.has_value()) {
+                throw std::invalid_argument("NullAwareAnti join is missing its membership equality");
             }
-            out << predicate_to_string(logical.predicates[i]);
+            out << "candidates=[";
+            for (std::size_t i = 0; i < logical.predicates.size(); ++i) {
+                if (i != 0) {
+                    out << " AND ";
+                }
+                out << predicate_to_string(logical.predicates[i]);
+            }
+            out << "], membership=" << predicate_to_string(*logical.null_aware_predicate);
+        } else {
+            if (logical.null_aware_predicate.has_value()) {
+                throw std::invalid_argument("non-NullAwareAnti join owns a membership equality");
+            }
+            for (std::size_t i = 0; i < logical.predicates.size(); ++i) {
+                if (i != 0) {
+                    out << " AND ";
+                }
+                out << predicate_to_string(logical.predicates[i]);
+            }
         }
         out << "]";
         append_annotation(out, logical, annotation);
         std::vector<OwnedSubplan> subplans;
         for (const auto& predicate : logical.predicates) {
             collect_predicate_subplans(predicate, subplans);
+        }
+        if (logical.null_aware_predicate.has_value()) {
+            collect_predicate_subplans(*logical.null_aware_predicate, subplans);
         }
         append_owned_subplans(out, subplans, depth + 1, annotation);
         out << "\n";

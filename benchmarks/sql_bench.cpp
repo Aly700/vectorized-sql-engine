@@ -324,6 +324,22 @@ plan::LogicalPlan bind_decorrelated_semi_query(const execution::Catalog& catalog
     throw std::logic_error("benchmark IN query did not produce a SemiJoin alternative");
 }
 
+plan::LogicalPlan bind_best_null_aware_anti_query(const execution::Catalog& catalog,
+                                                  const std::string& sql) {
+    const auto logical = bind_query(catalog, sql);
+    optimizer::Memo memo;
+    const auto root = memo.insert(logical);
+    const auto explored = optimizer::explore_memo_to_fixpoint(memo, optimizer::default_memo_rules());
+    if (!explored.reached_fixpoint) {
+        throw std::logic_error("benchmark NULL-aware anti memo exploration did not reach fixpoint");
+    }
+    const auto best = memo.extract_best(root, catalog);
+    if (plan::to_string(best).find("NullAwareAntiJoin[") == std::string::npos) {
+        throw std::logic_error("benchmark NOT IN query did not choose its NullAwareAnti alternative");
+    }
+    return best;
+}
+
 std::vector<Workload> make_workloads(const execution::Catalog& catalog) {
     std::vector<Workload> workloads;
     auto add = [&](std::string name, std::string rows, std::string sql) {
@@ -351,6 +367,16 @@ std::vector<Workload> make_workloads(const execution::Catalog& catalog) {
                                      "outer=100000,subquery_source=256,subquery_rows=1",
                                      sql,
                                      bind_decorrelated_semi_query(catalog, sql)});
+    }
+    {
+        const std::string sql =
+            "SELECT l.payload AS payload FROM join_left AS l WHERE l.k1 NOT IN ("
+            "SELECT r.k1 FROM join_right AS r "
+            "WHERE r.k2 = l.k2 AND r.payload < 10016)";
+        workloads.push_back(Workload{"selective_not_in_null_aware_anti",
+                                     "outer=100000,right_source=256,right_rows=16,survivors=93744",
+                                     sql,
+                                     bind_best_null_aware_anti_query(catalog, sql)});
     }
     add("aggregate_few_groups",
         "fact=200000,groups=8",

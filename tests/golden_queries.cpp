@@ -708,6 +708,22 @@ int main() {
             ExpectedResult{{"a"}, {{3}, {4}}},
         },
         GoldenQuery{
+            "NOT IN rejects NULL left values for a nonempty NULL-free set",
+            "SELECT k FROM nullable WHERE k NOT IN (SELECT a FROM t1)",
+            ExpectedResult{{"k"}, {}},
+        },
+        GoldenQuery{
+            "NOT IN right duplicates do not change membership truth",
+            "SELECT a FROM t WHERE a NOT IN (SELECT k FROM dup)",
+            ExpectedResult{{"a"}, {{3}, {4}}},
+        },
+        GoldenQuery{
+            "string NOT IN uses typed NULL-aware membership",
+            "SELECT k, v FROM string_left WHERE k NOT IN "
+            "(SELECT k FROM string_right WHERE k IS NOT NULL)",
+            ExpectedResult{{"k", "v"}, {{"b", 3}}},
+        },
+        GoldenQuery{
             "EXISTS ignores row NULLs",
             "SELECT a FROM t WHERE EXISTS (SELECT k FROM nullable WHERE k IS NULL)",
             ExpectedResult{{"a"}, {{1}, {2}, {3}, {4}}},
@@ -840,9 +856,61 @@ int main() {
             ExpectedResult{{"a"}, {{1}}},
         },
         GoldenQuery{
-            "correlated NOT IN remains materialized for null-aware future work",
+            "correlated NOT IN separates NULL-bearing and empty per-key sets",
             "SELECT a FROM t WHERE b NOT IN (SELECT v FROM nullable WHERE nullable.k = t.a)",
             ExpectedResult{{"a"}, {{3}, {4}}},
+        },
+        GoldenQuery{
+            "correlated NOT IN treats NULL correlation keys as empty candidate sets",
+            "SELECT l.k, l.v FROM nullable AS l WHERE l.v NOT IN "
+            "(SELECT r.v FROM nullable AS r WHERE r.k = l.k)",
+            ExpectedResult{{"l.k", "l.v"}, {{std::nullopt, 20}, {std::nullopt, 30}}},
+        },
+        GoldenQuery{
+            "correlated empty candidate set keeps a NULL membership value",
+            "SELECT l.k, l.v FROM nullable AS l WHERE l.v NOT IN "
+            "(SELECT r.v FROM nullable AS r WHERE r.k = l.k AND r.v IS NOT NULL)",
+            ExpectedResult{{"l.k", "l.v"},
+                           {{std::nullopt, 20}, {2, std::nullopt}, {std::nullopt, 30}}},
+        },
+        GoldenQuery{
+            "correlated NOT IN keeps NULL-free nonmatches and empty groups",
+            "SELECT a FROM t WHERE c NOT IN (SELECT t1.b FROM t1 WHERE t1.a = t.a)",
+            ExpectedResult{{"a"}, {{1}, {2}, {3}, {4}}},
+        },
+        GoldenQuery{
+            "NOT IN filters joined left input without changing join order",
+            "SELECT t1.b, t2.c FROM t1 JOIN t2 ON t1.a = t2.a "
+            "WHERE t2.c NOT IN (SELECT c FROM t3 WHERE d = 1)",
+            ExpectedResult{{"t1.b", "t2.c"}, {{20, 201}, {30, 201}}},
+        },
+        GoldenQuery{
+            "NOT IN right subplan may contain a join and duplicates",
+            "SELECT a FROM t WHERE a NOT IN "
+            "(SELECT t1.a FROM t1 JOIN t2 ON t1.a = t2.a)",
+            ExpectedResult{{"a"}, {{1}, {3}, {4}}},
+        },
+        GoldenQuery{
+            "NOT IN before GROUP BY feeds only surviving rows",
+            "SELECT b, COUNT(*) FROM t WHERE a NOT IN (SELECT a FROM t1) GROUP BY b",
+            ExpectedResult{{"b", "COUNT(*)"}, {{20, 1}, {40, 1}}},
+        },
+        GoldenQuery{
+            "NOT IN in HAVING filters complete groups",
+            "SELECT a, COUNT(*) FROM t GROUP BY a HAVING a NOT IN (SELECT a FROM t1)",
+            ExpectedResult{{"a", "COUNT(*)"}, {{3, 1}, {4, 1}}},
+        },
+        GoldenQuery{
+            "NOT IN input to window preserves survivor order",
+            "SELECT a, ROW_NUMBER() OVER () AS rn FROM t "
+            "WHERE a NOT IN (SELECT a FROM t1)",
+            ExpectedResult{{"a", "rn"}, {{3, 1}, {4, 2}}},
+        },
+        GoldenQuery{
+            "NOT IN right subplan may contain a window",
+            "SELECT a FROM t WHERE a NOT IN "
+            "(SELECT ROW_NUMBER() OVER (ORDER BY a) FROM t1)",
+            ExpectedResult{{"a"}, {{4}}},
         },
         GoldenQuery{
             "projected NULL literal uses literal output name",
@@ -1282,7 +1350,7 @@ int main() {
             }),
         },
         GoldenQuery{
-            "EXPLAIN NOT IN remains materialized",
+            "EXPLAIN NOT IN explores null-aware anti while cost retains materialization",
             "EXPLAIN SELECT a FROM t WHERE a NOT IN (SELECT a FROM t1)",
             explain_result({
                 "EXPLAIN",
@@ -1294,10 +1362,11 @@ int main() {
                 "          Scan[t1]",
                 "      Scan[t]",
                 "memo exploration:",
-                "  groups: 3",
-                "  iterations: 0",
+                "  groups: 6",
+                "  iterations: 1",
                 "  reached_fixpoint: yes",
-                "  fired rules: <none>",
+                "  fired rules:",
+                "    0: NotInToNullAwareAntiJoinRule",
                 "chosen plan:",
                 "  Project[a=col(t.a)] rows=3.60 cost=11.00",
                 "    Filter[col(t.a) NOT IN subquery(IN subquery at position 36)] rows=3.60 cost=11.00",
@@ -1306,6 +1375,36 @@ int main() {
                 "          Scan[t1] rows=3.00 cost=3.00",
                 "      Scan[t] rows=4.00 cost=4.00",
                 "total cost: 11.00",
+            }),
+        },
+        GoldenQuery{
+            "EXPLAIN correlated NOT IN chooses grouped null-aware anti",
+            "EXPLAIN SELECT big.k FROM big WHERE big.k NOT IN "
+            "(SELECT tiny.k FROM tiny WHERE tiny.k = big.k)",
+            explain_result({
+                "EXPLAIN",
+                "bound logical plan:",
+                "  Project[big.k=col(big.k)]",
+                "    Filter[col(big.k) NOT IN subquery(IN subquery at position 46)]",
+                "      Subquery[IN subquery at position 46 correlation=[outer(1):col(big.k)]]",
+                "        Project[tiny.k=col(tiny.k)]",
+                "          Filter[col(tiny.k) = col(big.k)]",
+                "            Scan[tiny]",
+                "      Scan[big]",
+                "memo exploration:",
+                "  groups: 6",
+                "  iterations: 1",
+                "  reached_fixpoint: yes",
+                "  fired rules:",
+                "    0: CorrelatedNotInToNullAwareAntiJoinRule",
+                "chosen plan:",
+                "  Project[big.k=col(big.k)] rows=500.00 cost=2004.00",
+                "    NullAwareAntiJoin[candidates=[col(big.k) = col(__corr_key_0)], "
+                "membership=col(big.k) = col(tiny.k)] rows=500.00 cost=2004.00",
+                "      Scan[big] rows=1000.00 cost=1000.00",
+                "      Project[tiny.k=col(tiny.k), __corr_key_0=col(tiny.k)] rows=2.00 cost=2.00",
+                "        Scan[tiny] rows=2.00 cost=2.00",
+                "total cost: 2004.00",
             }),
         },
         GoldenQuery{

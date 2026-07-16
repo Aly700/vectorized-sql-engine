@@ -85,9 +85,14 @@ struct ComparisonStats {
     std::size_t exists_to_semi_firings{0};
     std::size_t not_exists_to_anti_firings{0};
     std::size_t in_to_semi_firings{0};
+    std::size_t not_in_to_null_aware_anti_firings{0};
     std::size_t correlated_exists_to_semi_firings{0};
     std::size_t correlated_not_exists_to_anti_firings{0};
     std::size_t correlated_in_to_semi_firings{0};
+    std::size_t correlated_not_in_to_null_aware_anti_firings{0};
+    std::size_t null_aware_anti_execution_paths{0};
+    std::size_t null_aware_empty_right_paths{0};
+    std::size_t null_aware_null_bearing_right_paths{0};
     std::size_t residual_correlated_guard_paths{0};
     std::size_t left_join_to_inner_firings{0};
     std::size_t join_commute_firings{0};
@@ -399,6 +404,16 @@ inline bool contains_join(const plan::LogicalPlan& logical) {
     throw std::logic_error("unreachable logical plan kind");
 }
 
+inline bool contains_null_aware_anti(const plan::LogicalPlan& logical) {
+    if (logical.kind == plan::LogicalKind::Join &&
+        logical.join_kind == plan::JoinKind::NullAwareAnti) {
+        return true;
+    }
+    return (logical.input != nullptr && contains_null_aware_anti(*logical.input)) ||
+           (logical.left != nullptr && contains_null_aware_anti(*logical.left)) ||
+           (logical.right != nullptr && contains_null_aware_anti(*logical.right));
+}
+
 inline std::size_t join_keyword_count(const std::string& sql) {
     std::size_t count = 0;
     std::size_t pos = 0;
@@ -634,12 +649,18 @@ inline bool compare_engines(const std::string& sql,
                 std::count(explored.fired_rules.begin(), explored.fired_rules.end(), "NotExistsToAntiJoinRule");
             stats->in_to_semi_firings =
                 std::count(explored.fired_rules.begin(), explored.fired_rules.end(), "InToSemiJoinRule");
+            stats->not_in_to_null_aware_anti_firings = std::count(
+                explored.fired_rules.begin(), explored.fired_rules.end(), "NotInToNullAwareAntiJoinRule");
             stats->correlated_exists_to_semi_firings = std::count(
                 explored.fired_rules.begin(), explored.fired_rules.end(), "CorrelatedExistsToSemiJoinRule");
             stats->correlated_not_exists_to_anti_firings = std::count(
                 explored.fired_rules.begin(), explored.fired_rules.end(), "CorrelatedNotExistsToAntiJoinRule");
             stats->correlated_in_to_semi_firings = std::count(
                 explored.fired_rules.begin(), explored.fired_rules.end(), "CorrelatedInToSemiJoinRule");
+            stats->correlated_not_in_to_null_aware_anti_firings = std::count(
+                explored.fired_rules.begin(),
+                explored.fired_rules.end(),
+                "CorrelatedNotInToNullAwareAntiJoinRule");
             stats->join_commute_firings =
                 std::count(explored.fired_rules.begin(), explored.fired_rules.end(), "JoinCommuteRule");
             stats->join_associate_firings =
@@ -692,6 +713,9 @@ inline bool compare_engines(const std::string& sql,
                 path_label + " vectorized",
                 [&] { return execution::execute_vectorized(candidate_plan, catalog); },
                 stats);
+            if (stats != nullptr && contains_null_aware_anti(candidate_plan)) {
+                stats->null_aware_anti_execution_paths += 2;
+            }
             if (!unrewritten_oracle.batch.has_value()) {
                 return verify_error_pair(unrewritten_oracle,
                                          candidate_oracle,
