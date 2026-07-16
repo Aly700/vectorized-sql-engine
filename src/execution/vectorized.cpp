@@ -1646,6 +1646,103 @@ storage::ColumnarBatch execute_hash_existence_join(const BatchView& left,
     return materialize_left_join_rows(left, output_rows);
 }
 
+storage::ColumnarBatch execute_nested_loop_null_aware_anti_join(
+    const BatchView& left,
+    const BatchView& right,
+    const std::vector<plan::BoundPredicate>& candidate_predicates,
+    const plan::BoundPredicate& membership_predicate,
+    const ExecutionContext& context) {
+    const auto compiled_candidates =
+        compile_join_predicates(candidate_predicates, *left.batch, *right.batch, context);
+    const auto compiled_membership =
+        compile_join_predicate(membership_predicate, *left.batch, *right.batch, context);
+    SelectionVector output_rows;
+    output_rows.reserve(left.selection->size());
+    for (const auto left_row : *left.selection) {
+        bool suppressed = false;
+        for (const auto right_row : *right.selection) {
+            if (evaluate_join_predicates(compiled_candidates, left_row, right_row) != TruthValue::True) {
+                continue;
+            }
+            if (evaluate_join_predicate(compiled_membership, left_row, right_row) != TruthValue::False) {
+                suppressed = true;
+                break;
+            }
+        }
+        if (!suppressed) {
+            output_rows.push_back(left_row);
+        }
+    }
+    return materialize_left_join_rows(left, output_rows);
+}
+
+storage::ColumnarBatch execute_hash_null_aware_anti_join(
+    const BatchView& left,
+    const BatchView& right,
+    const JoinPredicateSplit& candidate_predicates,
+    const EquiJoinKey& membership_key) {
+    std::vector<plan::BoundColumnRef> left_candidate_columns;
+    std::vector<plan::BoundColumnRef> right_candidate_columns;
+    left_candidate_columns.reserve(candidate_predicates.equi_keys.size());
+    right_candidate_columns.reserve(candidate_predicates.equi_keys.size());
+    for (const auto& key : candidate_predicates.equi_keys) {
+        left_candidate_columns.push_back(key.left);
+        right_candidate_columns.push_back(key.right);
+    }
+    const auto compiled_left_candidates = compile_columns(left_candidate_columns, *left.batch);
+    const auto compiled_right_candidates = compile_columns(right_candidate_columns, *right.batch);
+    const auto compiled_left_membership = compile_column(membership_key.left, *left.batch);
+    const auto compiled_right_membership = compile_column(membership_key.right, *right.batch);
+    if (compiled_left_membership.type != compiled_right_membership.type) {
+        throw std::logic_error("NullAwareAnti membership equality has mismatched types");
+    }
+
+    // Lookup-only buckets represent C(l). NULL candidate keys cannot satisfy
+    // a correlation equality and therefore never enter a bucket.
+    std::unordered_map<HashKey, MaterializedValueSet, HashKeyHash> buckets;
+    for (const auto right_row : *right.selection) {
+        auto key = make_non_null_key(right_row, compiled_right_candidates);
+        if (!key.has_value()) {
+            continue;
+        }
+        auto [bucket_it, inserted] = buckets.try_emplace(*key);
+        auto& bucket = bucket_it->second;
+        if (inserted) {
+            bucket.type = compiled_right_membership.type;
+        }
+        bucket.is_empty = false;
+        const auto value = compiled_right_membership.cell(right_row);
+        if (value.is_null) {
+            bucket.has_null = true;
+        } else if (value.type == catalog::ColumnType::Int64) {
+            bucket.int_values.insert(value.int_value);
+        } else {
+            bucket.string_values.insert(value.string_value);
+        }
+    }
+
+    SelectionVector output_rows;
+    output_rows.reserve(left.selection->size());
+    for (const auto left_row : *left.selection) {
+        const auto key = make_non_null_key(left_row, compiled_left_candidates);
+        if (!key.has_value()) {
+            output_rows.push_back(left_row);
+            continue;
+        }
+        const auto bucket = buckets.find(*key);
+        if (bucket == buckets.end()) {
+            output_rows.push_back(left_row);
+            continue;
+        }
+        const auto membership = compiled_left_membership.cell(left_row);
+        if (bucket->second.has_null || membership.is_null || bucket->second.contains(membership)) {
+            continue;
+        }
+        output_rows.push_back(left_row);
+    }
+    return materialize_left_join_rows(left, output_rows);
+}
+
 template <bool EmitUnmatchedLeft>
 storage::ColumnarBatch execute_nested_loop_join(const BatchView& left,
                                                 const BatchView& right,
@@ -1823,13 +1920,50 @@ BatchView execute_filter(const plan::PhysicalPlan& plan, ExecutionContext& conte
 }
 
 BatchView execute_join(const plan::PhysicalPlan& plan, ExecutionContext& context) {
-    auto left = execute_to_view(require_left(plan), context);
-    auto right = execute_to_view(require_right(plan), context);
+    const auto is_null_aware = plan.join_kind == plan::JoinKind::NullAwareAnti;
+    if (is_null_aware != plan.null_aware_predicate.has_value()) {
+        throw std::invalid_argument(
+            is_null_aware ? "NullAwareAnti join is missing its membership equality"
+                          : "non-NullAwareAnti join owns a membership equality");
+    }
+    if (is_null_aware &&
+        (plan.null_aware_predicate->kind != sql::PredicateKind::Comparison ||
+         plan.null_aware_predicate->comparison.op != sql::ComparisonOp::Equal)) {
+        throw std::invalid_argument("NullAwareAnti membership predicate must be an equality");
+    }
+    if (is_null_aware &&
+        plan.null_aware_predicate->comparison.left.type !=
+            plan.null_aware_predicate->comparison.right.type) {
+        throw std::invalid_argument("NullAwareAnti membership equality must have matching types");
+    }
+
+    auto inputs = [&] {
+        if (is_null_aware) {
+            auto right = execute_to_view(require_right(plan), context);
+            auto left = execute_to_view(require_left(plan), context);
+            return std::pair{std::move(left), std::move(right)};
+        }
+        auto left = execute_to_view(require_left(plan), context);
+        auto right = execute_to_view(require_right(plan), context);
+        return std::pair{std::move(left), std::move(right)};
+    }();
+    auto& left = inputs.first;
+    auto& right = inputs.second;
     validate_view(left);
     validate_view(right);
 
     const auto predicates = split_join_predicates(plan.predicates, *left.batch, *right.batch);
     const auto materialized_batch = [&] {
+        if (is_null_aware) {
+            JoinPredicateSplit membership;
+            const auto hashable_membership =
+                try_add_equi_key(*plan.null_aware_predicate, *left.batch, *right.batch, membership);
+            if (hashable_membership && predicates.residuals.empty() && membership.equi_keys.size() == 1) {
+                return execute_hash_null_aware_anti_join(left, right, predicates, membership.equi_keys.front());
+            }
+            return execute_nested_loop_null_aware_anti_join(
+                left, right, plan.predicates, *plan.null_aware_predicate, context);
+        }
         if (plan.join_kind == plan::JoinKind::Semi) {
             return predicates.equi_keys.empty()
                        ? execute_nested_loop_existence_join<true>(left, right, predicates.residuals, context)
@@ -2487,6 +2621,10 @@ bool plan_requires_typed_dispatch(const plan::PhysicalPlan& plan, const Catalog&
             return true;
         }
     }
+    if (plan.null_aware_predicate.has_value() &&
+        predicate_requires_typed_dispatch(*plan.null_aware_predicate)) {
+        return true;
+    }
 
     switch (plan.kind) {
     case plan::PhysicalKind::Scan:
@@ -2622,6 +2760,9 @@ void prepare_owned_expressions(const Plan& plan, ExecutionContext& context) {
     for (const auto& predicate : plan.predicates) {
         prepare_predicate_subqueries(predicate, context);
     }
+    if (plan.null_aware_predicate.has_value()) {
+        prepare_predicate_subqueries(*plan.null_aware_predicate, context);
+    }
 }
 
 void prepare_subqueries(const plan::LogicalPlan& plan, ExecutionContext& context) {
@@ -2629,11 +2770,20 @@ void prepare_subqueries(const plan::LogicalPlan& plan, ExecutionContext& context
     if (plan.input != nullptr) {
         prepare_subqueries(*plan.input, context);
     }
-    if (plan.left != nullptr) {
-        prepare_subqueries(*plan.left, context);
-    }
-    if (plan.right != nullptr) {
-        prepare_subqueries(*plan.right, context);
+    if (plan.join_kind == plan::JoinKind::NullAwareAnti) {
+        if (plan.right != nullptr) {
+            prepare_subqueries(*plan.right, context);
+        }
+        if (plan.left != nullptr) {
+            prepare_subqueries(*plan.left, context);
+        }
+    } else {
+        if (plan.left != nullptr) {
+            prepare_subqueries(*plan.left, context);
+        }
+        if (plan.right != nullptr) {
+            prepare_subqueries(*plan.right, context);
+        }
     }
 }
 
@@ -2642,11 +2792,20 @@ void prepare_subqueries(const plan::PhysicalPlan& plan, ExecutionContext& contex
     if (plan.input != nullptr) {
         prepare_subqueries(*plan.input, context);
     }
-    if (plan.left != nullptr) {
-        prepare_subqueries(*plan.left, context);
-    }
-    if (plan.right != nullptr) {
-        prepare_subqueries(*plan.right, context);
+    if (plan.join_kind == plan::JoinKind::NullAwareAnti) {
+        if (plan.right != nullptr) {
+            prepare_subqueries(*plan.right, context);
+        }
+        if (plan.left != nullptr) {
+            prepare_subqueries(*plan.left, context);
+        }
+    } else {
+        if (plan.left != nullptr) {
+            prepare_subqueries(*plan.left, context);
+        }
+        if (plan.right != nullptr) {
+            prepare_subqueries(*plan.right, context);
+        }
     }
 }
 

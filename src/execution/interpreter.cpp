@@ -765,14 +765,28 @@ void prepare_subqueries(const plan::LogicalPlan& plan, ExecutionContext& context
     for (const auto& predicate : plan.predicates) {
         prepare_predicate_subqueries(predicate, context);
     }
+    if (plan.null_aware_predicate.has_value()) {
+        prepare_predicate_subqueries(*plan.null_aware_predicate, context);
+    }
     if (plan.input != nullptr) {
         prepare_subqueries(*plan.input, context);
     }
-    if (plan.left != nullptr) {
-        prepare_subqueries(*plan.left, context);
-    }
-    if (plan.right != nullptr) {
-        prepare_subqueries(*plan.right, context);
+    if (plan.join_kind == plan::JoinKind::NullAwareAnti) {
+        // The equivalent materialized NOT IN owner prepares its right subplan
+        // before descending into the outer relational input.
+        if (plan.right != nullptr) {
+            prepare_subqueries(*plan.right, context);
+        }
+        if (plan.left != nullptr) {
+            prepare_subqueries(*plan.left, context);
+        }
+    } else {
+        if (plan.left != nullptr) {
+            prepare_subqueries(*plan.left, context);
+        }
+        if (plan.right != nullptr) {
+            prepare_subqueries(*plan.right, context);
+        }
     }
 }
 
@@ -901,8 +915,38 @@ TruthValue evaluate_join_predicates(const std::vector<plan::BoundPredicate>& pre
 }
 
 storage::ColumnarBatch execute_join(const plan::LogicalPlan& plan, ExecutionContext& context) {
-    const auto left = execute_node(require_left(plan), context);
-    const auto right = execute_node(require_right(plan), context);
+    const auto is_null_aware = plan.join_kind == plan::JoinKind::NullAwareAnti;
+    if (is_null_aware != plan.null_aware_predicate.has_value()) {
+        throw std::invalid_argument(
+            is_null_aware ? "NullAwareAnti join is missing its membership equality"
+                          : "non-NullAwareAnti join owns a membership equality");
+    }
+    if (is_null_aware &&
+        (plan.null_aware_predicate->kind != sql::PredicateKind::Comparison ||
+         plan.null_aware_predicate->comparison.op != sql::ComparisonOp::Equal)) {
+        throw std::invalid_argument("NullAwareAnti membership predicate must be an equality");
+    }
+    if (is_null_aware &&
+        plan.null_aware_predicate->comparison.left.type !=
+            plan.null_aware_predicate->comparison.right.type) {
+        throw std::invalid_argument("NullAwareAnti membership equality must have matching types");
+    }
+
+    const auto inputs = [&] {
+        if (is_null_aware) {
+            // Materialized NOT IN prepares its uncorrelated right subplan
+            // eagerly. Preserve that error order while retaining left-major
+            // row production.
+            auto right = execute_node(require_right(plan), context);
+            auto left = execute_node(require_left(plan), context);
+            return std::pair{std::move(left), std::move(right)};
+        }
+        auto left = execute_node(require_left(plan), context);
+        auto right = execute_node(require_right(plan), context);
+        return std::pair{std::move(left), std::move(right)};
+    }();
+    const auto& left = inputs.first;
+    const auto& right = inputs.second;
 
     std::vector<std::string> output_names = left.column_names();
     const auto emits_right_columns =
@@ -934,31 +978,57 @@ storage::ColumnarBatch execute_join(const plan::LogicalPlan& plan, ExecutionCont
         }
     };
 
+    // NullAwareAnti is the NOT IN 3VL oracle. Candidate predicates select C(l)
+    // using TRUE-only filtering. Any TRUE or UNKNOWN membership equality then
+    // suppresses l; an empty C(l), or an all-FALSE C(l), emits it.
+    if (is_null_aware) {
+        for (std::size_t left_row = 0; left_row < left.row_count(); ++left_row) {
+            bool suppressed = false;
+            for (std::size_t right_row = 0; right_row < right.row_count(); ++right_row) {
+                if (evaluate_join_predicates(plan.predicates, left, left_row, right, right_row, context) !=
+                    TruthValue::True) {
+                    continue;
+                }
+                if (evaluate_join_predicate(
+                        *plan.null_aware_predicate, left, left_row, right, right_row, context) !=
+                    TruthValue::False) {
+                    suppressed = true;
+                    break;
+                }
+            }
+            if (!suppressed) {
+                append_output_row(left_row, std::nullopt);
+            }
+        }
+    }
+
     // Join order is part of the oracle contract: for each preserved left row
     // in input order, scan every right row in input order. LEFT JOIN emits one
     // NULL-extended row only when no right row's ON predicates are TRUE.
-    for (std::size_t left_row = 0; left_row < left.row_count(); ++left_row) {
-        bool matched = false;
-        for (std::size_t right_row = 0; right_row < right.row_count(); ++right_row) {
-            if (evaluate_join_predicates(plan.predicates, left, left_row, right, right_row, context) !=
-                TruthValue::True) {
-                continue;
-            }
+    if (!is_null_aware) {
+        for (std::size_t left_row = 0; left_row < left.row_count(); ++left_row) {
+            bool matched = false;
+            for (std::size_t right_row = 0; right_row < right.row_count(); ++right_row) {
+                if (evaluate_join_predicates(plan.predicates, left, left_row, right, right_row, context) !=
+                    TruthValue::True) {
+                    continue;
+                }
 
-            matched = true;
-            if (plan.join_kind == plan::JoinKind::Semi) {
+                matched = true;
+                if (plan.join_kind == plan::JoinKind::Semi) {
+                    append_output_row(left_row, std::nullopt);
+                    break;
+                }
+                if (plan.join_kind == plan::JoinKind::Anti) {
+                    break;
+                }
+                append_output_row(left_row, right_row);
+            }
+            if (!matched && plan.join_kind == plan::JoinKind::Left) {
                 append_output_row(left_row, std::nullopt);
-                break;
+            } else if (!matched && plan.join_kind == plan::JoinKind::Anti) {
+                append_output_row(left_row, std::nullopt);
             }
-            if (plan.join_kind == plan::JoinKind::Anti) {
-                break;
-            }
-            append_output_row(left_row, right_row);
-        }
-        if (!matched && plan.join_kind == plan::JoinKind::Left) {
-            append_output_row(left_row, std::nullopt);
-        } else if (!matched && plan.join_kind == plan::JoinKind::Anti) {
-            append_output_row(left_row, std::nullopt);
         }
     }
 

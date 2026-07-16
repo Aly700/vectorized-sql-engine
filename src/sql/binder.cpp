@@ -930,6 +930,9 @@ void collect_plan_correlations(const plan::LogicalPlan& logical,
     for (const auto& predicate : logical.predicates) {
         collect_predicate_correlations(predicate, correlations);
     }
+    if (logical.null_aware_predicate.has_value()) {
+        collect_predicate_correlations(*logical.null_aware_predicate, correlations);
+    }
     if (logical.input != nullptr) {
         collect_plan_correlations(*logical.input, correlations);
     }

@@ -4,6 +4,8 @@
 
 #include <cstddef>
 #include <memory>
+#include <optional>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -24,6 +26,7 @@ struct PhysicalPlan {
     std::vector<WindowExpression> window_expressions;
     std::vector<SortKey> sort_keys;
     std::vector<BoundPredicate> predicates;
+    std::optional<BoundPredicate> null_aware_predicate;
     JoinKind join_kind{JoinKind::Inner};
     std::size_t limit_count{0};
     std::shared_ptr<PhysicalPlan> input;
@@ -54,10 +57,35 @@ struct PhysicalPlan {
                              PhysicalPlan left,
                              PhysicalPlan right,
                              JoinKind join_kind = JoinKind::Inner) {
+        if (join_kind == JoinKind::NullAwareAnti) {
+            throw std::invalid_argument(
+                "NullAwareAnti must be constructed with an explicit membership equality");
+        }
         PhysicalPlan p;
         p.kind = PhysicalKind::Join;
         p.join_kind = join_kind;
         p.predicates = std::move(predicates);
+        p.left = std::make_shared<PhysicalPlan>(std::move(left));
+        p.right = std::make_shared<PhysicalPlan>(std::move(right));
+        return p;
+    }
+
+    static PhysicalPlan null_aware_anti(BoundPredicate membership,
+                                        PhysicalPlan left,
+                                        PhysicalPlan right,
+                                        std::vector<BoundPredicate> candidate_predicates = {}) {
+        if (membership.kind != sql::PredicateKind::Comparison ||
+            membership.comparison.op != sql::ComparisonOp::Equal) {
+            throw std::invalid_argument("NullAwareAnti membership predicate must be an equality");
+        }
+        if (membership.comparison.left.type != membership.comparison.right.type) {
+            throw std::invalid_argument("NullAwareAnti membership equality must have matching types");
+        }
+        PhysicalPlan p;
+        p.kind = PhysicalKind::Join;
+        p.join_kind = JoinKind::NullAwareAnti;
+        p.predicates = std::move(candidate_predicates);
+        p.null_aware_predicate = std::move(membership);
         p.left = std::make_shared<PhysicalPlan>(std::move(left));
         p.right = std::make_shared<PhysicalPlan>(std::move(right));
         return p;

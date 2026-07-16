@@ -196,6 +196,10 @@ void hash_logical_plan(std::size_t& seed, const plan::LogicalPlan& logical) {
     for (const auto& predicate : logical.predicates) {
         hash_predicate(seed, predicate);
     }
+    hash_combine(seed, logical.null_aware_predicate.has_value() ? 1 : 0);
+    if (logical.null_aware_predicate.has_value()) {
+        hash_predicate(seed, *logical.null_aware_predicate);
+    }
 
     hash_logical_child(seed, logical.input);
     hash_logical_child(seed, logical.left);
@@ -238,6 +242,10 @@ std::size_t structural_hash(const MemoExpression& expression) {
     hash_combine(seed, expression.predicates.size());
     for (const auto& predicate : expression.predicates) {
         hash_predicate(seed, predicate);
+    }
+    hash_combine(seed, expression.null_aware_predicate.has_value() ? 1 : 0);
+    if (expression.null_aware_predicate.has_value()) {
+        hash_predicate(seed, *expression.null_aware_predicate);
     }
 
     hash_combine(seed, expression.limit_count);
@@ -386,6 +394,10 @@ bool logical_child_equal(const std::shared_ptr<plan::LogicalPlan>& left,
 }
 
 bool logical_plan_equal(const plan::LogicalPlan& left, const plan::LogicalPlan& right) {
+    const auto null_aware_equal =
+        left.null_aware_predicate.has_value() == right.null_aware_predicate.has_value() &&
+        (!left.null_aware_predicate.has_value() ||
+         predicate_equal(*left.null_aware_predicate, *right.null_aware_predicate));
     return left.kind == right.kind && left.order_permission == right.order_permission &&
            left.join_kind == right.join_kind && left.table == right.table && left.binding_name == right.binding_name &&
            left.limit_count == right.limit_count &&
@@ -396,11 +408,16 @@ bool logical_plan_equal(const plan::LogicalPlan& left, const plan::LogicalPlan& 
            vector_equal(left.sort_keys, right.sort_keys, sort_key_equal) &&
            vector_equal(left.correlation_columns, right.correlation_columns, column_equal) &&
            vector_equal(left.predicates, right.predicates, predicate_equal) &&
+           null_aware_equal &&
            logical_child_equal(left.input, right.input) && logical_child_equal(left.left, right.left) &&
            logical_child_equal(left.right, right.right);
 }
 
 bool structural_equal(const MemoExpression& left, const MemoExpression& right) {
+    const auto null_aware_equal =
+        left.null_aware_predicate.has_value() == right.null_aware_predicate.has_value() &&
+        (!left.null_aware_predicate.has_value() ||
+         predicate_equal(*left.null_aware_predicate, *right.null_aware_predicate));
     return left.kind == right.kind && left.order_permission == right.order_permission &&
            left.join_kind == right.join_kind && left.table == right.table && left.binding_name == right.binding_name &&
            vector_equal(left.projections, right.projections, projection_equal) &&
@@ -408,7 +425,8 @@ bool structural_equal(const MemoExpression& left, const MemoExpression& right) {
            vector_equal(left.aggregate_expressions, right.aggregate_expressions, aggregate_expression_equal) &&
            vector_equal(left.window_expressions, right.window_expressions, window_expression_equal) &&
            vector_equal(left.sort_keys, right.sort_keys, sort_key_equal) &&
-           vector_equal(left.predicates, right.predicates, predicate_equal) && left.limit_count == right.limit_count &&
+           vector_equal(left.predicates, right.predicates, predicate_equal) && null_aware_equal &&
+           left.limit_count == right.limit_count &&
            left.children == right.children;
 }
 
@@ -545,6 +563,8 @@ std::string join_kind_to_string(plan::JoinKind kind) {
         return "SemiJoin";
     case plan::JoinKind::Anti:
         return "AntiJoin";
+    case plan::JoinKind::NullAwareAnti:
+        return "NullAwareAntiJoin";
     }
     throw std::logic_error("unreachable join kind");
 }
@@ -608,7 +628,16 @@ std::string memo_expression_to_string(const MemoExpression& expression) {
         return out.str();
     case MemoExpressionKind::Join:
         out << join_kind_to_string(expression.join_kind) << "[";
-        append_predicates(out, expression.predicates);
+        if (expression.join_kind == plan::JoinKind::NullAwareAnti) {
+            if (!expression.null_aware_predicate.has_value()) {
+                throw std::logic_error("memo NullAwareAnti join is missing its membership equality");
+            }
+            out << "candidates=[";
+            append_predicates(out, expression.predicates);
+            out << "], membership=" << predicate_to_string(*expression.null_aware_predicate);
+        } else {
+            append_predicates(out, expression.predicates);
+        }
         out << "]";
         append_children(out, expression.children);
         return out.str();
@@ -1157,6 +1186,7 @@ RelationEstimate limit_estimate(std::size_t limit_count, RelationEstimate child,
 }
 
 RelationEstimate join_estimate(const std::vector<plan::BoundPredicate>& predicates,
+                               const std::optional<plan::BoundPredicate>& null_aware_predicate,
                                RelationEstimate left,
                                RelationEstimate right,
                                plan::JoinKind join_kind,
@@ -1187,7 +1217,7 @@ RelationEstimate join_estimate(const std::vector<plan::BoundPredicate>& predicat
     constexpr double semi_match_selectivity = 0.5;
     if (join_kind == plan::JoinKind::Semi) {
         estimate.rows = safe_multiply(left.rows, semi_match_selectivity);
-    } else if (join_kind == plan::JoinKind::Anti) {
+    } else if (join_kind == plan::JoinKind::Anti || join_kind == plan::JoinKind::NullAwareAnti) {
         estimate.rows = safe_multiply(left.rows, 1.0 - semi_match_selectivity);
     } else {
         estimate.rows = join_kind == plan::JoinKind::Left ? std::max(inner_rows, left.rows) : inner_rows;
@@ -1197,10 +1227,29 @@ RelationEstimate join_estimate(const std::vector<plan::BoundPredicate>& predicat
     // emptiness. A residual-only join retains nested-loop pair work.
     const auto keyless_existence =
         (join_kind == plan::JoinKind::Semi || join_kind == plan::JoinKind::Anti) && predicates.empty();
-    const auto local_cost =
-        equi_key.has_value() || keyless_existence ? safe_add(left.rows, right.rows) : cross_rows;
-    estimate.cost = safe_add(safe_add(safe_add(left.cost, right.cost), local_cost),
-                             predicates_subquery_cost(predicates, catalog, cross_rows));
+    auto null_aware_hashable = join_kind == plan::JoinKind::NullAwareAnti &&
+                               null_aware_predicate.has_value() &&
+                               usable_equi_join_key(*null_aware_predicate, left, right).has_value();
+    if (null_aware_hashable) {
+        for (const auto& predicate : predicates) {
+            if (!usable_equi_join_key(predicate, left, right).has_value()) {
+                null_aware_hashable = false;
+                break;
+            }
+        }
+    }
+    const auto ordinary_hashable =
+        join_kind != plan::JoinKind::NullAwareAnti && (equi_key.has_value() || keyless_existence);
+    const auto local_cost = ordinary_hashable || null_aware_hashable
+                                ? safe_add(left.rows, right.rows)
+                                : cross_rows;
+    auto embedded_subquery_cost = predicates_subquery_cost(predicates, catalog, cross_rows);
+    if (null_aware_predicate.has_value()) {
+        embedded_subquery_cost = safe_add(
+            embedded_subquery_cost, predicate_subquery_cost(*null_aware_predicate, catalog, cross_rows));
+    }
+    estimate.cost = safe_add(
+        safe_add(safe_add(left.cost, right.cost), local_cost), embedded_subquery_cost);
     estimate.distinct_by_column = left.distinct_by_column;
     if (join_kind == plan::JoinKind::Inner || join_kind == plan::JoinKind::Left) {
         estimate.distinct_by_column.insert(right.distinct_by_column.begin(), right.distinct_by_column.end());
@@ -1214,7 +1263,19 @@ RelationEstimate join_estimate(const std::vector<plan::BoundPredicate>& predicat
         estimate.distinct_by_column[equi_key->right_key] = joined_distinct;
     }
 
-    estimate.plan = plan::LogicalPlan::join(predicates, std::move(left.plan), std::move(right.plan), join_kind);
+    if (join_kind == plan::JoinKind::NullAwareAnti) {
+        if (!null_aware_predicate.has_value()) {
+            throw std::logic_error("costing NullAwareAnti without a membership equality");
+        }
+        estimate.plan = plan::LogicalPlan::null_aware_anti(
+            *null_aware_predicate, std::move(left.plan), std::move(right.plan), predicates);
+    } else {
+        if (null_aware_predicate.has_value()) {
+            throw std::logic_error("costing non-NullAwareAnti with a membership equality");
+        }
+        estimate.plan =
+            plan::LogicalPlan::join(predicates, std::move(left.plan), std::move(right.plan), join_kind);
+    }
     estimate.plan.order_permission = order_permission;
     return estimate;
 }
@@ -1254,6 +1315,7 @@ RelationEstimate estimate_logical_relation(const plan::LogicalPlan& logical, con
                               logical.order_permission);
     case plan::LogicalKind::Join:
         return join_estimate(logical.predicates,
+                             logical.null_aware_predicate,
                              estimate_logical_relation(require_left(logical), catalog),
                              estimate_logical_relation(require_right(logical), catalog),
                              logical.join_kind,
@@ -1354,6 +1416,7 @@ private:
                                   expression.order_permission);
         case MemoExpressionKind::Join:
             return join_estimate(expression.predicates,
+                                 expression.null_aware_predicate,
                                  best_for_group(expression.children.at(0), stack).estimate,
                                  best_for_group(expression.children.at(1), stack).estimate,
                                  expression.join_kind,
@@ -1377,6 +1440,10 @@ GroupId Memo::insert(const plan::LogicalPlan& logical) {
     // helpers include their full trees, while ordinary relational ingest follows
     // only input/left/right. Phase 21b rules explicitly call insert() only after
     // proving a top-level EXISTS/IN leaf can be lifted to SEMI/ANTI algebra.
+    if (logical.kind != plan::LogicalKind::Join && logical.null_aware_predicate.has_value()) {
+        throw std::invalid_argument(
+            "non-join logical plan node owns a NullAwareAnti membership equality");
+    }
     MemoExpression expression;
     expression.order_permission = logical.order_permission;
     switch (logical.kind) {
@@ -1424,6 +1491,7 @@ GroupId Memo::insert(const plan::LogicalPlan& logical) {
         expression.kind = MemoExpressionKind::Join;
         expression.join_kind = logical.join_kind;
         expression.predicates = logical.predicates;
+        expression.null_aware_predicate = logical.null_aware_predicate;
         expression.children.push_back(insert(require_left(logical)));
         expression.children.push_back(insert(require_right(logical)));
         return insert_expression(std::move(expression));
@@ -1757,10 +1825,16 @@ plan::LogicalPlan Memo::extract_expression(const MemoExpression& expression, std
         return result;
     }
     case MemoExpressionKind::Join: {
-        auto result = plan::LogicalPlan::join(expression.predicates,
-                                             extract(expression.children.at(0), stack),
-                                             extract(expression.children.at(1), stack),
-                                             expression.join_kind);
+        auto result = expression.join_kind == plan::JoinKind::NullAwareAnti
+                          ? plan::LogicalPlan::null_aware_anti(
+                                *expression.null_aware_predicate,
+                                extract(expression.children.at(0), stack),
+                                extract(expression.children.at(1), stack),
+                                expression.predicates)
+                          : plan::LogicalPlan::join(expression.predicates,
+                                                    extract(expression.children.at(0), stack),
+                                                    extract(expression.children.at(1), stack),
+                                                    expression.join_kind);
         result.order_permission = expression.order_permission;
         return result;
     }
@@ -1776,6 +1850,9 @@ void Memo::validate_expression(const MemoExpression& expression) const {
         if (!has_group(child)) {
             throw std::logic_error("memo expression references an unknown child group");
         }
+    }
+    if (expression.kind != MemoExpressionKind::Join && expression.null_aware_predicate.has_value()) {
+        throw std::logic_error("non-join memo expression owns a NullAwareAnti membership equality");
     }
 
     switch (expression.kind) {
@@ -1849,6 +1926,20 @@ void Memo::validate_expression(const MemoExpression& expression) const {
             !expression.window_expressions.empty() || !expression.sort_keys.empty() ||
             expression.limit_count != 0 || expression.children.size() != 2) {
             throw std::logic_error("malformed memo join expression");
+        }
+        if ((expression.join_kind == plan::JoinKind::NullAwareAnti) !=
+            expression.null_aware_predicate.has_value()) {
+            throw std::logic_error("malformed memo NullAwareAnti membership field");
+        }
+        if (expression.null_aware_predicate.has_value() &&
+            (expression.null_aware_predicate->kind != sql::PredicateKind::Comparison ||
+             expression.null_aware_predicate->comparison.op != sql::ComparisonOp::Equal)) {
+            throw std::logic_error("malformed memo NullAwareAnti membership equality");
+        }
+        if (expression.null_aware_predicate.has_value() &&
+            expression.null_aware_predicate->comparison.left.type !=
+                expression.null_aware_predicate->comparison.right.type) {
+            throw std::logic_error("malformed memo NullAwareAnti membership equality types");
         }
         return;
     case MemoExpressionKind::GroupRef:
@@ -2189,7 +2280,11 @@ std::vector<plan::LogicalPlan> Memo::extract_alternatives_for_expression(
                     result.hit_plan_bound = true;
                     return alternatives;
                 }
-                auto join = plan::LogicalPlan::join(expression.predicates, left, right, expression.join_kind);
+                auto join = expression.join_kind == plan::JoinKind::NullAwareAnti
+                                ? plan::LogicalPlan::null_aware_anti(
+                                      *expression.null_aware_predicate, left, right, expression.predicates)
+                                : plan::LogicalPlan::join(
+                                      expression.predicates, left, right, expression.join_kind);
                 join.order_permission = expression.order_permission;
                 alternatives.push_back(std::move(join));
             }

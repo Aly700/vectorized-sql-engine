@@ -260,3 +260,23 @@ for `SUM(value) OVER (PARTITION BY bucket ORDER BY sort_key)` across the
 | workload | rows | correctness | interpreted min ms | interpreted median ms | vectorized min ms | vectorized median ms | median speedup |
 |---|---:|---|---:|---:|---:|---:|---:|
 | window_running_sum | fact=200000,partitions=100 | match rows=200000 checksum=0xefdfa729da68f560 | 704.578 | 711.366 | 102.685 | 105.883 | 6.718x |
+
+## Phase 24 Selective NULL-Aware Anti Join (2026-07-16)
+
+Same optimized build, five-repetition min/median, deterministic-data, and
+checksum-before-timing methodology as above. The SQL is a correlated `NOT IN`
+over the 100,000-row `join_left` table. Its equality correlation admits the
+Phase 24 rewrite, and the benchmark harness fails loudly unless memo costing
+chooses `NullAwareAntiJoin`. The right source has 256 rows; its local filter
+retains 16 membership values in one correlation bucket. Because the left key
+cycle ends partway through its final 256-row block, exactly 6,256 rows belong
+to that bucket and 93,744 survive.
+
+| workload | rows | correctness | interpreted min ms | interpreted median ms | vectorized min ms | vectorized median ms | median speedup |
+|---|---:|---|---:|---:|---:|---:|---:|
+| selective_not_in_null_aware_anti | outer=100000,right_source=256,right_rows=16,survivors=93744 | match rows=93744 checksum=0x3aa4b8448334dc4d | 193.038 | 196.903 | 11.762 | 12.043 | 16.350x |
+
+The checksum match is performed before timing and pins the left-only output
+and correlated candidate-set semantics. The vectorized grouped hash kernel is
+16.350x faster on median than the interpreted left-row-major semantic oracle
+for this selective workload.

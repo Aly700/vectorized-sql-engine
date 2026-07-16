@@ -200,6 +200,47 @@ public:
     [[nodiscard]] bool apply(Memo& memo, GroupId group, const MemoExpression& expression) const override;
 };
 
+// Pattern matched: one whole top-level `x NOT IN (SELECT c FROM Q)` Filter
+// conjunct whose left operand is not a scalar subquery and whose bound right
+// plan is uncorrelated with exactly one typed final output.
+// Replacement expression: retain the materialized Filter expression and add
+// NullAwareAnti(input, Q) with an empty candidate-predicate list and the
+// structural membership equality `x = c`; residual top-level conjuncts remain
+// above the new join. If Q's projected identity collides with a left identity,
+// a deterministic `__not_in_value_N` Project alias makes the right side
+// explicit before constructing that equality.
+// Semantic equivalence: for each left row, the join candidate bag is exactly
+// Q. An empty Q emits, matching TRUE even for NULL x. For nonempty Q, NULL x
+// makes every equality UNKNOWN and suppresses. A TRUE equality suppresses as
+// NOT IN FALSE; absent a TRUE, any NULL c supplies UNKNOWN and suppresses; only
+// non-NULL x with every non-NULL c unequal yields all FALSE and emits. These
+// cases exhaust SQL 3VL. Right duplicates repeat an existing truth value and
+// cannot multiply the left-only result. The join preserves left row order and
+// executes the right plan once eagerly, so empty-left behavior and positioned
+// checked-expression errors coincide with materialization.
+// Preconditions/guards: only an entire Filter conjunct is inspected; leaves
+// below AND/OR, scalar-subquery operands, correlation, missing plans, or a
+// non-single-output bound shape do not rewrite. A sibling subquery predicate
+// or an embedded subquery in the left relational input also blocks the rule:
+// materialization observes Q's eager execution relative to those other eager
+// errors, and a native join cannot in general reproduce that owner ordering.
+// Binding has already pinned any checked SUM input, and memo ingest copies
+// every node's order permission.
+// Unsupported correlation stays materialized and physical lowering fails at
+// its deterministic source position. Each application removes one NOT IN leaf
+// from the added expression, never creates one, and structural deduplication
+// guarantees termination.
+// Golden query: `SELECT a FROM t WHERE a NOT IN (SELECT a FROM t1)` explores
+// both materialized and NullAwareAnti alternatives; the trap matrix separately
+// pins empty and NULL-bearing right sets.
+class NotInToNullAwareAntiJoinRule final : public MemoRule {
+public:
+    [[nodiscard]] std::string_view name() const override {
+        return "NotInToNullAwareAntiJoinRule";
+    }
+    [[nodiscard]] bool apply(Memo& memo, GroupId group, const MemoExpression& expression) const override;
+};
+
 // Pattern matched: a top-level Filter EXISTS whose correlated subplan is
 // exactly Project(Filter(Q)) and every outer reference occurs in a whole,
 // top-level `outer_col = inner_col` WHERE conjunct.
@@ -244,6 +285,46 @@ public:
 class CorrelatedInToSemiJoinRule final : public MemoRule {
 public:
     [[nodiscard]] std::string_view name() const override { return "CorrelatedInToSemiJoinRule"; }
+    [[nodiscard]] bool apply(Memo& memo, GroupId group, const MemoExpression& expression) const override;
+};
+
+// Pattern matched: a whole top-level `x NOT IN (SELECT c ...)` conjunct whose
+// correlated subplan is exactly the Phase 21c Project(Filter(Scan|Join)) shape,
+// with every outer use covered by an immediate-parent/local column equality.
+// Replacement: remove the correlation WHERE equalities from a copied right
+// plan, append deterministic `__corr_key_N` projections, keep the resulting
+// outer-to-hidden equalities as candidate predicates, and store `x = c`
+// separately as the NullAwareAnti membership equality. A colliding selected
+// right identity receives the same deterministic hidden alias. The original
+// materialized Filter remains in its memo group.
+// Semantic equivalence: for a fixed outer row l, TRUE-only evaluation of the
+// extracted candidate equalities selects exactly the same inner bag C(l) as
+// substituting l into the original WHERE. A NULL on either correlation key
+// makes that equality UNKNOWN and therefore can make C(l) empty; it never acts
+// as a membership NULL. Applying the exhaustive uncorrelated NOT IN argument
+// above to each C(l) proves identical TRUE/FALSE/UNKNOWN survival for every
+// row, including empty per-key bags, NULL membership values, and NULL outer
+// correlation keys. Hidden columns do not escape the left-only join, right
+// duplicates do not multiply rows, and left-row-major order is unchanged.
+// Preconditions/guards: scalar-subquery operands; non-equality, nested,
+// transitive, projection, aggregate, HAVING, JOIN ON, AND/OR-contained, and
+// result-shaped correlation are rejected. Nested subqueries in the right plan
+// and sibling subquery predicates are also rejected because decorrelation
+// would change their eager/per-row error order. The accepted
+// Scan|Join/Filter/Project right slice is therefore pure and has no
+// runtime-error-producing aggregate; all copied order permissions remain
+// structural. Residual shapes stay materialized and fail physical lowering
+// with the positioned guard.
+// The replacement removes one eligible leaf and memo deduplication guarantees
+// termination.
+// Golden query: `SELECT b FROM t WHERE b NOT IN (SELECT t1.b FROM t1 WHERE
+// t1.a=t.a)` executes the original and every native alternative through both
+// engines.
+class CorrelatedNotInToNullAwareAntiJoinRule final : public MemoRule {
+public:
+    [[nodiscard]] std::string_view name() const override {
+        return "CorrelatedNotInToNullAwareAntiJoinRule";
+    }
     [[nodiscard]] bool apply(Memo& memo, GroupId group, const MemoExpression& expression) const override;
 };
 
@@ -294,12 +375,14 @@ public:
 // NULL operands yield UNKNOWN and are rejected in either placement. Whole-tree reference analysis
 // prevents unsound OR/AND splitting.
 // Preconditions: The child join must be an INNER join, except that a whole
-// left-only conjunct may move into the preserved child of a SEMI/ANTI join.
-// This exception is sound because Semi/Anti output is a subset of left rows:
+// left-only conjunct may move into the preserved child of a SEMI, ANTI, or
+// NULL-aware ANTI join. This exception is sound because every preserved-left
+// join output is a subset of left rows:
 // filtering a left row before testing match existence keeps exactly the rows
 // that would pass the same predicate after the existence test. Right-only,
 // mixed-side, literal-only, and empty-reference conjuncts remain above a
-// SEMI/ANTI join; no predicate is moved into its match condition or right side.
+// preserved-left join; no predicate is moved into its candidate conditions,
+// NULL-aware membership equality, match condition, or right side.
 // LEFT joins are skipped because pushing a
 // predicate into the null-supplying side, or turning a post-join predicate into an ON predicate,
 // can preserve NULL-extended rows that the original WHERE would reject or reject rows the original

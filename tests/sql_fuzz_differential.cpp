@@ -1542,7 +1542,7 @@ bool verify_generated_case(std::uint64_t seed, const GeneratedCase& generated, d
 }
 
 std::string correlated_sql_for_seed(std::uint64_t seed) {
-    switch ((seed - 1) % 5) {
+    switch ((seed - 1) % 6) {
     case 0:
         return "SELECT o.c0 FROM t0 AS o WHERE EXISTS "
                "(SELECT i.c0 FROM t1 AS i WHERE i.c0 = o.c0)";
@@ -1553,6 +1553,9 @@ std::string correlated_sql_for_seed(std::uint64_t seed) {
         return "SELECT o.c0 FROM t0 AS o WHERE o.c0 IN "
                "(SELECT i.c0 FROM t1 AS i WHERE i.c0 = o.c0)";
     case 3:
+        return "SELECT o.c0 FROM t0 AS o WHERE o.c0 NOT IN "
+               "(SELECT i.c0 FROM t1 AS i WHERE i.c0 = o.c0)";
+    case 4:
         return "SELECT o.c0 FROM t0 AS o WHERE o.c0 = "
                "(SELECT MAX(i.c0) FROM t1 AS i WHERE i.c0 = o.c0)";
     default:
@@ -1565,8 +1568,8 @@ bool is_residual_correlation_guard(const plan::LogicalPlan& logical) {
     try {
         (void)plan::lower_to_physical(logical);
     } catch (const std::runtime_error& error) {
-        return std::string(error.what()) ==
-               "vectorized execution does not support residual correlated subqueries";
+        return std::string(error.what()).starts_with(
+            "vectorized execution does not support residual correlated subqueries at position ");
     }
     return false;
 }
@@ -1575,8 +1578,8 @@ bool verify_correlated_case(std::uint64_t seed,
                             const GeneratedCase& generated,
                             differential::ComparisonStats* stats) {
     const auto sql_text = correlated_sql_for_seed(seed);
-    const auto mode = static_cast<std::size_t>((seed - 1) % 5);
-    const auto expects_decorrelation = mode < 3;
+    const auto mode = static_cast<std::size_t>((seed - 1) % 6);
+    const auto expects_decorrelation = mode < 4;
     try {
         const auto logical = sql::bind_select(sql::parse_select(sql_text), generated.catalog);
         const auto oracle = execution::execute_interpreted(logical, generated.catalog);
@@ -1609,9 +1612,14 @@ bool verify_correlated_case(std::uint64_t seed,
             explored.fired_rules.begin(), explored.fired_rules.end(), "CorrelatedNotExistsToAntiJoinRule");
         stats->correlated_in_to_semi_firings = std::count(
             explored.fired_rules.begin(), explored.fired_rules.end(), "CorrelatedInToSemiJoinRule");
+        stats->correlated_not_in_to_null_aware_anti_firings = std::count(
+            explored.fired_rules.begin(),
+            explored.fired_rules.end(),
+            "CorrelatedNotInToNullAwareAntiJoinRule");
         const auto new_firings = stats->correlated_exists_to_semi_firings +
                                  stats->correlated_not_exists_to_anti_firings +
-                                 stats->correlated_in_to_semi_firings;
+                                 stats->correlated_in_to_semi_firings +
+                                 stats->correlated_not_in_to_null_aware_anti_firings;
         if ((expects_decorrelation && new_firings == 0) || (!expects_decorrelation && new_firings != 0)) {
             std::cerr << "correlated fuzzer rule guard mismatch\nseed: " << seed << "\nsql: " << sql_text
                       << "\ntrace: " << differential::format_trace(explored.fired_rules)
@@ -1635,6 +1643,9 @@ bool verify_correlated_case(std::uint64_t seed,
             }
             const auto vectorized = execution::execute_vectorized(alternative, generated.catalog);
             ++stats->execution_path_count;
+            if (differential::contains_null_aware_anti(alternative)) {
+                stats->null_aware_anti_execution_paths += 2;
+            }
             if (!differential::same_batch(alternative_oracle, vectorized)) {
                 std::cerr << "correlated native vectorized divergence\nseed: " << seed << "\nsql: " << sql_text
                           << "\nalternative:\n" << plan::to_string(alternative) << "\n";
@@ -1663,6 +1674,9 @@ bool verify_correlated_case(std::uint64_t seed,
         } else {
             const auto best_vectorized = execution::execute_vectorized(best, generated.catalog);
             ++stats->execution_path_count;
+            if (differential::contains_null_aware_anti(best)) {
+                stats->null_aware_anti_execution_paths += 2;
+            }
             if (!differential::same_batch(best_oracle, best_vectorized)) {
                 return false;
             }
@@ -1673,6 +1687,36 @@ bool verify_correlated_case(std::uint64_t seed,
                   << generated.catalog_dump << "exception: " << error.what() << "\n";
         return false;
     }
+}
+
+bool verify_null_aware_trap_case(std::uint64_t seed,
+                                 const GeneratedCase& generated,
+                                 differential::ComparisonStats* stats) {
+    const auto empty_right = seed % 2 == 1;
+    const auto sql_text = empty_right
+                              ? "SELECT o.c0 FROM t0 AS o WHERE o.c0 NOT IN "
+                                "(SELECT i.c0 FROM t1 AS i WHERE 1 = 0)"
+                              : "SELECT o.c0 FROM t0 AS o WHERE o.c0 NOT IN "
+                                "(SELECT MAX(i.c0) FROM t1 AS i WHERE 1 = 0)";
+    differential::ComparisonStats local;
+    std::ostringstream context;
+    context << "NULL-aware trap lane seed: " << seed << "\n" << generated.catalog_dump;
+    if (!differential::compare_engines(sql_text, generated.catalog, context.str(), &local)) {
+        return false;
+    }
+    if (local.not_in_to_null_aware_anti_firings == 0 ||
+        local.null_aware_anti_execution_paths == 0) {
+        std::cerr << "NULL-aware trap lane missed native execution\nseed: " << seed
+                  << "\nsql: " << sql_text << "\n" << generated.catalog_dump;
+        return false;
+    }
+    *stats = local;
+    if (empty_right) {
+        stats->null_aware_empty_right_paths = local.null_aware_anti_execution_paths;
+    } else {
+        stats->null_aware_null_bearing_right_paths = local.null_aware_anti_execution_paths;
+    }
+    return true;
 }
 
 } // namespace
@@ -1737,11 +1781,16 @@ int main(int argc, char** argv) {
     std::size_t exists_to_semi_firings = 0;
     std::size_t not_exists_to_anti_firings = 0;
     std::size_t in_to_semi_firings = 0;
+    std::size_t not_in_to_null_aware_anti_firings = 0;
     std::size_t correlated_exists_to_semi_firings = 0;
     std::size_t correlated_not_exists_to_anti_firings = 0;
     std::size_t correlated_in_to_semi_firings = 0;
+    std::size_t correlated_not_in_to_null_aware_anti_firings = 0;
+    std::size_t null_aware_anti_execution_paths = 0;
+    std::size_t null_aware_empty_right_paths = 0;
+    std::size_t null_aware_null_bearing_right_paths = 0;
     std::size_t residual_correlated_guard_paths = 0;
-    std::vector<std::size_t> correlated_mode_queries(5, 0);
+    std::vector<std::size_t> correlated_mode_queries(6, 0);
     std::size_t left_join_to_inner_firings = 0;
     std::size_t join_commute_firings = 0;
     std::size_t join_associate_firings = 0;
@@ -1810,6 +1859,8 @@ int main(int argc, char** argv) {
         exists_to_semi_firings += stats.exists_to_semi_firings;
         not_exists_to_anti_firings += stats.not_exists_to_anti_firings;
         in_to_semi_firings += stats.in_to_semi_firings;
+        not_in_to_null_aware_anti_firings += stats.not_in_to_null_aware_anti_firings;
+        null_aware_anti_execution_paths += stats.null_aware_anti_execution_paths;
         left_join_to_inner_firings += stats.left_join_to_inner_firings;
         join_commute_firings += stats.join_commute_firings;
         join_associate_firings += stats.join_associate_firings;
@@ -1821,7 +1872,7 @@ int main(int argc, char** argv) {
             return 1;
         }
         ++queries;
-        ++correlated_mode_queries.at(static_cast<std::size_t>((seed - 1) % 5));
+        ++correlated_mode_queries.at(static_cast<std::size_t>((seed - 1) % 6));
         alternatives += correlated_stats.alternative_count;
         execution_paths += correlated_stats.execution_path_count;
         accepted_error_paths += correlated_stats.accepted_error_path_count;
@@ -1831,9 +1882,29 @@ int main(int argc, char** argv) {
         correlated_not_exists_to_anti_firings +=
             correlated_stats.correlated_not_exists_to_anti_firings;
         correlated_in_to_semi_firings += correlated_stats.correlated_in_to_semi_firings;
+        correlated_not_in_to_null_aware_anti_firings +=
+            correlated_stats.correlated_not_in_to_null_aware_anti_firings;
+        null_aware_anti_execution_paths += correlated_stats.null_aware_anti_execution_paths;
         residual_correlated_guard_paths += correlated_stats.residual_correlated_guard_paths;
         hit_expression_bound = hit_expression_bound || correlated_stats.hit_expression_bound;
         hit_plan_bound = hit_plan_bound || correlated_stats.hit_plan_bound;
+
+        differential::ComparisonStats trap_stats;
+        if (!verify_null_aware_trap_case(seed, generated, &trap_stats)) {
+            return 1;
+        }
+        ++queries;
+        alternatives += trap_stats.alternative_count;
+        execution_paths += trap_stats.execution_path_count;
+        accepted_error_paths += trap_stats.accepted_error_path_count;
+        max_group_expression_count =
+            std::max(max_group_expression_count, trap_stats.max_group_expression_count);
+        not_in_to_null_aware_anti_firings += trap_stats.not_in_to_null_aware_anti_firings;
+        null_aware_anti_execution_paths += trap_stats.null_aware_anti_execution_paths;
+        null_aware_empty_right_paths += trap_stats.null_aware_empty_right_paths;
+        null_aware_null_bearing_right_paths += trap_stats.null_aware_null_bearing_right_paths;
+        hit_expression_bound = hit_expression_bound || trap_stats.hit_expression_bound;
+        hit_plan_bound = hit_plan_bound || trap_stats.hit_plan_bound;
     }
 
     if (seeds.size() == kDefaultSeedCount &&
@@ -1843,8 +1914,12 @@ int main(int argc, char** argv) {
          not_exists_subquery_queries == 0 || nested_subquery_queries == 0 || subquery_join_queries == 0 ||
          subquery_aggregate_queries == 0 || null_bearing_subquery_queries == 0 || empty_subquery_queries == 0 ||
          or_embedded_subquery_queries == 0 || exists_to_semi_firings == 0 || not_exists_to_anti_firings == 0 ||
-         in_to_semi_firings == 0 || correlated_exists_to_semi_firings == 0 ||
+         in_to_semi_firings == 0 || not_in_to_null_aware_anti_firings == 0 ||
+         correlated_exists_to_semi_firings == 0 ||
          correlated_not_exists_to_anti_firings == 0 || correlated_in_to_semi_firings == 0 ||
+         correlated_not_in_to_null_aware_anti_firings == 0 ||
+         null_aware_anti_execution_paths == 0 || null_aware_empty_right_paths == 0 ||
+         null_aware_null_bearing_right_paths == 0 ||
          residual_correlated_guard_paths == 0 || window_queries == 0 || window_definitions == 0 ||
          row_number_windows == 0 || rank_windows == 0 || dense_rank_windows == 0 || count_windows == 0 ||
          sum_windows == 0 || min_windows == 0 || max_windows == 0 || partitioned_windows == 0 ||
@@ -1877,9 +1952,17 @@ int main(int argc, char** argv) {
                   << " exists_to_semi_firings=" << exists_to_semi_firings
                   << " not_exists_to_anti_firings=" << not_exists_to_anti_firings
                   << " in_to_semi_firings=" << in_to_semi_firings << "\n";
+        std::cerr << " not_in_to_null_aware_anti_firings="
+                  << not_in_to_null_aware_anti_firings
+                  << " null_aware_anti_execution_paths=" << null_aware_anti_execution_paths
+                  << " null_aware_empty_right_paths=" << null_aware_empty_right_paths
+                  << " null_aware_null_bearing_right_paths=" << null_aware_null_bearing_right_paths
+                  << "\n";
         std::cerr << " correlated_exists_to_semi_firings=" << correlated_exists_to_semi_firings
                   << " correlated_not_exists_to_anti_firings=" << correlated_not_exists_to_anti_firings
                   << " correlated_in_to_semi_firings=" << correlated_in_to_semi_firings
+                  << " correlated_not_in_to_null_aware_anti_firings="
+                  << correlated_not_in_to_null_aware_anti_firings
                   << " residual_correlated_guard_paths=" << residual_correlated_guard_paths << "\n";
         std::cerr << " window_queries=" << window_queries
                   << " window_definitions=" << window_definitions
@@ -1963,14 +2046,21 @@ int main(int argc, char** argv) {
               << " exists_to_semi_firings=" << exists_to_semi_firings
               << " not_exists_to_anti_firings=" << not_exists_to_anti_firings
               << " in_to_semi_firings=" << in_to_semi_firings
+              << " not_in_to_null_aware_anti_firings=" << not_in_to_null_aware_anti_firings
               << " correlated_exists_queries=" << correlated_mode_queries[0]
               << " correlated_not_exists_queries=" << correlated_mode_queries[1]
               << " correlated_in_queries=" << correlated_mode_queries[2]
-              << " correlated_scalar_queries=" << correlated_mode_queries[3]
-              << " correlated_blocked_or_queries=" << correlated_mode_queries[4]
+              << " correlated_not_in_queries=" << correlated_mode_queries[3]
+              << " correlated_scalar_queries=" << correlated_mode_queries[4]
+              << " correlated_blocked_or_queries=" << correlated_mode_queries[5]
               << " correlated_exists_to_semi_firings=" << correlated_exists_to_semi_firings
               << " correlated_not_exists_to_anti_firings=" << correlated_not_exists_to_anti_firings
               << " correlated_in_to_semi_firings=" << correlated_in_to_semi_firings
+              << " correlated_not_in_to_null_aware_anti_firings="
+              << correlated_not_in_to_null_aware_anti_firings
+              << " null_aware_anti_execution_paths=" << null_aware_anti_execution_paths
+              << " null_aware_empty_right_paths=" << null_aware_empty_right_paths
+              << " null_aware_null_bearing_right_paths=" << null_aware_null_bearing_right_paths
               << " residual_correlated_guard_paths=" << residual_correlated_guard_paths
               << " left_join_to_inner_firings=" << left_join_to_inner_firings
               << " join_commute_firings=" << join_commute_firings
