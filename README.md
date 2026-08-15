@@ -23,4 +23,3 @@ cmake -S . -B build && cmake --build build && ctest --test-dir build --output-on
 3. Columnar storage and vectorized operators.
 4. Rule-based rewrites with equivalence tests.
 5. Cascades memo, cost model, and join reordering.
-
