@@ -202,7 +202,8 @@ void assert_cross_group_duplicate_expression_merges_groups() {
     assert(left_right != right_left);
 
     try {
-        assert(memo.insert_equivalent(left_right, join_expression(right, left)));
+        const auto merged = memo.insert_equivalent(left_right, join_expression(right, left));
+        assert(merged);
     } catch (const std::logic_error& error) {
         std::cerr << "cross-group duplicate did not merge\n"
                   << "error: " << error.what() << "\n"

@@ -1,5 +1,7 @@
 # Vectorized SQL Query Engine
 
+[![CI](https://github.com/Aly700/vectorized-sql-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/Aly700/vectorized-sql-engine/actions/workflows/ci.yml)
+
 ## Scope
 
 A columnar analytical engine whose hardest boundary is the optimizer: SQL is parsed and bound into relational algebra, rules produce equivalent plans, and a Cascades-style memo chooses a low-cost vectorized physical plan without changing semantics.
