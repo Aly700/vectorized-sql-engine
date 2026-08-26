@@ -472,6 +472,7 @@ private:
         while (is_keyword("OR")) {
             const auto position = current_.position;
             advance();
+            count_boolean_operator(position);
             left = PredicateExpr::binary(PredicateKind::Or, std::move(left), parse_boolean_and(), position);
         }
         return left;
@@ -482,6 +483,7 @@ private:
         while (is_keyword("AND")) {
             const auto position = current_.position;
             advance();
+            count_boolean_operator(position);
             left = PredicateExpr::binary(PredicateKind::And, std::move(left), parse_boolean_primary(), position);
         }
         return left;
@@ -489,6 +491,7 @@ private:
 
     PredicateExpr parse_boolean_primary() {
         if (current_.kind == TokenKind::LeftParen && !next_is_keyword("SELECT")) {
+            const NestingGuard guard{nesting_depth_, current_.position};
             advance();
             auto expression = parse_boolean_expression();
             expect_token(TokenKind::RightParen, "expected ')' after boolean expression");
@@ -524,6 +527,7 @@ private:
         while (is_keyword("OR")) {
             const auto position = current_.position;
             advance();
+            count_boolean_operator(position);
             left = HavingPredicateExpr::binary(PredicateKind::Or,
                                                std::move(left),
                                                parse_having_boolean_and(),
@@ -537,6 +541,7 @@ private:
         while (is_keyword("AND")) {
             const auto position = current_.position;
             advance();
+            count_boolean_operator(position);
             left = HavingPredicateExpr::binary(PredicateKind::And,
                                                std::move(left),
                                                parse_having_boolean_primary(),
@@ -547,6 +552,7 @@ private:
 
     HavingPredicateExpr parse_having_boolean_primary() {
         if (current_.kind == TokenKind::LeftParen && !next_is_keyword("SELECT")) {
+            const NestingGuard guard{nesting_depth_, current_.position};
             advance();
             auto expression = parse_having_boolean_expression();
             expect_token(TokenKind::RightParen, "expected ')' after boolean expression");
@@ -701,6 +707,7 @@ private:
     }
 
     ScalarSubquery parse_subquery(const std::string& message) {
+        const NestingGuard guard{nesting_depth_, current_.position};
         if (current_.kind != TokenKind::LeftParen || !next_is_keyword("SELECT")) {
             throw ParseError(current_.position, message);
         }
@@ -1000,6 +1007,7 @@ private:
 
     AggregateCall parse_aggregate_call() {
         const auto position = current_.position;
+        const NestingGuard guard{nesting_depth_, position};
         const auto function = parse_aggregate_function();
         expect_token(TokenKind::LeftParen, "expected '(' after aggregate function");
 
@@ -1037,8 +1045,35 @@ private:
         return aggregate;
     }
 
+    static constexpr std::size_t kMaxNestingDepth = 64;
+    static constexpr std::size_t kMaxBooleanOperators = 200;
+
+    // Bound parser recursion and predicate tree depth so pathological input
+    // reports a parse error instead of exhausting the stack here or in the
+    // recursive plan traversals downstream.
+    struct NestingGuard {
+        std::size_t& depth;
+        NestingGuard(std::size_t& tracked, std::size_t position) : depth(tracked) {
+            if (depth >= kMaxNestingDepth) {
+                throw ParseError(position, "expression nesting exceeds the maximum supported depth");
+            }
+            ++depth;
+        }
+        ~NestingGuard() { --depth; }
+    };
+
+    void count_boolean_operator(std::size_t position) {
+        ++boolean_operators_;
+        if (boolean_operators_ > kMaxBooleanOperators) {
+            throw ParseError(position,
+                             "boolean expression exceeds the maximum supported number of operators");
+        }
+    }
+
     Lexer lexer_;
     Token current_;
+    std::size_t nesting_depth_{0};
+    std::size_t boolean_operators_{0};
 };
 
 } // namespace

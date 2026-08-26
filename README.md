@@ -16,6 +16,9 @@ C++20, CMake, Arrow-like in-memory column batches, SIMD-friendly operator interf
 cmake -S . -B build && cmake --build build && ctest --test-dir build --output-on-failure
 ```
 
+Linux CI runs the full test suite with address and undefined-behavior sanitizers.
+Continuous parser and planner fuzzing replays known queries before a timed fuzzing run.
+
 ## Phase map
 
 1. Parser, binder, logical algebra, and golden-query oracle.

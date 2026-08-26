@@ -1,0 +1,1 @@
+SELECT a FROM t WHERE a = (SELECT MAX(a) FROM t1)
