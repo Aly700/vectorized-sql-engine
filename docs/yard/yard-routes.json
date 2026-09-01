@@ -1,0 +1,2699 @@
+{
+  "engine": {
+    "repo": "github.com/Aly700/vectorized-sql-engine",
+    "commit": "1058974ea747",
+    "exportedAt": "2026-09-01",
+    "machine": "MacBook Pro Mac14,7, Apple M2, 8 cores, 16 GB",
+    "toolchain": "Apple LLVM 17.0.0 (clang-1700.4.4.1)",
+    "flags": "-O2 -DNDEBUG",
+    "repetitions": 5
+  },
+  "workings": [
+    {
+      "id": "coupling",
+      "sql": "SELECT l.payload AS left_payload, r.payload AS right_payload FROM join_left AS l JOIN join_right AS r ON l.k1 = r.k1 AND l.k2 = r.k2",
+      "tables": [ { "name": "join_left", "rows": 100000 }, { "name": "join_right", "rows": 256 } ],
+      "explain": [
+        "EXPLAIN",
+        "bound logical plan:",
+        "  Project[left_payload=col(l.payload), right_payload=col(r.payload)]",
+        "    Join[col(l.k1) = col(r.k1) AND col(l.k2) = col(r.k2)]",
+        "      Scan[join_left AS l]",
+        "      Scan[join_right AS r]",
+        "memo exploration:",
+        "  groups: 4",
+        "  iterations: 1",
+        "  reached_fixpoint: yes",
+        "  fired rules:",
+        "    0: JoinCommuteRule",
+        "chosen plan:",
+        "  Project[left_payload=col(l.payload), right_payload=col(r.payload)] rows=25.60 cost=200512.00",
+        "    Join[col(l.k1) = col(r.k1) AND col(l.k2) = col(r.k2)] rows=25.60 cost=200512.00",
+        "      Scan[join_left AS l] rows=100000.00 cost=100000.00",
+        "      Scan[join_right AS r] rows=256.00 cost=256.00",
+        "total cost: 200512.00"
+      ],
+      "memo": { "groups": 4, "iterations": 1, "reachedFixpoint": true, "firedRules": [
+          "JoinCommuteRule"
+        ] },
+      "alternatives": [
+        {
+          "index": 0,
+          "plan": "Project[left_payload=col(l.payload), right_payload=col(r.payload)]\n  Join[col(l.k1) = col(r.k1) AND col(l.k2) = col(r.k2)]\n    Scan[join_left AS l]\n    Scan[join_right AS r]",
+          "tree": {
+            "op": "Project",
+            "detail": "left_payload=col(l.payload), right_payload=col(r.payload)",
+            "rows": 25.60,
+            "cost": 200512.00,
+            "children": [
+              {
+                "op": "Join",
+                "detail": "col(l.k1) = col(r.k1) AND col(l.k2) = col(r.k2)",
+                "rows": 25.60,
+                "cost": 200512.00,
+                "children": [
+                  {
+                    "op": "Scan",
+                    "detail": "join_left AS l",
+                    "rows": 100000.00,
+                    "cost": 100000.00,
+                    "children": []
+                  },
+                  {
+                    "op": "Scan",
+                    "detail": "join_right AS r",
+                    "rows": 256.00,
+                    "cost": 256.00,
+                    "children": []
+                  }
+                ]
+              }
+            ]
+          },
+          "totalCost": 200512.00,
+          "rowCount": 100000,
+          "bagChecksum": "0xe60844c222869ce8",
+          "vectorizedMs": { "min": 15.060, "median": 15.291 }
+        },
+        {
+          "index": 1,
+          "plan": "Project[left_payload=col(l.payload), right_payload=col(r.payload)]\n  Join[col(l.k1) = col(r.k1) AND col(l.k2) = col(r.k2)]\n    Scan[join_right AS r]\n    Scan[join_left AS l]",
+          "tree": {
+            "op": "Project",
+            "detail": "left_payload=col(l.payload), right_payload=col(r.payload)",
+            "rows": 25.60,
+            "cost": 200512.00,
+            "children": [
+              {
+                "op": "Join",
+                "detail": "col(l.k1) = col(r.k1) AND col(l.k2) = col(r.k2)",
+                "rows": 25.60,
+                "cost": 200512.00,
+                "children": [
+                  {
+                    "op": "Scan",
+                    "detail": "join_right AS r",
+                    "rows": 256.00,
+                    "cost": 256.00,
+                    "children": []
+                  },
+                  {
+                    "op": "Scan",
+                    "detail": "join_left AS l",
+                    "rows": 100000.00,
+                    "cost": 100000.00,
+                    "children": []
+                  }
+                ]
+              }
+            ]
+          },
+          "totalCost": 200512.00,
+          "rowCount": 100000,
+          "bagChecksum": "0xe60844c222869ce8",
+          "vectorizedMs": { "min": 15.361, "median": 15.564 }
+        }
+      ],
+      "chosen": 0,
+      "checksum": "0xd6eff9218be6da07",
+      "interpretedMs": { "min": 5707.965, "median": 5737.780 },
+      "hitExpressionBound": false,
+      "hitPlanBound": false
+    },
+    {
+      "id": "hump-and-bowl",
+      "sql": "SELECT l.group_id AS group_id, COUNT(*) AS n, MAX(r.measure) AS top FROM e2e_left AS l JOIN e2e_right AS r ON l.k = r.k WHERE l.filter_key < 80 GROUP BY l.group_id ORDER BY n DESC, group_id ASC LIMIT 20",
+      "tables": [ { "name": "e2e_left", "rows": 120000 }, { "name": "e2e_right", "rows": 256 } ],
+      "explain": [
+        "EXPLAIN",
+        "bound logical plan:",
+        "  Limit[20]",
+        "    Sort[col(n) DESC, col(group_id) ASC]",
+        "      Project[group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))]",
+        "        Aggregate[group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]]",
+        "          Filter[col(l.filter_key) < lit(80)]",
+        "            Join[col(l.k) = col(r.k)]",
+        "              Scan[e2e_left AS l]",
+        "              Scan[e2e_right AS r]",
+        "memo exploration:",
+        "  groups: 11",
+        "  iterations: 2",
+        "  reached_fixpoint: yes",
+        "  fired rules:",
+        "    0: JoinCommuteRule",
+        "    1: FilterIntoJoinRule",
+        "    2: JoinCommuteRule",
+        "chosen plan:",
+        "  Limit[20] rows=20.00 cost=241486.08",
+        "    Sort[col(n) DESC, col(group_id) ASC] rows=85.33 cost=241486.08",
+        "      Project[group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))] rows=85.33 cost=240938.67",
+        "        Aggregate[group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]] rows=85.33 cost=240938.67",
+        "          Filter[col(l.filter_key) < lit(80)] rows=85.33 cost=240768.00",
+        "            Join[col(l.k) = col(r.k)] rows=256.00 cost=240512.00",
+        "              Scan[e2e_left AS l] rows=120000.00 cost=120000.00",
+        "              Scan[e2e_right AS r] rows=256.00 cost=256.00",
+        "total cost: 241486.08"
+      ],
+      "memo": { "groups": 11, "iterations": 2, "reachedFixpoint": true, "firedRules": [
+          "JoinCommuteRule",
+          "FilterIntoJoinRule",
+          "JoinCommuteRule"
+        ] },
+      "alternatives": [
+        {
+          "index": 0,
+          "plan": "Limit[20]\n  Sort[col(n) DESC, col(group_id) ASC]\n    Project[group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))]\n      Aggregate[group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]]\n        Filter[col(l.filter_key) < lit(80)]\n          Join[col(l.k) = col(r.k)]\n            Scan[e2e_left AS l]\n            Scan[e2e_right AS r]",
+          "tree": {
+            "op": "Limit",
+            "detail": "20",
+            "rows": 20.00,
+            "cost": 241486.08,
+            "children": [
+              {
+                "op": "Sort",
+                "detail": "col(n) DESC, col(group_id) ASC",
+                "rows": 85.33,
+                "cost": 241486.08,
+                "children": [
+                  {
+                    "op": "Project",
+                    "detail": "group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))",
+                    "rows": 85.33,
+                    "cost": 240938.67,
+                    "children": [
+                      {
+                        "op": "Aggregate",
+                        "detail": "group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]",
+                        "rows": 85.33,
+                        "cost": 240938.67,
+                        "children": [
+                          {
+                            "op": "Filter",
+                            "detail": "col(l.filter_key) < lit(80)",
+                            "rows": 85.33,
+                            "cost": 240768.00,
+                            "children": [
+                              {
+                                "op": "Join",
+                                "detail": "col(l.k) = col(r.k)",
+                                "rows": 256.00,
+                                "cost": 240512.00,
+                                "children": [
+                                  {
+                                    "op": "Scan",
+                                    "detail": "e2e_left AS l",
+                                    "rows": 120000.00,
+                                    "cost": 120000.00,
+                                    "children": []
+                                  },
+                                  {
+                                    "op": "Scan",
+                                    "detail": "e2e_right AS r",
+                                    "rows": 256.00,
+                                    "cost": 256.00,
+                                    "children": []
+                                  }
+                                ]
+                              }
+                            ]
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "totalCost": 241486.08,
+          "rowCount": 20,
+          "bagChecksum": "0x5ad6701e8dbf32d5",
+          "vectorizedMs": { "min": 27.881, "median": 27.934 }
+        },
+        {
+          "index": 1,
+          "plan": "Limit[20]\n  Sort[col(n) DESC, col(group_id) ASC]\n    Project[group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))]\n      Aggregate[group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]]\n        Filter[col(l.filter_key) < lit(80)]\n          Join[col(l.k) = col(r.k)]\n            Scan[e2e_right AS r]\n            Scan[e2e_left AS l]",
+          "tree": {
+            "op": "Limit",
+            "detail": "20",
+            "rows": 20.00,
+            "cost": 241486.08,
+            "children": [
+              {
+                "op": "Sort",
+                "detail": "col(n) DESC, col(group_id) ASC",
+                "rows": 85.33,
+                "cost": 241486.08,
+                "children": [
+                  {
+                    "op": "Project",
+                    "detail": "group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))",
+                    "rows": 85.33,
+                    "cost": 240938.67,
+                    "children": [
+                      {
+                        "op": "Aggregate",
+                        "detail": "group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]",
+                        "rows": 85.33,
+                        "cost": 240938.67,
+                        "children": [
+                          {
+                            "op": "Filter",
+                            "detail": "col(l.filter_key) < lit(80)",
+                            "rows": 85.33,
+                            "cost": 240768.00,
+                            "children": [
+                              {
+                                "op": "Join",
+                                "detail": "col(l.k) = col(r.k)",
+                                "rows": 256.00,
+                                "cost": 240512.00,
+                                "children": [
+                                  {
+                                    "op": "Scan",
+                                    "detail": "e2e_right AS r",
+                                    "rows": 256.00,
+                                    "cost": 256.00,
+                                    "children": []
+                                  },
+                                  {
+                                    "op": "Scan",
+                                    "detail": "e2e_left AS l",
+                                    "rows": 120000.00,
+                                    "cost": 120000.00,
+                                    "children": []
+                                  }
+                                ]
+                              }
+                            ]
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "totalCost": 241486.08,
+          "rowCount": 20,
+          "bagChecksum": "0x5ad6701e8dbf32d5",
+          "vectorizedMs": { "min": 25.992, "median": 26.419 }
+        },
+        {
+          "index": 2,
+          "plan": "Limit[20]\n  Sort[col(n) DESC, col(group_id) ASC]\n    Project[group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))]\n      Aggregate[group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]]\n        Join[col(l.k) = col(r.k)]\n          Filter[col(l.filter_key) < lit(80)]\n            Scan[e2e_left AS l]\n          Scan[e2e_right AS r]",
+          "tree": {
+            "op": "Limit",
+            "detail": "20",
+            "rows": 20.00,
+            "cost": 283072.00,
+            "children": [
+              {
+                "op": "Sort",
+                "detail": "col(n) DESC, col(group_id) ASC",
+                "rows": 256.00,
+                "cost": 283072.00,
+                "children": [
+                  {
+                    "op": "Project",
+                    "detail": "group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))",
+                    "rows": 256.00,
+                    "cost": 281024.00,
+                    "children": [
+                      {
+                        "op": "Aggregate",
+                        "detail": "group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]",
+                        "rows": 256.00,
+                        "cost": 281024.00,
+                        "children": [
+                          {
+                            "op": "Join",
+                            "detail": "col(l.k) = col(r.k)",
+                            "rows": 256.00,
+                            "cost": 280512.00,
+                            "children": [
+                              {
+                                "op": "Filter",
+                                "detail": "col(l.filter_key) < lit(80)",
+                                "rows": 40000.00,
+                                "cost": 240000.00,
+                                "children": [
+                                  {
+                                    "op": "Scan",
+                                    "detail": "e2e_left AS l",
+                                    "rows": 120000.00,
+                                    "cost": 120000.00,
+                                    "children": []
+                                  }
+                                ]
+                              },
+                              {
+                                "op": "Scan",
+                                "detail": "e2e_right AS r",
+                                "rows": 256.00,
+                                "cost": 256.00,
+                                "children": []
+                              }
+                            ]
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "totalCost": 283072.00,
+          "rowCount": 20,
+          "bagChecksum": "0x5ad6701e8dbf32d5",
+          "vectorizedMs": { "min": 24.780, "median": 24.812 }
+        },
+        {
+          "index": 3,
+          "plan": "Limit[20]\n  Sort[col(n) DESC, col(group_id) ASC]\n    Project[group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))]\n      Aggregate[group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]]\n        Join[col(l.k) = col(r.k)]\n          Scan[e2e_right AS r]\n          Filter[col(l.filter_key) < lit(80)]\n            Scan[e2e_left AS l]",
+          "tree": {
+            "op": "Limit",
+            "detail": "20",
+            "rows": 20.00,
+            "cost": 283072.00,
+            "children": [
+              {
+                "op": "Sort",
+                "detail": "col(n) DESC, col(group_id) ASC",
+                "rows": 256.00,
+                "cost": 283072.00,
+                "children": [
+                  {
+                    "op": "Project",
+                    "detail": "group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))",
+                    "rows": 256.00,
+                    "cost": 281024.00,
+                    "children": [
+                      {
+                        "op": "Aggregate",
+                        "detail": "group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]",
+                        "rows": 256.00,
+                        "cost": 281024.00,
+                        "children": [
+                          {
+                            "op": "Join",
+                            "detail": "col(l.k) = col(r.k)",
+                            "rows": 256.00,
+                            "cost": 280512.00,
+                            "children": [
+                              {
+                                "op": "Scan",
+                                "detail": "e2e_right AS r",
+                                "rows": 256.00,
+                                "cost": 256.00,
+                                "children": []
+                              },
+                              {
+                                "op": "Filter",
+                                "detail": "col(l.filter_key) < lit(80)",
+                                "rows": 40000.00,
+                                "cost": 240000.00,
+                                "children": [
+                                  {
+                                    "op": "Scan",
+                                    "detail": "e2e_left AS l",
+                                    "rows": 120000.00,
+                                    "cost": 120000.00,
+                                    "children": []
+                                  }
+                                ]
+                              }
+                            ]
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "totalCost": 283072.00,
+          "rowCount": 20,
+          "bagChecksum": "0x5ad6701e8dbf32d5",
+          "vectorizedMs": { "min": 23.322, "median": 23.467 }
+        }
+      ],
+      "chosen": 0,
+      "checksum": "0xae466c9b0f225c78",
+      "interpretedMs": { "min": 4175.083, "median": 4200.672 },
+      "hitExpressionBound": false,
+      "hitPlanBound": false
+    },
+    {
+      "id": "three-trains",
+      "sql": "SELECT l.group_id AS group_id, COUNT(*) AS n, MAX(r.measure) AS top FROM e2e_left AS l JOIN e2e_right AS r ON l.k = r.k JOIN e2e_class AS c ON l.group_id = c.group_id WHERE c.tier = 1 GROUP BY l.group_id ORDER BY n DESC, group_id ASC LIMIT 20",
+      "tables": [ { "name": "e2e_left", "rows": 120000 }, { "name": "e2e_right", "rows": 256 }, { "name": "e2e_class", "rows": 128 } ],
+      "explain": [
+        "EXPLAIN",
+        "bound logical plan:",
+        "  Limit[20]",
+        "    Sort[col(n) DESC, col(group_id) ASC]",
+        "      Project[group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))]",
+        "        Aggregate[group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]]",
+        "          Filter[col(c.tier) = lit(1)]",
+        "            Join[col(l.group_id) = col(c.group_id)]",
+        "              Join[col(l.k) = col(r.k)]",
+        "                Scan[e2e_left AS l]",
+        "                Scan[e2e_right AS r]",
+        "              Scan[e2e_class AS c]",
+        "memo exploration:",
+        "  groups: 22",
+        "  iterations: 3",
+        "  reached_fixpoint: yes",
+        "  fired rules:",
+        "    0: JoinCommuteRule",
+        "    1: JoinCommuteRule",
+        "    2: JoinAssociateRule",
+        "    3: FilterIntoJoinRule",
+        "    4: JoinAssociateRule",
+        "    5: JoinCommuteRule",
+        "    6: FilterIntoJoinRule",
+        "    7: JoinCommuteRule",
+        "    8: JoinCommuteRule",
+        "    9: JoinAssociateRule",
+        "    10: JoinAssociateRule",
+        "    11: JoinCommuteRule",
+        "    12: FilterIntoJoinRule",
+        "    13: JoinCommuteRule",
+        "    14: JoinCommuteRule",
+        "    15: JoinCommuteRule",
+        "chosen plan:",
+        "  Limit[20] rows=12.80 cost=240866.28",
+        "    Sort[col(n) DESC, col(group_id) ASC] rows=12.80 cost=240866.28",
+        "      Project[group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))] rows=12.80 cost=240819.20",
+        "        Aggregate[group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]] rows=12.80 cost=240819.20",
+        "          Join[col(l.k) = col(r.k)] rows=12.80 cost=240793.60",
+        "            Scan[e2e_right AS r] rows=256.00 cost=256.00",
+        "            Join[col(l.group_id) = col(c.group_id)] rows=12.80 cost=240268.80",
+        "              Scan[e2e_left AS l] rows=120000.00 cost=120000.00",
+        "              Filter[col(c.tier) = lit(1)] rows=12.80 cost=256.00",
+        "                Scan[e2e_class AS c] rows=128.00 cost=128.00",
+        "total cost: 240866.28"
+      ],
+      "memo": { "groups": 22, "iterations": 3, "reachedFixpoint": true, "firedRules": [
+          "JoinCommuteRule",
+          "JoinCommuteRule",
+          "JoinAssociateRule",
+          "FilterIntoJoinRule",
+          "JoinAssociateRule",
+          "JoinCommuteRule",
+          "FilterIntoJoinRule",
+          "JoinCommuteRule",
+          "JoinCommuteRule",
+          "JoinAssociateRule",
+          "JoinAssociateRule",
+          "JoinCommuteRule",
+          "FilterIntoJoinRule",
+          "JoinCommuteRule",
+          "JoinCommuteRule",
+          "JoinCommuteRule"
+        ] },
+      "alternatives": [
+        {
+          "index": 0,
+          "plan": "Limit[20]\n  Sort[col(n) DESC, col(group_id) ASC]\n    Project[group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))]\n      Aggregate[group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]]\n        Filter[col(c.tier) = lit(1)]\n          Join[col(l.group_id) = col(c.group_id)]\n            Join[col(l.k) = col(r.k)]\n              Scan[e2e_left AS l]\n              Scan[e2e_right AS r]\n            Scan[e2e_class AS c]",
+          "tree": {
+            "op": "Limit",
+            "detail": "20",
+            "rows": 12.80,
+            "cost": 241224.68,
+            "children": [
+              {
+                "op": "Sort",
+                "detail": "col(n) DESC, col(group_id) ASC",
+                "rows": 12.80,
+                "cost": 241224.68,
+                "children": [
+                  {
+                    "op": "Project",
+                    "detail": "group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))",
+                    "rows": 12.80,
+                    "cost": 241177.60,
+                    "children": [
+                      {
+                        "op": "Aggregate",
+                        "detail": "group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]",
+                        "rows": 12.80,
+                        "cost": 241177.60,
+                        "children": [
+                          {
+                            "op": "Filter",
+                            "detail": "col(c.tier) = lit(1)",
+                            "rows": 12.80,
+                            "cost": 241152.00,
+                            "children": [
+                              {
+                                "op": "Join",
+                                "detail": "col(l.group_id) = col(c.group_id)",
+                                "rows": 128.00,
+                                "cost": 241024.00,
+                                "children": [
+                                  {
+                                    "op": "Join",
+                                    "detail": "col(l.k) = col(r.k)",
+                                    "rows": 256.00,
+                                    "cost": 240512.00,
+                                    "children": [
+                                      {
+                                        "op": "Scan",
+                                        "detail": "e2e_left AS l",
+                                        "rows": 120000.00,
+                                        "cost": 120000.00,
+                                        "children": []
+                                      },
+                                      {
+                                        "op": "Scan",
+                                        "detail": "e2e_right AS r",
+                                        "rows": 256.00,
+                                        "cost": 256.00,
+                                        "children": []
+                                      }
+                                    ]
+                                  },
+                                  {
+                                    "op": "Scan",
+                                    "detail": "e2e_class AS c",
+                                    "rows": 128.00,
+                                    "cost": 128.00,
+                                    "children": []
+                                  }
+                                ]
+                              }
+                            ]
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "totalCost": 241224.68,
+          "rowCount": 20,
+          "bagChecksum": "0x8f1c966523a83a50",
+          "vectorizedMs": { "min": 39.776, "median": 39.897 }
+        },
+        {
+          "index": 1,
+          "plan": "Limit[20]\n  Sort[col(n) DESC, col(group_id) ASC]\n    Project[group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))]\n      Aggregate[group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]]\n        Filter[col(c.tier) = lit(1)]\n          Join[col(l.group_id) = col(c.group_id)]\n            Join[col(l.k) = col(r.k)]\n              Scan[e2e_right AS r]\n              Scan[e2e_left AS l]\n            Scan[e2e_class AS c]",
+          "tree": {
+            "op": "Limit",
+            "detail": "20",
+            "rows": 12.80,
+            "cost": 241224.68,
+            "children": [
+              {
+                "op": "Sort",
+                "detail": "col(n) DESC, col(group_id) ASC",
+                "rows": 12.80,
+                "cost": 241224.68,
+                "children": [
+                  {
+                    "op": "Project",
+                    "detail": "group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))",
+                    "rows": 12.80,
+                    "cost": 241177.60,
+                    "children": [
+                      {
+                        "op": "Aggregate",
+                        "detail": "group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]",
+                        "rows": 12.80,
+                        "cost": 241177.60,
+                        "children": [
+                          {
+                            "op": "Filter",
+                            "detail": "col(c.tier) = lit(1)",
+                            "rows": 12.80,
+                            "cost": 241152.00,
+                            "children": [
+                              {
+                                "op": "Join",
+                                "detail": "col(l.group_id) = col(c.group_id)",
+                                "rows": 128.00,
+                                "cost": 241024.00,
+                                "children": [
+                                  {
+                                    "op": "Join",
+                                    "detail": "col(l.k) = col(r.k)",
+                                    "rows": 256.00,
+                                    "cost": 240512.00,
+                                    "children": [
+                                      {
+                                        "op": "Scan",
+                                        "detail": "e2e_right AS r",
+                                        "rows": 256.00,
+                                        "cost": 256.00,
+                                        "children": []
+                                      },
+                                      {
+                                        "op": "Scan",
+                                        "detail": "e2e_left AS l",
+                                        "rows": 120000.00,
+                                        "cost": 120000.00,
+                                        "children": []
+                                      }
+                                    ]
+                                  },
+                                  {
+                                    "op": "Scan",
+                                    "detail": "e2e_class AS c",
+                                    "rows": 128.00,
+                                    "cost": 128.00,
+                                    "children": []
+                                  }
+                                ]
+                              }
+                            ]
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "totalCost": 241224.68,
+          "rowCount": 20,
+          "bagChecksum": "0x8f1c966523a83a50",
+          "vectorizedMs": { "min": 34.654, "median": 34.667 }
+        },
+        {
+          "index": 2,
+          "plan": "Limit[20]\n  Sort[col(n) DESC, col(group_id) ASC]\n    Project[group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))]\n      Aggregate[group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]]\n        Filter[col(c.tier) = lit(1)]\n          Join[col(l.group_id) = col(c.group_id)]\n            Scan[e2e_class AS c]\n            Join[col(l.k) = col(r.k)]\n              Scan[e2e_left AS l]\n              Scan[e2e_right AS r]",
+          "tree": {
+            "op": "Limit",
+            "detail": "20",
+            "rows": 12.80,
+            "cost": 241224.68,
+            "children": [
+              {
+                "op": "Sort",
+                "detail": "col(n) DESC, col(group_id) ASC",
+                "rows": 12.80,
+                "cost": 241224.68,
+                "children": [
+                  {
+                    "op": "Project",
+                    "detail": "group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))",
+                    "rows": 12.80,
+                    "cost": 241177.60,
+                    "children": [
+                      {
+                        "op": "Aggregate",
+                        "detail": "group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]",
+                        "rows": 12.80,
+                        "cost": 241177.60,
+                        "children": [
+                          {
+                            "op": "Filter",
+                            "detail": "col(c.tier) = lit(1)",
+                            "rows": 12.80,
+                            "cost": 241152.00,
+                            "children": [
+                              {
+                                "op": "Join",
+                                "detail": "col(l.group_id) = col(c.group_id)",
+                                "rows": 128.00,
+                                "cost": 241024.00,
+                                "children": [
+                                  {
+                                    "op": "Scan",
+                                    "detail": "e2e_class AS c",
+                                    "rows": 128.00,
+                                    "cost": 128.00,
+                                    "children": []
+                                  },
+                                  {
+                                    "op": "Join",
+                                    "detail": "col(l.k) = col(r.k)",
+                                    "rows": 256.00,
+                                    "cost": 240512.00,
+                                    "children": [
+                                      {
+                                        "op": "Scan",
+                                        "detail": "e2e_left AS l",
+                                        "rows": 120000.00,
+                                        "cost": 120000.00,
+                                        "children": []
+                                      },
+                                      {
+                                        "op": "Scan",
+                                        "detail": "e2e_right AS r",
+                                        "rows": 256.00,
+                                        "cost": 256.00,
+                                        "children": []
+                                      }
+                                    ]
+                                  }
+                                ]
+                              }
+                            ]
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "totalCost": 241224.68,
+          "rowCount": 20,
+          "bagChecksum": "0x8f1c966523a83a50",
+          "vectorizedMs": { "min": 32.942, "median": 32.990 }
+        },
+        {
+          "index": 3,
+          "plan": "Limit[20]\n  Sort[col(n) DESC, col(group_id) ASC]\n    Project[group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))]\n      Aggregate[group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]]\n        Filter[col(c.tier) = lit(1)]\n          Join[col(l.group_id) = col(c.group_id)]\n            Scan[e2e_class AS c]\n            Join[col(l.k) = col(r.k)]\n              Scan[e2e_right AS r]\n              Scan[e2e_left AS l]",
+          "tree": {
+            "op": "Limit",
+            "detail": "20",
+            "rows": 12.80,
+            "cost": 241224.68,
+            "children": [
+              {
+                "op": "Sort",
+                "detail": "col(n) DESC, col(group_id) ASC",
+                "rows": 12.80,
+                "cost": 241224.68,
+                "children": [
+                  {
+                    "op": "Project",
+                    "detail": "group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))",
+                    "rows": 12.80,
+                    "cost": 241177.60,
+                    "children": [
+                      {
+                        "op": "Aggregate",
+                        "detail": "group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]",
+                        "rows": 12.80,
+                        "cost": 241177.60,
+                        "children": [
+                          {
+                            "op": "Filter",
+                            "detail": "col(c.tier) = lit(1)",
+                            "rows": 12.80,
+                            "cost": 241152.00,
+                            "children": [
+                              {
+                                "op": "Join",
+                                "detail": "col(l.group_id) = col(c.group_id)",
+                                "rows": 128.00,
+                                "cost": 241024.00,
+                                "children": [
+                                  {
+                                    "op": "Scan",
+                                    "detail": "e2e_class AS c",
+                                    "rows": 128.00,
+                                    "cost": 128.00,
+                                    "children": []
+                                  },
+                                  {
+                                    "op": "Join",
+                                    "detail": "col(l.k) = col(r.k)",
+                                    "rows": 256.00,
+                                    "cost": 240512.00,
+                                    "children": [
+                                      {
+                                        "op": "Scan",
+                                        "detail": "e2e_right AS r",
+                                        "rows": 256.00,
+                                        "cost": 256.00,
+                                        "children": []
+                                      },
+                                      {
+                                        "op": "Scan",
+                                        "detail": "e2e_left AS l",
+                                        "rows": 120000.00,
+                                        "cost": 120000.00,
+                                        "children": []
+                                      }
+                                    ]
+                                  }
+                                ]
+                              }
+                            ]
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "totalCost": 241224.68,
+          "rowCount": 20,
+          "bagChecksum": "0x8f1c966523a83a50",
+          "vectorizedMs": { "min": 30.710, "median": 30.725 }
+        },
+        {
+          "index": 4,
+          "plan": "Limit[20]\n  Sort[col(n) DESC, col(group_id) ASC]\n    Project[group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))]\n      Aggregate[group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]]\n        Filter[col(c.tier) = lit(1)]\n          Join[col(l.k) = col(r.k)]\n            Scan[e2e_right AS r]\n            Join[col(l.group_id) = col(c.group_id)]\n              Scan[e2e_left AS l]\n              Scan[e2e_class AS c]",
+          "tree": {
+            "op": "Limit",
+            "detail": "20",
+            "rows": 12.80,
+            "cost": 241096.68,
+            "children": [
+              {
+                "op": "Sort",
+                "detail": "col(n) DESC, col(group_id) ASC",
+                "rows": 12.80,
+                "cost": 241096.68,
+                "children": [
+                  {
+                    "op": "Project",
+                    "detail": "group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))",
+                    "rows": 12.80,
+                    "cost": 241049.60,
+                    "children": [
+                      {
+                        "op": "Aggregate",
+                        "detail": "group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]",
+                        "rows": 12.80,
+                        "cost": 241049.60,
+                        "children": [
+                          {
+                            "op": "Filter",
+                            "detail": "col(c.tier) = lit(1)",
+                            "rows": 12.80,
+                            "cost": 241024.00,
+                            "children": [
+                              {
+                                "op": "Join",
+                                "detail": "col(l.k) = col(r.k)",
+                                "rows": 128.00,
+                                "cost": 240896.00,
+                                "children": [
+                                  {
+                                    "op": "Scan",
+                                    "detail": "e2e_right AS r",
+                                    "rows": 256.00,
+                                    "cost": 256.00,
+                                    "children": []
+                                  },
+                                  {
+                                    "op": "Join",
+                                    "detail": "col(l.group_id) = col(c.group_id)",
+                                    "rows": 128.00,
+                                    "cost": 240256.00,
+                                    "children": [
+                                      {
+                                        "op": "Scan",
+                                        "detail": "e2e_left AS l",
+                                        "rows": 120000.00,
+                                        "cost": 120000.00,
+                                        "children": []
+                                      },
+                                      {
+                                        "op": "Scan",
+                                        "detail": "e2e_class AS c",
+                                        "rows": 128.00,
+                                        "cost": 128.00,
+                                        "children": []
+                                      }
+                                    ]
+                                  }
+                                ]
+                              }
+                            ]
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "totalCost": 241096.68,
+          "rowCount": 20,
+          "bagChecksum": "0x8f1c966523a83a50",
+          "vectorizedMs": { "min": 36.685, "median": 36.737 }
+        },
+        {
+          "index": 5,
+          "plan": "Limit[20]\n  Sort[col(n) DESC, col(group_id) ASC]\n    Project[group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))]\n      Aggregate[group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]]\n        Filter[col(c.tier) = lit(1)]\n          Join[col(l.k) = col(r.k)]\n            Scan[e2e_right AS r]\n            Join[col(l.group_id) = col(c.group_id)]\n              Scan[e2e_class AS c]\n              Scan[e2e_left AS l]",
+          "tree": {
+            "op": "Limit",
+            "detail": "20",
+            "rows": 12.80,
+            "cost": 241096.68,
+            "children": [
+              {
+                "op": "Sort",
+                "detail": "col(n) DESC, col(group_id) ASC",
+                "rows": 12.80,
+                "cost": 241096.68,
+                "children": [
+                  {
+                    "op": "Project",
+                    "detail": "group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))",
+                    "rows": 12.80,
+                    "cost": 241049.60,
+                    "children": [
+                      {
+                        "op": "Aggregate",
+                        "detail": "group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]",
+                        "rows": 12.80,
+                        "cost": 241049.60,
+                        "children": [
+                          {
+                            "op": "Filter",
+                            "detail": "col(c.tier) = lit(1)",
+                            "rows": 12.80,
+                            "cost": 241024.00,
+                            "children": [
+                              {
+                                "op": "Join",
+                                "detail": "col(l.k) = col(r.k)",
+                                "rows": 128.00,
+                                "cost": 240896.00,
+                                "children": [
+                                  {
+                                    "op": "Scan",
+                                    "detail": "e2e_right AS r",
+                                    "rows": 256.00,
+                                    "cost": 256.00,
+                                    "children": []
+                                  },
+                                  {
+                                    "op": "Join",
+                                    "detail": "col(l.group_id) = col(c.group_id)",
+                                    "rows": 128.00,
+                                    "cost": 240256.00,
+                                    "children": [
+                                      {
+                                        "op": "Scan",
+                                        "detail": "e2e_class AS c",
+                                        "rows": 128.00,
+                                        "cost": 128.00,
+                                        "children": []
+                                      },
+                                      {
+                                        "op": "Scan",
+                                        "detail": "e2e_left AS l",
+                                        "rows": 120000.00,
+                                        "cost": 120000.00,
+                                        "children": []
+                                      }
+                                    ]
+                                  }
+                                ]
+                              }
+                            ]
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "totalCost": 241096.68,
+          "rowCount": 20,
+          "bagChecksum": "0x8f1c966523a83a50",
+          "vectorizedMs": { "min": 32.799, "median": 32.900 }
+        },
+        {
+          "index": 6,
+          "plan": "Limit[20]\n  Sort[col(n) DESC, col(group_id) ASC]\n    Project[group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))]\n      Aggregate[group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]]\n        Filter[col(c.tier) = lit(1)]\n          Join[col(l.k) = col(r.k)]\n            Join[col(l.group_id) = col(c.group_id)]\n              Scan[e2e_left AS l]\n              Scan[e2e_class AS c]\n            Scan[e2e_right AS r]",
+          "tree": {
+            "op": "Limit",
+            "detail": "20",
+            "rows": 12.80,
+            "cost": 241096.68,
+            "children": [
+              {
+                "op": "Sort",
+                "detail": "col(n) DESC, col(group_id) ASC",
+                "rows": 12.80,
+                "cost": 241096.68,
+                "children": [
+                  {
+                    "op": "Project",
+                    "detail": "group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))",
+                    "rows": 12.80,
+                    "cost": 241049.60,
+                    "children": [
+                      {
+                        "op": "Aggregate",
+                        "detail": "group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]",
+                        "rows": 12.80,
+                        "cost": 241049.60,
+                        "children": [
+                          {
+                            "op": "Filter",
+                            "detail": "col(c.tier) = lit(1)",
+                            "rows": 12.80,
+                            "cost": 241024.00,
+                            "children": [
+                              {
+                                "op": "Join",
+                                "detail": "col(l.k) = col(r.k)",
+                                "rows": 128.00,
+                                "cost": 240896.00,
+                                "children": [
+                                  {
+                                    "op": "Join",
+                                    "detail": "col(l.group_id) = col(c.group_id)",
+                                    "rows": 128.00,
+                                    "cost": 240256.00,
+                                    "children": [
+                                      {
+                                        "op": "Scan",
+                                        "detail": "e2e_left AS l",
+                                        "rows": 120000.00,
+                                        "cost": 120000.00,
+                                        "children": []
+                                      },
+                                      {
+                                        "op": "Scan",
+                                        "detail": "e2e_class AS c",
+                                        "rows": 128.00,
+                                        "cost": 128.00,
+                                        "children": []
+                                      }
+                                    ]
+                                  },
+                                  {
+                                    "op": "Scan",
+                                    "detail": "e2e_right AS r",
+                                    "rows": 256.00,
+                                    "cost": 256.00,
+                                    "children": []
+                                  }
+                                ]
+                              }
+                            ]
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "totalCost": 241096.68,
+          "rowCount": 20,
+          "bagChecksum": "0x8f1c966523a83a50",
+          "vectorizedMs": { "min": 39.762, "median": 39.825 }
+        },
+        {
+          "index": 7,
+          "plan": "Limit[20]\n  Sort[col(n) DESC, col(group_id) ASC]\n    Project[group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))]\n      Aggregate[group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]]\n        Filter[col(c.tier) = lit(1)]\n          Join[col(l.k) = col(r.k)]\n            Join[col(l.group_id) = col(c.group_id)]\n              Scan[e2e_class AS c]\n              Scan[e2e_left AS l]\n            Scan[e2e_right AS r]",
+          "tree": {
+            "op": "Limit",
+            "detail": "20",
+            "rows": 12.80,
+            "cost": 241096.68,
+            "children": [
+              {
+                "op": "Sort",
+                "detail": "col(n) DESC, col(group_id) ASC",
+                "rows": 12.80,
+                "cost": 241096.68,
+                "children": [
+                  {
+                    "op": "Project",
+                    "detail": "group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))",
+                    "rows": 12.80,
+                    "cost": 241049.60,
+                    "children": [
+                      {
+                        "op": "Aggregate",
+                        "detail": "group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]",
+                        "rows": 12.80,
+                        "cost": 241049.60,
+                        "children": [
+                          {
+                            "op": "Filter",
+                            "detail": "col(c.tier) = lit(1)",
+                            "rows": 12.80,
+                            "cost": 241024.00,
+                            "children": [
+                              {
+                                "op": "Join",
+                                "detail": "col(l.k) = col(r.k)",
+                                "rows": 128.00,
+                                "cost": 240896.00,
+                                "children": [
+                                  {
+                                    "op": "Join",
+                                    "detail": "col(l.group_id) = col(c.group_id)",
+                                    "rows": 128.00,
+                                    "cost": 240256.00,
+                                    "children": [
+                                      {
+                                        "op": "Scan",
+                                        "detail": "e2e_class AS c",
+                                        "rows": 128.00,
+                                        "cost": 128.00,
+                                        "children": []
+                                      },
+                                      {
+                                        "op": "Scan",
+                                        "detail": "e2e_left AS l",
+                                        "rows": 120000.00,
+                                        "cost": 120000.00,
+                                        "children": []
+                                      }
+                                    ]
+                                  },
+                                  {
+                                    "op": "Scan",
+                                    "detail": "e2e_right AS r",
+                                    "rows": 256.00,
+                                    "cost": 256.00,
+                                    "children": []
+                                  }
+                                ]
+                              }
+                            ]
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "totalCost": 241096.68,
+          "rowCount": 20,
+          "bagChecksum": "0x8f1c966523a83a50",
+          "vectorizedMs": { "min": 29.400, "median": 29.418 }
+        },
+        {
+          "index": 8,
+          "plan": "Limit[20]\n  Sort[col(n) DESC, col(group_id) ASC]\n    Project[group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))]\n      Aggregate[group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]]\n        Join[col(l.group_id) = col(c.group_id)]\n          Join[col(l.k) = col(r.k)]\n            Scan[e2e_left AS l]\n            Scan[e2e_right AS r]\n          Filter[col(c.tier) = lit(1)]\n            Scan[e2e_class AS c]",
+          "tree": {
+            "op": "Limit",
+            "detail": "20",
+            "rows": 12.80,
+            "cost": 241109.48,
+            "children": [
+              {
+                "op": "Sort",
+                "detail": "col(n) DESC, col(group_id) ASC",
+                "rows": 12.80,
+                "cost": 241109.48,
+                "children": [
+                  {
+                    "op": "Project",
+                    "detail": "group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))",
+                    "rows": 12.80,
+                    "cost": 241062.40,
+                    "children": [
+                      {
+                        "op": "Aggregate",
+                        "detail": "group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]",
+                        "rows": 12.80,
+                        "cost": 241062.40,
+                        "children": [
+                          {
+                            "op": "Join",
+                            "detail": "col(l.group_id) = col(c.group_id)",
+                            "rows": 12.80,
+                            "cost": 241036.80,
+                            "children": [
+                              {
+                                "op": "Join",
+                                "detail": "col(l.k) = col(r.k)",
+                                "rows": 256.00,
+                                "cost": 240512.00,
+                                "children": [
+                                  {
+                                    "op": "Scan",
+                                    "detail": "e2e_left AS l",
+                                    "rows": 120000.00,
+                                    "cost": 120000.00,
+                                    "children": []
+                                  },
+                                  {
+                                    "op": "Scan",
+                                    "detail": "e2e_right AS r",
+                                    "rows": 256.00,
+                                    "cost": 256.00,
+                                    "children": []
+                                  }
+                                ]
+                              },
+                              {
+                                "op": "Filter",
+                                "detail": "col(c.tier) = lit(1)",
+                                "rows": 12.80,
+                                "cost": 256.00,
+                                "children": [
+                                  {
+                                    "op": "Scan",
+                                    "detail": "e2e_class AS c",
+                                    "rows": 128.00,
+                                    "cost": 128.00,
+                                    "children": []
+                                  }
+                                ]
+                              }
+                            ]
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "totalCost": 241109.48,
+          "rowCount": 20,
+          "bagChecksum": "0x8f1c966523a83a50",
+          "vectorizedMs": { "min": 27.592, "median": 27.625 }
+        },
+        {
+          "index": 9,
+          "plan": "Limit[20]\n  Sort[col(n) DESC, col(group_id) ASC]\n    Project[group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))]\n      Aggregate[group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]]\n        Join[col(l.group_id) = col(c.group_id)]\n          Join[col(l.k) = col(r.k)]\n            Scan[e2e_right AS r]\n            Scan[e2e_left AS l]\n          Filter[col(c.tier) = lit(1)]\n            Scan[e2e_class AS c]",
+          "tree": {
+            "op": "Limit",
+            "detail": "20",
+            "rows": 12.80,
+            "cost": 241109.48,
+            "children": [
+              {
+                "op": "Sort",
+                "detail": "col(n) DESC, col(group_id) ASC",
+                "rows": 12.80,
+                "cost": 241109.48,
+                "children": [
+                  {
+                    "op": "Project",
+                    "detail": "group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))",
+                    "rows": 12.80,
+                    "cost": 241062.40,
+                    "children": [
+                      {
+                        "op": "Aggregate",
+                        "detail": "group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]",
+                        "rows": 12.80,
+                        "cost": 241062.40,
+                        "children": [
+                          {
+                            "op": "Join",
+                            "detail": "col(l.group_id) = col(c.group_id)",
+                            "rows": 12.80,
+                            "cost": 241036.80,
+                            "children": [
+                              {
+                                "op": "Join",
+                                "detail": "col(l.k) = col(r.k)",
+                                "rows": 256.00,
+                                "cost": 240512.00,
+                                "children": [
+                                  {
+                                    "op": "Scan",
+                                    "detail": "e2e_right AS r",
+                                    "rows": 256.00,
+                                    "cost": 256.00,
+                                    "children": []
+                                  },
+                                  {
+                                    "op": "Scan",
+                                    "detail": "e2e_left AS l",
+                                    "rows": 120000.00,
+                                    "cost": 120000.00,
+                                    "children": []
+                                  }
+                                ]
+                              },
+                              {
+                                "op": "Filter",
+                                "detail": "col(c.tier) = lit(1)",
+                                "rows": 12.80,
+                                "cost": 256.00,
+                                "children": [
+                                  {
+                                    "op": "Scan",
+                                    "detail": "e2e_class AS c",
+                                    "rows": 128.00,
+                                    "cost": 128.00,
+                                    "children": []
+                                  }
+                                ]
+                              }
+                            ]
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "totalCost": 241109.48,
+          "rowCount": 20,
+          "bagChecksum": "0x8f1c966523a83a50",
+          "vectorizedMs": { "min": 24.504, "median": 24.548 }
+        },
+        {
+          "index": 10,
+          "plan": "Limit[20]\n  Sort[col(n) DESC, col(group_id) ASC]\n    Project[group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))]\n      Aggregate[group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]]\n        Join[col(l.group_id) = col(c.group_id)]\n          Filter[col(c.tier) = lit(1)]\n            Scan[e2e_class AS c]\n          Join[col(l.k) = col(r.k)]\n            Scan[e2e_left AS l]\n            Scan[e2e_right AS r]",
+          "tree": {
+            "op": "Limit",
+            "detail": "20",
+            "rows": 12.80,
+            "cost": 241109.48,
+            "children": [
+              {
+                "op": "Sort",
+                "detail": "col(n) DESC, col(group_id) ASC",
+                "rows": 12.80,
+                "cost": 241109.48,
+                "children": [
+                  {
+                    "op": "Project",
+                    "detail": "group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))",
+                    "rows": 12.80,
+                    "cost": 241062.40,
+                    "children": [
+                      {
+                        "op": "Aggregate",
+                        "detail": "group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]",
+                        "rows": 12.80,
+                        "cost": 241062.40,
+                        "children": [
+                          {
+                            "op": "Join",
+                            "detail": "col(l.group_id) = col(c.group_id)",
+                            "rows": 12.80,
+                            "cost": 241036.80,
+                            "children": [
+                              {
+                                "op": "Filter",
+                                "detail": "col(c.tier) = lit(1)",
+                                "rows": 12.80,
+                                "cost": 256.00,
+                                "children": [
+                                  {
+                                    "op": "Scan",
+                                    "detail": "e2e_class AS c",
+                                    "rows": 128.00,
+                                    "cost": 128.00,
+                                    "children": []
+                                  }
+                                ]
+                              },
+                              {
+                                "op": "Join",
+                                "detail": "col(l.k) = col(r.k)",
+                                "rows": 256.00,
+                                "cost": 240512.00,
+                                "children": [
+                                  {
+                                    "op": "Scan",
+                                    "detail": "e2e_left AS l",
+                                    "rows": 120000.00,
+                                    "cost": 120000.00,
+                                    "children": []
+                                  },
+                                  {
+                                    "op": "Scan",
+                                    "detail": "e2e_right AS r",
+                                    "rows": 256.00,
+                                    "cost": 256.00,
+                                    "children": []
+                                  }
+                                ]
+                              }
+                            ]
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "totalCost": 241109.48,
+          "rowCount": 20,
+          "bagChecksum": "0x8f1c966523a83a50",
+          "vectorizedMs": { "min": 25.881, "median": 25.902 }
+        },
+        {
+          "index": 11,
+          "plan": "Limit[20]\n  Sort[col(n) DESC, col(group_id) ASC]\n    Project[group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))]\n      Aggregate[group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]]\n        Join[col(l.group_id) = col(c.group_id)]\n          Filter[col(c.tier) = lit(1)]\n            Scan[e2e_class AS c]\n          Join[col(l.k) = col(r.k)]\n            Scan[e2e_right AS r]\n            Scan[e2e_left AS l]",
+          "tree": {
+            "op": "Limit",
+            "detail": "20",
+            "rows": 12.80,
+            "cost": 241109.48,
+            "children": [
+              {
+                "op": "Sort",
+                "detail": "col(n) DESC, col(group_id) ASC",
+                "rows": 12.80,
+                "cost": 241109.48,
+                "children": [
+                  {
+                    "op": "Project",
+                    "detail": "group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))",
+                    "rows": 12.80,
+                    "cost": 241062.40,
+                    "children": [
+                      {
+                        "op": "Aggregate",
+                        "detail": "group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]",
+                        "rows": 12.80,
+                        "cost": 241062.40,
+                        "children": [
+                          {
+                            "op": "Join",
+                            "detail": "col(l.group_id) = col(c.group_id)",
+                            "rows": 12.80,
+                            "cost": 241036.80,
+                            "children": [
+                              {
+                                "op": "Filter",
+                                "detail": "col(c.tier) = lit(1)",
+                                "rows": 12.80,
+                                "cost": 256.00,
+                                "children": [
+                                  {
+                                    "op": "Scan",
+                                    "detail": "e2e_class AS c",
+                                    "rows": 128.00,
+                                    "cost": 128.00,
+                                    "children": []
+                                  }
+                                ]
+                              },
+                              {
+                                "op": "Join",
+                                "detail": "col(l.k) = col(r.k)",
+                                "rows": 256.00,
+                                "cost": 240512.00,
+                                "children": [
+                                  {
+                                    "op": "Scan",
+                                    "detail": "e2e_right AS r",
+                                    "rows": 256.00,
+                                    "cost": 256.00,
+                                    "children": []
+                                  },
+                                  {
+                                    "op": "Scan",
+                                    "detail": "e2e_left AS l",
+                                    "rows": 120000.00,
+                                    "cost": 120000.00,
+                                    "children": []
+                                  }
+                                ]
+                              }
+                            ]
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "totalCost": 241109.48,
+          "rowCount": 20,
+          "bagChecksum": "0x8f1c966523a83a50",
+          "vectorizedMs": { "min": 23.560, "median": 23.607 }
+        },
+        {
+          "index": 12,
+          "plan": "Limit[20]\n  Sort[col(n) DESC, col(group_id) ASC]\n    Project[group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))]\n      Aggregate[group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]]\n        Join[col(l.k) = col(r.k)]\n          Scan[e2e_right AS r]\n          Join[col(l.group_id) = col(c.group_id)]\n            Scan[e2e_left AS l]\n            Filter[col(c.tier) = lit(1)]\n              Scan[e2e_class AS c]",
+          "tree": {
+            "op": "Limit",
+            "detail": "20",
+            "rows": 12.80,
+            "cost": 240866.28,
+            "children": [
+              {
+                "op": "Sort",
+                "detail": "col(n) DESC, col(group_id) ASC",
+                "rows": 12.80,
+                "cost": 240866.28,
+                "children": [
+                  {
+                    "op": "Project",
+                    "detail": "group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))",
+                    "rows": 12.80,
+                    "cost": 240819.20,
+                    "children": [
+                      {
+                        "op": "Aggregate",
+                        "detail": "group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]",
+                        "rows": 12.80,
+                        "cost": 240819.20,
+                        "children": [
+                          {
+                            "op": "Join",
+                            "detail": "col(l.k) = col(r.k)",
+                            "rows": 12.80,
+                            "cost": 240793.60,
+                            "children": [
+                              {
+                                "op": "Scan",
+                                "detail": "e2e_right AS r",
+                                "rows": 256.00,
+                                "cost": 256.00,
+                                "children": []
+                              },
+                              {
+                                "op": "Join",
+                                "detail": "col(l.group_id) = col(c.group_id)",
+                                "rows": 12.80,
+                                "cost": 240268.80,
+                                "children": [
+                                  {
+                                    "op": "Scan",
+                                    "detail": "e2e_left AS l",
+                                    "rows": 120000.00,
+                                    "cost": 120000.00,
+                                    "children": []
+                                  },
+                                  {
+                                    "op": "Filter",
+                                    "detail": "col(c.tier) = lit(1)",
+                                    "rows": 12.80,
+                                    "cost": 256.00,
+                                    "children": [
+                                      {
+                                        "op": "Scan",
+                                        "detail": "e2e_class AS c",
+                                        "rows": 128.00,
+                                        "cost": 128.00,
+                                        "children": []
+                                      }
+                                    ]
+                                  }
+                                ]
+                              }
+                            ]
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "totalCost": 240866.28,
+          "rowCount": 20,
+          "bagChecksum": "0x8f1c966523a83a50",
+          "vectorizedMs": { "min": 16.510, "median": 16.563 }
+        },
+        {
+          "index": 13,
+          "plan": "Limit[20]\n  Sort[col(n) DESC, col(group_id) ASC]\n    Project[group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))]\n      Aggregate[group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]]\n        Join[col(l.k) = col(r.k)]\n          Scan[e2e_right AS r]\n          Join[col(l.group_id) = col(c.group_id)]\n            Filter[col(c.tier) = lit(1)]\n              Scan[e2e_class AS c]\n            Scan[e2e_left AS l]",
+          "tree": {
+            "op": "Limit",
+            "detail": "20",
+            "rows": 12.80,
+            "cost": 240866.28,
+            "children": [
+              {
+                "op": "Sort",
+                "detail": "col(n) DESC, col(group_id) ASC",
+                "rows": 12.80,
+                "cost": 240866.28,
+                "children": [
+                  {
+                    "op": "Project",
+                    "detail": "group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))",
+                    "rows": 12.80,
+                    "cost": 240819.20,
+                    "children": [
+                      {
+                        "op": "Aggregate",
+                        "detail": "group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]",
+                        "rows": 12.80,
+                        "cost": 240819.20,
+                        "children": [
+                          {
+                            "op": "Join",
+                            "detail": "col(l.k) = col(r.k)",
+                            "rows": 12.80,
+                            "cost": 240793.60,
+                            "children": [
+                              {
+                                "op": "Scan",
+                                "detail": "e2e_right AS r",
+                                "rows": 256.00,
+                                "cost": 256.00,
+                                "children": []
+                              },
+                              {
+                                "op": "Join",
+                                "detail": "col(l.group_id) = col(c.group_id)",
+                                "rows": 12.80,
+                                "cost": 240268.80,
+                                "children": [
+                                  {
+                                    "op": "Filter",
+                                    "detail": "col(c.tier) = lit(1)",
+                                    "rows": 12.80,
+                                    "cost": 256.00,
+                                    "children": [
+                                      {
+                                        "op": "Scan",
+                                        "detail": "e2e_class AS c",
+                                        "rows": 128.00,
+                                        "cost": 128.00,
+                                        "children": []
+                                      }
+                                    ]
+                                  },
+                                  {
+                                    "op": "Scan",
+                                    "detail": "e2e_left AS l",
+                                    "rows": 120000.00,
+                                    "cost": 120000.00,
+                                    "children": []
+                                  }
+                                ]
+                              }
+                            ]
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "totalCost": 240866.28,
+          "rowCount": 20,
+          "bagChecksum": "0x8f1c966523a83a50",
+          "vectorizedMs": { "min": 15.168, "median": 15.200 }
+        },
+        {
+          "index": 14,
+          "plan": "Limit[20]\n  Sort[col(n) DESC, col(group_id) ASC]\n    Project[group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))]\n      Aggregate[group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]]\n        Join[col(l.k) = col(r.k)]\n          Join[col(l.group_id) = col(c.group_id)]\n            Scan[e2e_left AS l]\n            Filter[col(c.tier) = lit(1)]\n              Scan[e2e_class AS c]\n          Scan[e2e_right AS r]",
+          "tree": {
+            "op": "Limit",
+            "detail": "20",
+            "rows": 12.80,
+            "cost": 240866.28,
+            "children": [
+              {
+                "op": "Sort",
+                "detail": "col(n) DESC, col(group_id) ASC",
+                "rows": 12.80,
+                "cost": 240866.28,
+                "children": [
+                  {
+                    "op": "Project",
+                    "detail": "group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))",
+                    "rows": 12.80,
+                    "cost": 240819.20,
+                    "children": [
+                      {
+                        "op": "Aggregate",
+                        "detail": "group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]",
+                        "rows": 12.80,
+                        "cost": 240819.20,
+                        "children": [
+                          {
+                            "op": "Join",
+                            "detail": "col(l.k) = col(r.k)",
+                            "rows": 12.80,
+                            "cost": 240793.60,
+                            "children": [
+                              {
+                                "op": "Join",
+                                "detail": "col(l.group_id) = col(c.group_id)",
+                                "rows": 12.80,
+                                "cost": 240268.80,
+                                "children": [
+                                  {
+                                    "op": "Scan",
+                                    "detail": "e2e_left AS l",
+                                    "rows": 120000.00,
+                                    "cost": 120000.00,
+                                    "children": []
+                                  },
+                                  {
+                                    "op": "Filter",
+                                    "detail": "col(c.tier) = lit(1)",
+                                    "rows": 12.80,
+                                    "cost": 256.00,
+                                    "children": [
+                                      {
+                                        "op": "Scan",
+                                        "detail": "e2e_class AS c",
+                                        "rows": 128.00,
+                                        "cost": 128.00,
+                                        "children": []
+                                      }
+                                    ]
+                                  }
+                                ]
+                              },
+                              {
+                                "op": "Scan",
+                                "detail": "e2e_right AS r",
+                                "rows": 256.00,
+                                "cost": 256.00,
+                                "children": []
+                              }
+                            ]
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "totalCost": 240866.28,
+          "rowCount": 20,
+          "bagChecksum": "0x8f1c966523a83a50",
+          "vectorizedMs": { "min": 17.779, "median": 17.896 }
+        },
+        {
+          "index": 15,
+          "plan": "Limit[20]\n  Sort[col(n) DESC, col(group_id) ASC]\n    Project[group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))]\n      Aggregate[group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]]\n        Join[col(l.k) = col(r.k)]\n          Join[col(l.group_id) = col(c.group_id)]\n            Filter[col(c.tier) = lit(1)]\n              Scan[e2e_class AS c]\n            Scan[e2e_left AS l]\n          Scan[e2e_right AS r]",
+          "tree": {
+            "op": "Limit",
+            "detail": "20",
+            "rows": 12.80,
+            "cost": 240866.28,
+            "children": [
+              {
+                "op": "Sort",
+                "detail": "col(n) DESC, col(group_id) ASC",
+                "rows": 12.80,
+                "cost": 240866.28,
+                "children": [
+                  {
+                    "op": "Project",
+                    "detail": "group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))",
+                    "rows": 12.80,
+                    "cost": 240819.20,
+                    "children": [
+                      {
+                        "op": "Aggregate",
+                        "detail": "group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]",
+                        "rows": 12.80,
+                        "cost": 240819.20,
+                        "children": [
+                          {
+                            "op": "Join",
+                            "detail": "col(l.k) = col(r.k)",
+                            "rows": 12.80,
+                            "cost": 240793.60,
+                            "children": [
+                              {
+                                "op": "Join",
+                                "detail": "col(l.group_id) = col(c.group_id)",
+                                "rows": 12.80,
+                                "cost": 240268.80,
+                                "children": [
+                                  {
+                                    "op": "Filter",
+                                    "detail": "col(c.tier) = lit(1)",
+                                    "rows": 12.80,
+                                    "cost": 256.00,
+                                    "children": [
+                                      {
+                                        "op": "Scan",
+                                        "detail": "e2e_class AS c",
+                                        "rows": 128.00,
+                                        "cost": 128.00,
+                                        "children": []
+                                      }
+                                    ]
+                                  },
+                                  {
+                                    "op": "Scan",
+                                    "detail": "e2e_left AS l",
+                                    "rows": 120000.00,
+                                    "cost": 120000.00,
+                                    "children": []
+                                  }
+                                ]
+                              },
+                              {
+                                "op": "Scan",
+                                "detail": "e2e_right AS r",
+                                "rows": 256.00,
+                                "cost": 256.00,
+                                "children": []
+                              }
+                            ]
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "totalCost": 240866.28,
+          "rowCount": 20,
+          "bagChecksum": "0x8f1c966523a83a50",
+          "vectorizedMs": { "min": 14.535, "median": 14.738 }
+        },
+        {
+          "index": 16,
+          "plan": "Limit[20]\n  Sort[col(n) DESC, col(group_id) ASC]\n    Project[group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))]\n      Aggregate[group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]]\n        Join[col(l.k) = col(r.k)]\n          Scan[e2e_right AS r]\n          Filter[col(c.tier) = lit(1)]\n            Join[col(l.group_id) = col(c.group_id)]\n              Scan[e2e_left AS l]\n              Scan[e2e_class AS c]",
+          "tree": {
+            "op": "Limit",
+            "detail": "20",
+            "rows": 12.80,
+            "cost": 240981.48,
+            "children": [
+              {
+                "op": "Sort",
+                "detail": "col(n) DESC, col(group_id) ASC",
+                "rows": 12.80,
+                "cost": 240981.48,
+                "children": [
+                  {
+                    "op": "Project",
+                    "detail": "group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))",
+                    "rows": 12.80,
+                    "cost": 240934.40,
+                    "children": [
+                      {
+                        "op": "Aggregate",
+                        "detail": "group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]",
+                        "rows": 12.80,
+                        "cost": 240934.40,
+                        "children": [
+                          {
+                            "op": "Join",
+                            "detail": "col(l.k) = col(r.k)",
+                            "rows": 12.80,
+                            "cost": 240908.80,
+                            "children": [
+                              {
+                                "op": "Scan",
+                                "detail": "e2e_right AS r",
+                                "rows": 256.00,
+                                "cost": 256.00,
+                                "children": []
+                              },
+                              {
+                                "op": "Filter",
+                                "detail": "col(c.tier) = lit(1)",
+                                "rows": 12.80,
+                                "cost": 240384.00,
+                                "children": [
+                                  {
+                                    "op": "Join",
+                                    "detail": "col(l.group_id) = col(c.group_id)",
+                                    "rows": 128.00,
+                                    "cost": 240256.00,
+                                    "children": [
+                                      {
+                                        "op": "Scan",
+                                        "detail": "e2e_left AS l",
+                                        "rows": 120000.00,
+                                        "cost": 120000.00,
+                                        "children": []
+                                      },
+                                      {
+                                        "op": "Scan",
+                                        "detail": "e2e_class AS c",
+                                        "rows": 128.00,
+                                        "cost": 128.00,
+                                        "children": []
+                                      }
+                                    ]
+                                  }
+                                ]
+                              }
+                            ]
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "totalCost": 240981.48,
+          "rowCount": 20,
+          "bagChecksum": "0x8f1c966523a83a50",
+          "vectorizedMs": { "min": 26.074, "median": 26.108 }
+        },
+        {
+          "index": 17,
+          "plan": "Limit[20]\n  Sort[col(n) DESC, col(group_id) ASC]\n    Project[group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))]\n      Aggregate[group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]]\n        Join[col(l.k) = col(r.k)]\n          Scan[e2e_right AS r]\n          Filter[col(c.tier) = lit(1)]\n            Join[col(l.group_id) = col(c.group_id)]\n              Scan[e2e_class AS c]\n              Scan[e2e_left AS l]",
+          "tree": {
+            "op": "Limit",
+            "detail": "20",
+            "rows": 12.80,
+            "cost": 240981.48,
+            "children": [
+              {
+                "op": "Sort",
+                "detail": "col(n) DESC, col(group_id) ASC",
+                "rows": 12.80,
+                "cost": 240981.48,
+                "children": [
+                  {
+                    "op": "Project",
+                    "detail": "group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))",
+                    "rows": 12.80,
+                    "cost": 240934.40,
+                    "children": [
+                      {
+                        "op": "Aggregate",
+                        "detail": "group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]",
+                        "rows": 12.80,
+                        "cost": 240934.40,
+                        "children": [
+                          {
+                            "op": "Join",
+                            "detail": "col(l.k) = col(r.k)",
+                            "rows": 12.80,
+                            "cost": 240908.80,
+                            "children": [
+                              {
+                                "op": "Scan",
+                                "detail": "e2e_right AS r",
+                                "rows": 256.00,
+                                "cost": 256.00,
+                                "children": []
+                              },
+                              {
+                                "op": "Filter",
+                                "detail": "col(c.tier) = lit(1)",
+                                "rows": 12.80,
+                                "cost": 240384.00,
+                                "children": [
+                                  {
+                                    "op": "Join",
+                                    "detail": "col(l.group_id) = col(c.group_id)",
+                                    "rows": 128.00,
+                                    "cost": 240256.00,
+                                    "children": [
+                                      {
+                                        "op": "Scan",
+                                        "detail": "e2e_class AS c",
+                                        "rows": 128.00,
+                                        "cost": 128.00,
+                                        "children": []
+                                      },
+                                      {
+                                        "op": "Scan",
+                                        "detail": "e2e_left AS l",
+                                        "rows": 120000.00,
+                                        "cost": 120000.00,
+                                        "children": []
+                                      }
+                                    ]
+                                  }
+                                ]
+                              }
+                            ]
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "totalCost": 240981.48,
+          "rowCount": 20,
+          "bagChecksum": "0x8f1c966523a83a50",
+          "vectorizedMs": { "min": 21.237, "median": 21.333 }
+        },
+        {
+          "index": 18,
+          "plan": "Limit[20]\n  Sort[col(n) DESC, col(group_id) ASC]\n    Project[group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))]\n      Aggregate[group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]]\n        Join[col(l.k) = col(r.k)]\n          Scan[e2e_right AS r]\n          Join[col(l.group_id) = col(c.group_id)]\n            Scan[e2e_left AS l]\n            Filter[col(c.tier) = lit(1)]\n              Scan[e2e_class AS c]",
+          "tree": {
+            "op": "Limit",
+            "detail": "20",
+            "rows": 12.80,
+            "cost": 240866.28,
+            "children": [
+              {
+                "op": "Sort",
+                "detail": "col(n) DESC, col(group_id) ASC",
+                "rows": 12.80,
+                "cost": 240866.28,
+                "children": [
+                  {
+                    "op": "Project",
+                    "detail": "group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))",
+                    "rows": 12.80,
+                    "cost": 240819.20,
+                    "children": [
+                      {
+                        "op": "Aggregate",
+                        "detail": "group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]",
+                        "rows": 12.80,
+                        "cost": 240819.20,
+                        "children": [
+                          {
+                            "op": "Join",
+                            "detail": "col(l.k) = col(r.k)",
+                            "rows": 12.80,
+                            "cost": 240793.60,
+                            "children": [
+                              {
+                                "op": "Scan",
+                                "detail": "e2e_right AS r",
+                                "rows": 256.00,
+                                "cost": 256.00,
+                                "children": []
+                              },
+                              {
+                                "op": "Join",
+                                "detail": "col(l.group_id) = col(c.group_id)",
+                                "rows": 12.80,
+                                "cost": 240268.80,
+                                "children": [
+                                  {
+                                    "op": "Scan",
+                                    "detail": "e2e_left AS l",
+                                    "rows": 120000.00,
+                                    "cost": 120000.00,
+                                    "children": []
+                                  },
+                                  {
+                                    "op": "Filter",
+                                    "detail": "col(c.tier) = lit(1)",
+                                    "rows": 12.80,
+                                    "cost": 256.00,
+                                    "children": [
+                                      {
+                                        "op": "Scan",
+                                        "detail": "e2e_class AS c",
+                                        "rows": 128.00,
+                                        "cost": 128.00,
+                                        "children": []
+                                      }
+                                    ]
+                                  }
+                                ]
+                              }
+                            ]
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "totalCost": 240866.28,
+          "rowCount": 20,
+          "bagChecksum": "0x8f1c966523a83a50",
+          "vectorizedMs": { "min": 16.506, "median": 16.541 }
+        },
+        {
+          "index": 19,
+          "plan": "Limit[20]\n  Sort[col(n) DESC, col(group_id) ASC]\n    Project[group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))]\n      Aggregate[group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]]\n        Join[col(l.k) = col(r.k)]\n          Scan[e2e_right AS r]\n          Join[col(l.group_id) = col(c.group_id)]\n            Filter[col(c.tier) = lit(1)]\n              Scan[e2e_class AS c]\n            Scan[e2e_left AS l]",
+          "tree": {
+            "op": "Limit",
+            "detail": "20",
+            "rows": 12.80,
+            "cost": 240866.28,
+            "children": [
+              {
+                "op": "Sort",
+                "detail": "col(n) DESC, col(group_id) ASC",
+                "rows": 12.80,
+                "cost": 240866.28,
+                "children": [
+                  {
+                    "op": "Project",
+                    "detail": "group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))",
+                    "rows": 12.80,
+                    "cost": 240819.20,
+                    "children": [
+                      {
+                        "op": "Aggregate",
+                        "detail": "group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]",
+                        "rows": 12.80,
+                        "cost": 240819.20,
+                        "children": [
+                          {
+                            "op": "Join",
+                            "detail": "col(l.k) = col(r.k)",
+                            "rows": 12.80,
+                            "cost": 240793.60,
+                            "children": [
+                              {
+                                "op": "Scan",
+                                "detail": "e2e_right AS r",
+                                "rows": 256.00,
+                                "cost": 256.00,
+                                "children": []
+                              },
+                              {
+                                "op": "Join",
+                                "detail": "col(l.group_id) = col(c.group_id)",
+                                "rows": 12.80,
+                                "cost": 240268.80,
+                                "children": [
+                                  {
+                                    "op": "Filter",
+                                    "detail": "col(c.tier) = lit(1)",
+                                    "rows": 12.80,
+                                    "cost": 256.00,
+                                    "children": [
+                                      {
+                                        "op": "Scan",
+                                        "detail": "e2e_class AS c",
+                                        "rows": 128.00,
+                                        "cost": 128.00,
+                                        "children": []
+                                      }
+                                    ]
+                                  },
+                                  {
+                                    "op": "Scan",
+                                    "detail": "e2e_left AS l",
+                                    "rows": 120000.00,
+                                    "cost": 120000.00,
+                                    "children": []
+                                  }
+                                ]
+                              }
+                            ]
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "totalCost": 240866.28,
+          "rowCount": 20,
+          "bagChecksum": "0x8f1c966523a83a50",
+          "vectorizedMs": { "min": 15.267, "median": 15.569 }
+        },
+        {
+          "index": 20,
+          "plan": "Limit[20]\n  Sort[col(n) DESC, col(group_id) ASC]\n    Project[group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))]\n      Aggregate[group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]]\n        Join[col(l.k) = col(r.k)]\n          Filter[col(c.tier) = lit(1)]\n            Join[col(l.group_id) = col(c.group_id)]\n              Scan[e2e_left AS l]\n              Scan[e2e_class AS c]\n          Scan[e2e_right AS r]",
+          "tree": {
+            "op": "Limit",
+            "detail": "20",
+            "rows": 12.80,
+            "cost": 240981.48,
+            "children": [
+              {
+                "op": "Sort",
+                "detail": "col(n) DESC, col(group_id) ASC",
+                "rows": 12.80,
+                "cost": 240981.48,
+                "children": [
+                  {
+                    "op": "Project",
+                    "detail": "group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))",
+                    "rows": 12.80,
+                    "cost": 240934.40,
+                    "children": [
+                      {
+                        "op": "Aggregate",
+                        "detail": "group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]",
+                        "rows": 12.80,
+                        "cost": 240934.40,
+                        "children": [
+                          {
+                            "op": "Join",
+                            "detail": "col(l.k) = col(r.k)",
+                            "rows": 12.80,
+                            "cost": 240908.80,
+                            "children": [
+                              {
+                                "op": "Filter",
+                                "detail": "col(c.tier) = lit(1)",
+                                "rows": 12.80,
+                                "cost": 240384.00,
+                                "children": [
+                                  {
+                                    "op": "Join",
+                                    "detail": "col(l.group_id) = col(c.group_id)",
+                                    "rows": 128.00,
+                                    "cost": 240256.00,
+                                    "children": [
+                                      {
+                                        "op": "Scan",
+                                        "detail": "e2e_left AS l",
+                                        "rows": 120000.00,
+                                        "cost": 120000.00,
+                                        "children": []
+                                      },
+                                      {
+                                        "op": "Scan",
+                                        "detail": "e2e_class AS c",
+                                        "rows": 128.00,
+                                        "cost": 128.00,
+                                        "children": []
+                                      }
+                                    ]
+                                  }
+                                ]
+                              },
+                              {
+                                "op": "Scan",
+                                "detail": "e2e_right AS r",
+                                "rows": 256.00,
+                                "cost": 256.00,
+                                "children": []
+                              }
+                            ]
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "totalCost": 240981.48,
+          "rowCount": 20,
+          "bagChecksum": "0x8f1c966523a83a50",
+          "vectorizedMs": { "min": 26.842, "median": 26.997 }
+        },
+        {
+          "index": 21,
+          "plan": "Limit[20]\n  Sort[col(n) DESC, col(group_id) ASC]\n    Project[group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))]\n      Aggregate[group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]]\n        Join[col(l.k) = col(r.k)]\n          Filter[col(c.tier) = lit(1)]\n            Join[col(l.group_id) = col(c.group_id)]\n              Scan[e2e_class AS c]\n              Scan[e2e_left AS l]\n          Scan[e2e_right AS r]",
+          "tree": {
+            "op": "Limit",
+            "detail": "20",
+            "rows": 12.80,
+            "cost": 240981.48,
+            "children": [
+              {
+                "op": "Sort",
+                "detail": "col(n) DESC, col(group_id) ASC",
+                "rows": 12.80,
+                "cost": 240981.48,
+                "children": [
+                  {
+                    "op": "Project",
+                    "detail": "group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))",
+                    "rows": 12.80,
+                    "cost": 240934.40,
+                    "children": [
+                      {
+                        "op": "Aggregate",
+                        "detail": "group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]",
+                        "rows": 12.80,
+                        "cost": 240934.40,
+                        "children": [
+                          {
+                            "op": "Join",
+                            "detail": "col(l.k) = col(r.k)",
+                            "rows": 12.80,
+                            "cost": 240908.80,
+                            "children": [
+                              {
+                                "op": "Filter",
+                                "detail": "col(c.tier) = lit(1)",
+                                "rows": 12.80,
+                                "cost": 240384.00,
+                                "children": [
+                                  {
+                                    "op": "Join",
+                                    "detail": "col(l.group_id) = col(c.group_id)",
+                                    "rows": 128.00,
+                                    "cost": 240256.00,
+                                    "children": [
+                                      {
+                                        "op": "Scan",
+                                        "detail": "e2e_class AS c",
+                                        "rows": 128.00,
+                                        "cost": 128.00,
+                                        "children": []
+                                      },
+                                      {
+                                        "op": "Scan",
+                                        "detail": "e2e_left AS l",
+                                        "rows": 120000.00,
+                                        "cost": 120000.00,
+                                        "children": []
+                                      }
+                                    ]
+                                  }
+                                ]
+                              },
+                              {
+                                "op": "Scan",
+                                "detail": "e2e_right AS r",
+                                "rows": 256.00,
+                                "cost": 256.00,
+                                "children": []
+                              }
+                            ]
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "totalCost": 240981.48,
+          "rowCount": 20,
+          "bagChecksum": "0x8f1c966523a83a50",
+          "vectorizedMs": { "min": 20.516, "median": 20.581 }
+        },
+        {
+          "index": 22,
+          "plan": "Limit[20]\n  Sort[col(n) DESC, col(group_id) ASC]\n    Project[group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))]\n      Aggregate[group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]]\n        Join[col(l.k) = col(r.k)]\n          Join[col(l.group_id) = col(c.group_id)]\n            Scan[e2e_left AS l]\n            Filter[col(c.tier) = lit(1)]\n              Scan[e2e_class AS c]\n          Scan[e2e_right AS r]",
+          "tree": {
+            "op": "Limit",
+            "detail": "20",
+            "rows": 12.80,
+            "cost": 240866.28,
+            "children": [
+              {
+                "op": "Sort",
+                "detail": "col(n) DESC, col(group_id) ASC",
+                "rows": 12.80,
+                "cost": 240866.28,
+                "children": [
+                  {
+                    "op": "Project",
+                    "detail": "group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))",
+                    "rows": 12.80,
+                    "cost": 240819.20,
+                    "children": [
+                      {
+                        "op": "Aggregate",
+                        "detail": "group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]",
+                        "rows": 12.80,
+                        "cost": 240819.20,
+                        "children": [
+                          {
+                            "op": "Join",
+                            "detail": "col(l.k) = col(r.k)",
+                            "rows": 12.80,
+                            "cost": 240793.60,
+                            "children": [
+                              {
+                                "op": "Join",
+                                "detail": "col(l.group_id) = col(c.group_id)",
+                                "rows": 12.80,
+                                "cost": 240268.80,
+                                "children": [
+                                  {
+                                    "op": "Scan",
+                                    "detail": "e2e_left AS l",
+                                    "rows": 120000.00,
+                                    "cost": 120000.00,
+                                    "children": []
+                                  },
+                                  {
+                                    "op": "Filter",
+                                    "detail": "col(c.tier) = lit(1)",
+                                    "rows": 12.80,
+                                    "cost": 256.00,
+                                    "children": [
+                                      {
+                                        "op": "Scan",
+                                        "detail": "e2e_class AS c",
+                                        "rows": 128.00,
+                                        "cost": 128.00,
+                                        "children": []
+                                      }
+                                    ]
+                                  }
+                                ]
+                              },
+                              {
+                                "op": "Scan",
+                                "detail": "e2e_right AS r",
+                                "rows": 256.00,
+                                "cost": 256.00,
+                                "children": []
+                              }
+                            ]
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "totalCost": 240866.28,
+          "rowCount": 20,
+          "bagChecksum": "0x8f1c966523a83a50",
+          "vectorizedMs": { "min": 17.074, "median": 17.142 }
+        },
+        {
+          "index": 23,
+          "plan": "Limit[20]\n  Sort[col(n) DESC, col(group_id) ASC]\n    Project[group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))]\n      Aggregate[group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]]\n        Join[col(l.k) = col(r.k)]\n          Join[col(l.group_id) = col(c.group_id)]\n            Filter[col(c.tier) = lit(1)]\n              Scan[e2e_class AS c]\n            Scan[e2e_left AS l]\n          Scan[e2e_right AS r]",
+          "tree": {
+            "op": "Limit",
+            "detail": "20",
+            "rows": 12.80,
+            "cost": 240866.28,
+            "children": [
+              {
+                "op": "Sort",
+                "detail": "col(n) DESC, col(group_id) ASC",
+                "rows": 12.80,
+                "cost": 240866.28,
+                "children": [
+                  {
+                    "op": "Project",
+                    "detail": "group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))",
+                    "rows": 12.80,
+                    "cost": 240819.20,
+                    "children": [
+                      {
+                        "op": "Aggregate",
+                        "detail": "group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]",
+                        "rows": 12.80,
+                        "cost": 240819.20,
+                        "children": [
+                          {
+                            "op": "Join",
+                            "detail": "col(l.k) = col(r.k)",
+                            "rows": 12.80,
+                            "cost": 240793.60,
+                            "children": [
+                              {
+                                "op": "Join",
+                                "detail": "col(l.group_id) = col(c.group_id)",
+                                "rows": 12.80,
+                                "cost": 240268.80,
+                                "children": [
+                                  {
+                                    "op": "Filter",
+                                    "detail": "col(c.tier) = lit(1)",
+                                    "rows": 12.80,
+                                    "cost": 256.00,
+                                    "children": [
+                                      {
+                                        "op": "Scan",
+                                        "detail": "e2e_class AS c",
+                                        "rows": 128.00,
+                                        "cost": 128.00,
+                                        "children": []
+                                      }
+                                    ]
+                                  },
+                                  {
+                                    "op": "Scan",
+                                    "detail": "e2e_left AS l",
+                                    "rows": 120000.00,
+                                    "cost": 120000.00,
+                                    "children": []
+                                  }
+                                ]
+                              },
+                              {
+                                "op": "Scan",
+                                "detail": "e2e_right AS r",
+                                "rows": 256.00,
+                                "cost": 256.00,
+                                "children": []
+                              }
+                            ]
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "totalCost": 240866.28,
+          "rowCount": 20,
+          "bagChecksum": "0x8f1c966523a83a50",
+          "vectorizedMs": { "min": 14.410, "median": 14.423 }
+        }
+      ],
+      "chosen": 12,
+      "checksum": "0x7e53943623dc6b01",
+      "interpretedMs": { "min": 1591.984, "median": 1601.294 },
+      "hitExpressionBound": false,
+      "hitPlanBound": false
+    },
+    {
+      "id": "special",
+      "sql": "SELECT l.payload AS payload FROM join_left AS l WHERE l.k1 IN (SELECT r.k1 FROM join_right AS r WHERE r.payload = 10000)",
+      "tables": [ { "name": "join_left", "rows": 100000 }, { "name": "join_right", "rows": 256 } ],
+      "explain": [
+        "EXPLAIN",
+        "bound logical plan:",
+        "  Project[payload=col(l.payload)]",
+        "    Filter[col(l.k1) IN subquery(IN subquery at position 59)]",
+        "      Subquery[IN subquery at position 59]",
+        "        Project[r.k1=col(r.k1)]",
+        "          Filter[col(r.payload) = lit(10000)]",
+        "            Scan[join_right AS r]",
+        "      Scan[join_left AS l]",
+        "memo exploration:",
+        "  groups: 7",
+        "  iterations: 1",
+        "  reached_fixpoint: yes",
+        "  fired rules:",
+        "    0: InToSemiJoinRule",
+        "chosen plan:",
+        "  Project[payload=col(l.payload)] rows=10000.00 cost=200512.00",
+        "    Filter[col(l.k1) IN subquery(IN subquery at position 59)] rows=10000.00 cost=200512.00",
+        "      Subquery[IN subquery at position 59]",
+        "        Project[r.k1=col(r.k1)] rows=25.60 cost=512.00",
+        "          Filter[col(r.payload) = lit(10000)] rows=25.60 cost=512.00",
+        "            Scan[join_right AS r] rows=256.00 cost=256.00",
+        "      Scan[join_left AS l] rows=100000.00 cost=100000.00",
+        "total cost: 200512.00"
+      ],
+      "memo": { "groups": 7, "iterations": 1, "reachedFixpoint": true, "firedRules": [
+          "InToSemiJoinRule"
+        ] },
+      "alternatives": [
+        {
+          "index": 0,
+          "plan": "Project[payload=col(l.payload)]\n  Filter[col(l.k1) IN subquery(IN subquery at position 59)]\n    Subquery[IN subquery at position 59]\n      Project[r.k1=col(r.k1)]\n        Filter[col(r.payload) = lit(10000)]\n          Scan[join_right AS r]\n    Scan[join_left AS l]",
+          "tree": {
+            "op": "Project",
+            "detail": "payload=col(l.payload)",
+            "rows": 10000.00,
+            "cost": 200512.00,
+            "children": [
+              {
+                "op": "Filter",
+                "detail": "col(l.k1) IN subquery(IN subquery at position 59)",
+                "rows": 10000.00,
+                "cost": 200512.00,
+                "children": [
+                  {
+                    "op": "Scan",
+                    "detail": "join_left AS l",
+                    "rows": 100000.00,
+                    "cost": 100000.00,
+                    "children": []
+                  }
+                ]
+              }
+            ]
+          },
+          "totalCost": 200512.00,
+          "rowCount": 6250,
+          "bagChecksum": "0x5b144f1cb20c62ff",
+          "vectorizedMs": { "min": 3.063, "median": 3.151 }
+        },
+        {
+          "index": 1,
+          "plan": "Project[payload=col(l.payload)]\n  SemiJoin[col(l.k1) = col(r.k1)]\n    Scan[join_left AS l]\n    Project[r.k1=col(r.k1)]\n      Filter[col(r.payload) = lit(10000)]\n        Scan[join_right AS r]",
+          "tree": {
+            "op": "Project",
+            "detail": "payload=col(l.payload)",
+            "rows": 50000.00,
+            "cost": 200537.60,
+            "children": [
+              {
+                "op": "SemiJoin",
+                "detail": "col(l.k1) = col(r.k1)",
+                "rows": 50000.00,
+                "cost": 200537.60,
+                "children": [
+                  {
+                    "op": "Scan",
+                    "detail": "join_left AS l",
+                    "rows": 100000.00,
+                    "cost": 100000.00,
+                    "children": []
+                  },
+                  {
+                    "op": "Project",
+                    "detail": "r.k1=col(r.k1)",
+                    "rows": 25.60,
+                    "cost": 512.00,
+                    "children": [
+                      {
+                        "op": "Filter",
+                        "detail": "col(r.payload) = lit(10000)",
+                        "rows": 25.60,
+                        "cost": 512.00,
+                        "children": [
+                          {
+                            "op": "Scan",
+                            "detail": "join_right AS r",
+                            "rows": 256.00,
+                            "cost": 256.00,
+                            "children": []
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          },
+          "totalCost": 200537.60,
+          "rowCount": 6250,
+          "bagChecksum": "0x5b144f1cb20c62ff",
+          "vectorizedMs": { "min": 5.250, "median": 5.272 }
+        }
+      ],
+      "chosen": 0,
+      "checksum": "0x72a0d9bc69515c7e",
+      "interpretedMs": { "min": 8.902, "median": 9.068 },
+      "hitExpressionBound": false,
+      "hitPlanBound": false
+    }
+  ],
+  "hump": [
+    { "id": "scan_filter_1pct", "sql": "SELECT a FROM fact WHERE bucket = 7", "predicate": "bucket = 7", "kept": 2000, "of": 200000, "checksum": "0x95ba2cbd0a720591", "interpretedMs": { "min": 17.409, "median": 17.525 }, "vectorizedMs": { "min": 7.904, "median": 7.949 } },
+    { "id": "scan_filter_10pct", "sql": "SELECT a FROM fact WHERE decile = 3", "predicate": "decile = 3", "kept": 20000, "of": 200000, "checksum": "0x8031b34dc1b05c00", "interpretedMs": { "min": 18.751, "median": 18.816 }, "vectorizedMs": { "min": 9.067, "median": 9.089 } },
+    { "id": "scan_filter_50pct", "sql": "SELECT a FROM fact WHERE half = 1", "predicate": "half = 1", "kept": 100000, "of": 200000, "checksum": "0xd4bb87b7e1354cb7", "interpretedMs": { "min": 25.338, "median": 25.427 }, "vectorizedMs": { "min": 14.235, "median": 14.249 } }
+  ]
+}
