@@ -20,3 +20,52 @@ jobs:
         run: cmake --build build --parallel
       - name: Test
         run: ctest --test-dir build --output-on-failure
+
+  sanitizers:
+    runs-on: ubuntu-latest
+    env:
+      CC: clang
+      CXX: clang++
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: >-
+          cmake -S . -B build-sanitizers
+          -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer"
+      - name: Build
+        run: cmake --build build-sanitizers --parallel 2
+      - name: Test
+        run: ctest --test-dir build-sanitizers --output-on-failure
+
+  fuzz:
+    runs-on: ubuntu-latest
+    env:
+      CC: clang
+      CXX: clang++
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S . -B build-fuzz -DCMAKE_BUILD_TYPE=Debug -DSQL_ENGINE_BUILD_FUZZER=ON
+      - name: Build
+        run: cmake --build build-fuzz --target sql_parser_planner_fuzz --parallel 2
+      - name: Replay corpus (regression gate)
+        run: ./build-fuzz/sql_parser_planner_fuzz -timeout=10 fuzz/corpus/*
+      - name: Short discovery session (non-blocking)
+        continue-on-error: true
+        run: >-
+          ./build-fuzz/sql_parser_planner_fuzz fuzz/corpus
+          -max_total_time=90
+          -timeout=10
+          -rss_limit_mb=2048
+          -print_final_stats=1
+      - name: Upload discovery artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-findings
+          path: |
+            crash-*
+            timeout-*
+            oom-*
+          if-no-files-found: ignore

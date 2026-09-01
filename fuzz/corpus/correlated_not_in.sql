@@ -1,0 +1,1 @@
+SELECT b FROM t WHERE b NOT IN (SELECT t1.b FROM t1 WHERE t1.a = t.a)

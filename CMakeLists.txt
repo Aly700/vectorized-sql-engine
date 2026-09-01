@@ -5,6 +5,8 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+option(SQL_ENGINE_BUILD_FUZZER "Build the parser and planner fuzz target" OFF)
+
 add_library(sql_engine
     src/sql/parser.cpp
     src/sql/binder.cpp
@@ -19,6 +21,21 @@ add_library(sql_engine
 )
 target_include_directories(sql_engine PUBLIC include)
 target_compile_options(sql_engine PRIVATE -Wall -Wextra -Wpedantic)
+
+if(SQL_ENGINE_BUILD_FUZZER)
+    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        message(FATAL_ERROR "SQL_ENGINE_BUILD_FUZZER requires Clang")
+    endif()
+    target_compile_options(sql_engine PRIVATE
+        -fsanitize=fuzzer-no-link,address,undefined
+        -fno-sanitize-recover=all
+        -fno-omit-frame-pointer
+    )
+    target_link_options(sql_engine INTERFACE
+        -fsanitize=address,undefined
+        -fno-sanitize-recover=all
+    )
+endif()
 
 add_executable(sql_smoke tests/smoke.cpp)
 target_link_libraries(sql_smoke PRIVATE sql_engine)
@@ -49,6 +66,20 @@ target_link_libraries(sql_bench PRIVATE sql_engine)
 
 add_executable(yard_export benchmarks/yard_export.cpp)
 target_link_libraries(yard_export PRIVATE sql_engine)
+
+if(SQL_ENGINE_BUILD_FUZZER)
+    add_executable(sql_parser_planner_fuzz fuzz/parser_planner_fuzz.cpp)
+    target_link_libraries(sql_parser_planner_fuzz PRIVATE sql_engine)
+    target_compile_options(sql_parser_planner_fuzz PRIVATE
+        -fsanitize=fuzzer,address,undefined
+        -fno-sanitize-recover=all
+        -fno-omit-frame-pointer
+    )
+    target_link_options(sql_parser_planner_fuzz PRIVATE
+        -fsanitize=fuzzer,address,undefined
+        -fno-sanitize-recover=all
+    )
+endif()
 
 include(CTest)
 add_test(NAME sql_smoke COMMAND sql_smoke)

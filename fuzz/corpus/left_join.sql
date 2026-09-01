@@ -1,0 +1,1 @@
+SELECT t1.b, t2.c FROM t1 LEFT OUTER JOIN t2 ON t1.a = t2.a
