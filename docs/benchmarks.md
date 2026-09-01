@@ -280,3 +280,114 @@ The checksum match is performed before timing and pins the left-only output
 and correlated candidate-set semantics. The vectorized grouped hash kernel is
 16.350x faster on median than the interpreted left-row-major semantic oracle
 for this selective workload.
+
+## Yard Routes (2026-09-01)
+
+`yard_export` (commit `1058974ea747`) enumerates every memo alternative for four
+workings, prices each with `estimate_cost`, and times each through vectorized
+execution with the same Release build, five-repetition min/median, deterministic
+data, and checksum-before-timing methodology as above. The chosen row is the
+`extract_best` winner; every alternative must reproduce its bag checksum. The
+interpreted timing is for the chosen plan only.
+
+### coupling
+
+```sql
+SELECT l.payload AS left_payload, r.payload AS right_payload FROM join_left AS l JOIN join_right AS r ON l.k1 = r.k1 AND l.k2 = r.k2
+```
+
+memo: 4 groups, 1 iterations, fired rules: JoinCommuteRule
+
+| alternative | plan | total cost | vectorized min ms | vectorized median ms |
+|---:|---|---:|---:|---:|
+| 0 (chosen) | `Project[left_payload=col(l.payload), right_payload=col(r.payload)]   Join[col(l.k1) = col(r.k1) AND col(l.k2) = col(r.k2)]     Scan[join_left AS l]     Scan[join_right AS r]` | 200512.00 | 15.060 | 15.291 |
+| 1 | `Project[left_payload=col(l.payload), right_payload=col(r.payload)]   Join[col(l.k1) = col(r.k1) AND col(l.k2) = col(r.k2)]     Scan[join_right AS r]     Scan[join_left AS l]` | 200512.00 | 15.361 | 15.564 |
+
+interpreted (chosen plan): 5707.965 / 5737.780 ms; rows=100000 checksum=0xd6eff9218be6da07 bag checksum=0xe60844c222869ce8
+
+### hump-and-bowl
+
+```sql
+SELECT l.group_id AS group_id, COUNT(*) AS n, MAX(r.measure) AS top FROM e2e_left AS l JOIN e2e_right AS r ON l.k = r.k WHERE l.filter_key < 80 GROUP BY l.group_id ORDER BY n DESC, group_id ASC LIMIT 20
+```
+
+memo: 11 groups, 2 iterations, fired rules: JoinCommuteRule, FilterIntoJoinRule, JoinCommuteRule
+
+| alternative | plan | total cost | vectorized min ms | vectorized median ms |
+|---:|---|---:|---:|---:|
+| 0 (chosen) | `Limit[20]   Sort[col(n) DESC, col(group_id) ASC]     Project[group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))]       Aggregate[group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]]         Filter[col(l.filter_key) < lit(80)]           Join[col(l.k) = col(r.k)]             Scan[e2e_left AS l]             Scan[e2e_right AS r]` | 241486.08 | 27.881 | 27.934 |
+| 1 | `Limit[20]   Sort[col(n) DESC, col(group_id) ASC]     Project[group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))]       Aggregate[group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]]         Filter[col(l.filter_key) < lit(80)]           Join[col(l.k) = col(r.k)]             Scan[e2e_right AS r]             Scan[e2e_left AS l]` | 241486.08 | 25.992 | 26.419 |
+| 2 | `Limit[20]   Sort[col(n) DESC, col(group_id) ASC]     Project[group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))]       Aggregate[group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]]         Join[col(l.k) = col(r.k)]           Filter[col(l.filter_key) < lit(80)]             Scan[e2e_left AS l]           Scan[e2e_right AS r]` | 283072.00 | 24.780 | 24.812 |
+| 3 | `Limit[20]   Sort[col(n) DESC, col(group_id) ASC]     Project[group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))]       Aggregate[group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]]         Join[col(l.k) = col(r.k)]           Scan[e2e_right AS r]           Filter[col(l.filter_key) < lit(80)]             Scan[e2e_left AS l]` | 283072.00 | 23.322 | 23.467 |
+
+interpreted (chosen plan): 4175.083 / 4200.672 ms; rows=20 checksum=0xae466c9b0f225c78 bag checksum=0x5ad6701e8dbf32d5
+
+### three-trains
+
+```sql
+SELECT l.group_id AS group_id, COUNT(*) AS n, MAX(r.measure) AS top FROM e2e_left AS l JOIN e2e_right AS r ON l.k = r.k JOIN e2e_class AS c ON l.group_id = c.group_id WHERE c.tier = 1 GROUP BY l.group_id ORDER BY n DESC, group_id ASC LIMIT 20
+```
+
+memo: 22 groups, 3 iterations, fired rules: JoinCommuteRule, JoinCommuteRule, JoinAssociateRule, FilterIntoJoinRule, JoinAssociateRule, JoinCommuteRule, FilterIntoJoinRule, JoinCommuteRule, JoinCommuteRule, JoinAssociateRule, JoinAssociateRule, JoinCommuteRule, FilterIntoJoinRule, JoinCommuteRule, JoinCommuteRule, JoinCommuteRule
+
+| alternative | plan | total cost | vectorized min ms | vectorized median ms |
+|---:|---|---:|---:|---:|
+| 0 | `Limit[20]   Sort[col(n) DESC, col(group_id) ASC]     Project[group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))]       Aggregate[group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]]         Filter[col(c.tier) = lit(1)]           Join[col(l.group_id) = col(c.group_id)]             Join[col(l.k) = col(r.k)]               Scan[e2e_left AS l]               Scan[e2e_right AS r]             Scan[e2e_class AS c]` | 241224.68 | 39.776 | 39.897 |
+| 1 | `Limit[20]   Sort[col(n) DESC, col(group_id) ASC]     Project[group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))]       Aggregate[group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]]         Filter[col(c.tier) = lit(1)]           Join[col(l.group_id) = col(c.group_id)]             Join[col(l.k) = col(r.k)]               Scan[e2e_right AS r]               Scan[e2e_left AS l]             Scan[e2e_class AS c]` | 241224.68 | 34.654 | 34.667 |
+| 2 | `Limit[20]   Sort[col(n) DESC, col(group_id) ASC]     Project[group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))]       Aggregate[group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]]         Filter[col(c.tier) = lit(1)]           Join[col(l.group_id) = col(c.group_id)]             Scan[e2e_class AS c]             Join[col(l.k) = col(r.k)]               Scan[e2e_left AS l]               Scan[e2e_right AS r]` | 241224.68 | 32.942 | 32.990 |
+| 3 | `Limit[20]   Sort[col(n) DESC, col(group_id) ASC]     Project[group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))]       Aggregate[group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]]         Filter[col(c.tier) = lit(1)]           Join[col(l.group_id) = col(c.group_id)]             Scan[e2e_class AS c]             Join[col(l.k) = col(r.k)]               Scan[e2e_right AS r]               Scan[e2e_left AS l]` | 241224.68 | 30.710 | 30.725 |
+| 4 | `Limit[20]   Sort[col(n) DESC, col(group_id) ASC]     Project[group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))]       Aggregate[group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]]         Filter[col(c.tier) = lit(1)]           Join[col(l.k) = col(r.k)]             Scan[e2e_right AS r]             Join[col(l.group_id) = col(c.group_id)]               Scan[e2e_left AS l]               Scan[e2e_class AS c]` | 241096.68 | 36.685 | 36.737 |
+| 5 | `Limit[20]   Sort[col(n) DESC, col(group_id) ASC]     Project[group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))]       Aggregate[group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]]         Filter[col(c.tier) = lit(1)]           Join[col(l.k) = col(r.k)]             Scan[e2e_right AS r]             Join[col(l.group_id) = col(c.group_id)]               Scan[e2e_class AS c]               Scan[e2e_left AS l]` | 241096.68 | 32.799 | 32.900 |
+| 6 | `Limit[20]   Sort[col(n) DESC, col(group_id) ASC]     Project[group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))]       Aggregate[group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]]         Filter[col(c.tier) = lit(1)]           Join[col(l.k) = col(r.k)]             Join[col(l.group_id) = col(c.group_id)]               Scan[e2e_left AS l]               Scan[e2e_class AS c]             Scan[e2e_right AS r]` | 241096.68 | 39.762 | 39.825 |
+| 7 | `Limit[20]   Sort[col(n) DESC, col(group_id) ASC]     Project[group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))]       Aggregate[group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]]         Filter[col(c.tier) = lit(1)]           Join[col(l.k) = col(r.k)]             Join[col(l.group_id) = col(c.group_id)]               Scan[e2e_class AS c]               Scan[e2e_left AS l]             Scan[e2e_right AS r]` | 241096.68 | 29.400 | 29.418 |
+| 8 | `Limit[20]   Sort[col(n) DESC, col(group_id) ASC]     Project[group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))]       Aggregate[group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]]         Join[col(l.group_id) = col(c.group_id)]           Join[col(l.k) = col(r.k)]             Scan[e2e_left AS l]             Scan[e2e_right AS r]           Filter[col(c.tier) = lit(1)]             Scan[e2e_class AS c]` | 241109.48 | 27.592 | 27.625 |
+| 9 | `Limit[20]   Sort[col(n) DESC, col(group_id) ASC]     Project[group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))]       Aggregate[group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]]         Join[col(l.group_id) = col(c.group_id)]           Join[col(l.k) = col(r.k)]             Scan[e2e_right AS r]             Scan[e2e_left AS l]           Filter[col(c.tier) = lit(1)]             Scan[e2e_class AS c]` | 241109.48 | 24.504 | 24.548 |
+| 10 | `Limit[20]   Sort[col(n) DESC, col(group_id) ASC]     Project[group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))]       Aggregate[group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]]         Join[col(l.group_id) = col(c.group_id)]           Filter[col(c.tier) = lit(1)]             Scan[e2e_class AS c]           Join[col(l.k) = col(r.k)]             Scan[e2e_left AS l]             Scan[e2e_right AS r]` | 241109.48 | 25.881 | 25.902 |
+| 11 | `Limit[20]   Sort[col(n) DESC, col(group_id) ASC]     Project[group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))]       Aggregate[group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]]         Join[col(l.group_id) = col(c.group_id)]           Filter[col(c.tier) = lit(1)]             Scan[e2e_class AS c]           Join[col(l.k) = col(r.k)]             Scan[e2e_right AS r]             Scan[e2e_left AS l]` | 241109.48 | 23.560 | 23.607 |
+| 12 (chosen) | `Limit[20]   Sort[col(n) DESC, col(group_id) ASC]     Project[group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))]       Aggregate[group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]]         Join[col(l.k) = col(r.k)]           Scan[e2e_right AS r]           Join[col(l.group_id) = col(c.group_id)]             Scan[e2e_left AS l]             Filter[col(c.tier) = lit(1)]               Scan[e2e_class AS c]` | 240866.28 | 16.510 | 16.563 |
+| 13 | `Limit[20]   Sort[col(n) DESC, col(group_id) ASC]     Project[group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))]       Aggregate[group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]]         Join[col(l.k) = col(r.k)]           Scan[e2e_right AS r]           Join[col(l.group_id) = col(c.group_id)]             Filter[col(c.tier) = lit(1)]               Scan[e2e_class AS c]             Scan[e2e_left AS l]` | 240866.28 | 15.168 | 15.200 |
+| 14 | `Limit[20]   Sort[col(n) DESC, col(group_id) ASC]     Project[group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))]       Aggregate[group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]]         Join[col(l.k) = col(r.k)]           Join[col(l.group_id) = col(c.group_id)]             Scan[e2e_left AS l]             Filter[col(c.tier) = lit(1)]               Scan[e2e_class AS c]           Scan[e2e_right AS r]` | 240866.28 | 17.779 | 17.896 |
+| 15 | `Limit[20]   Sort[col(n) DESC, col(group_id) ASC]     Project[group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))]       Aggregate[group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]]         Join[col(l.k) = col(r.k)]           Join[col(l.group_id) = col(c.group_id)]             Filter[col(c.tier) = lit(1)]               Scan[e2e_class AS c]             Scan[e2e_left AS l]           Scan[e2e_right AS r]` | 240866.28 | 14.535 | 14.738 |
+| 16 | `Limit[20]   Sort[col(n) DESC, col(group_id) ASC]     Project[group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))]       Aggregate[group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]]         Join[col(l.k) = col(r.k)]           Scan[e2e_right AS r]           Filter[col(c.tier) = lit(1)]             Join[col(l.group_id) = col(c.group_id)]               Scan[e2e_left AS l]               Scan[e2e_class AS c]` | 240981.48 | 26.074 | 26.108 |
+| 17 | `Limit[20]   Sort[col(n) DESC, col(group_id) ASC]     Project[group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))]       Aggregate[group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]]         Join[col(l.k) = col(r.k)]           Scan[e2e_right AS r]           Filter[col(c.tier) = lit(1)]             Join[col(l.group_id) = col(c.group_id)]               Scan[e2e_class AS c]               Scan[e2e_left AS l]` | 240981.48 | 21.237 | 21.333 |
+| 18 | `Limit[20]   Sort[col(n) DESC, col(group_id) ASC]     Project[group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))]       Aggregate[group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]]         Join[col(l.k) = col(r.k)]           Scan[e2e_right AS r]           Join[col(l.group_id) = col(c.group_id)]             Scan[e2e_left AS l]             Filter[col(c.tier) = lit(1)]               Scan[e2e_class AS c]` | 240866.28 | 16.506 | 16.541 |
+| 19 | `Limit[20]   Sort[col(n) DESC, col(group_id) ASC]     Project[group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))]       Aggregate[group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]]         Join[col(l.k) = col(r.k)]           Scan[e2e_right AS r]           Join[col(l.group_id) = col(c.group_id)]             Filter[col(c.tier) = lit(1)]               Scan[e2e_class AS c]             Scan[e2e_left AS l]` | 240866.28 | 15.267 | 15.569 |
+| 20 | `Limit[20]   Sort[col(n) DESC, col(group_id) ASC]     Project[group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))]       Aggregate[group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]]         Join[col(l.k) = col(r.k)]           Filter[col(c.tier) = lit(1)]             Join[col(l.group_id) = col(c.group_id)]               Scan[e2e_left AS l]               Scan[e2e_class AS c]           Scan[e2e_right AS r]` | 240981.48 | 26.842 | 26.997 |
+| 21 | `Limit[20]   Sort[col(n) DESC, col(group_id) ASC]     Project[group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))]       Aggregate[group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]]         Join[col(l.k) = col(r.k)]           Filter[col(c.tier) = lit(1)]             Join[col(l.group_id) = col(c.group_id)]               Scan[e2e_class AS c]               Scan[e2e_left AS l]           Scan[e2e_right AS r]` | 240981.48 | 20.516 | 20.581 |
+| 22 | `Limit[20]   Sort[col(n) DESC, col(group_id) ASC]     Project[group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))]       Aggregate[group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]]         Join[col(l.k) = col(r.k)]           Join[col(l.group_id) = col(c.group_id)]             Scan[e2e_left AS l]             Filter[col(c.tier) = lit(1)]               Scan[e2e_class AS c]           Scan[e2e_right AS r]` | 240866.28 | 17.074 | 17.142 |
+| 23 | `Limit[20]   Sort[col(n) DESC, col(group_id) ASC]     Project[group_id=col(l.group_id), n=col(COUNT(*)), top=col(MAX(r.measure))]       Aggregate[group_keys=[col(l.group_id)], aggregates=[COUNT(*), MAX(r.measure)=col(r.measure)]]         Join[col(l.k) = col(r.k)]           Join[col(l.group_id) = col(c.group_id)]             Filter[col(c.tier) = lit(1)]               Scan[e2e_class AS c]             Scan[e2e_left AS l]           Scan[e2e_right AS r]` | 240866.28 | 14.410 | 14.423 |
+
+interpreted (chosen plan): 1591.984 / 1601.294 ms; rows=20 checksum=0x7e53943623dc6b01 bag checksum=0x8f1c966523a83a50
+
+### special
+
+```sql
+SELECT l.payload AS payload FROM join_left AS l WHERE l.k1 IN (SELECT r.k1 FROM join_right AS r WHERE r.payload = 10000)
+```
+
+memo: 7 groups, 1 iterations, fired rules: InToSemiJoinRule
+
+| alternative | plan | total cost | vectorized min ms | vectorized median ms |
+|---:|---|---:|---:|---:|
+| 0 (chosen) | `Project[payload=col(l.payload)]   Filter[col(l.k1) IN subquery(IN subquery at position 59)]     Subquery[IN subquery at position 59]       Project[r.k1=col(r.k1)]         Filter[col(r.payload) = lit(10000)]           Scan[join_right AS r]     Scan[join_left AS l]` | 200512.00 | 3.063 | 3.151 |
+| 1 | `Project[payload=col(l.payload)]   SemiJoin[col(l.k1) = col(r.k1)]     Scan[join_left AS l]     Project[r.k1=col(r.k1)]       Filter[col(r.payload) = lit(10000)]         Scan[join_right AS r]` | 200537.60 | 5.250 | 5.272 |
+
+interpreted (chosen plan): 8.902 / 9.068 ms; rows=6250 checksum=0x72a0d9bc69515c7e bag checksum=0x5b144f1cb20c62ff
+
+### hump workloads
+
+| workload | predicate | kept | interpreted min ms | interpreted median ms | vectorized min ms | vectorized median ms |
+|---|---|---:|---:|---:|---:|---:|
+| scan_filter_1pct | `bucket = 7` | 2000 | 17.409 | 17.525 | 7.904 | 7.949 |
+| scan_filter_10pct | `decile = 3` | 20000 | 18.751 | 18.816 | 9.067 | 9.089 |
+| scan_filter_50pct | `half = 1` | 100000 | 25.338 | 25.427 | 14.235 | 14.249 |
+
+### three_way_route in sql_bench
+
+The three-trains working is also registered in `sql_bench` as `three_way_route`, timed on the
+query as bound (the first alternative above, before the memo reorders it). Same Release build,
+five repetitions, checksum before timing:
+
+| workload | rows | correctness | interpreted min ms | interpreted median ms | vectorized min ms | vectorized median ms | median speedup |
+|---|---:|---|---:|---:|---:|---:|---:|
+| three_way_route | left=120000,right=256,class=128 | match rows=20 checksum=0x7e53943623dc6b01 | 5829.809 | 5843.328 | 39.476 | 39.516 | 147.871x |

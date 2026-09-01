@@ -64,6 +64,9 @@ target_link_libraries(sql_optimizer_cost_model PRIVATE sql_engine)
 add_executable(sql_bench benchmarks/sql_bench.cpp)
 target_link_libraries(sql_bench PRIVATE sql_engine)
 
+add_executable(yard_export benchmarks/yard_export.cpp)
+target_link_libraries(yard_export PRIVATE sql_engine)
+
 if(SQL_ENGINE_BUILD_FUZZER)
     add_executable(sql_parser_planner_fuzz fuzz/parser_planner_fuzz.cpp)
     target_link_libraries(sql_parser_planner_fuzz PRIVATE sql_engine)
