@@ -153,6 +153,49 @@ std::string node_detail(const std::string& line) {
     return line.substr(bracket + 1, line.size() - bracket - 2);
 }
 
+struct OwnedSubquery {
+    std::string detail;
+    const plan::LogicalPlan* plan{nullptr};
+};
+
+void collect_scalar_subquery(const plan::BoundScalarExpr& expression,
+                             std::vector<OwnedSubquery>& subqueries) {
+    if (const auto* subquery = std::get_if<plan::BoundScalarSubquery>(&expression.value);
+        subquery != nullptr && subquery->plan != nullptr) {
+        subqueries.push_back({"Subquery[" + subquery->name + "]", subquery->plan.get()});
+    }
+}
+
+void collect_predicate_subqueries(const plan::BoundPredicate& predicate,
+                                  std::vector<OwnedSubquery>& subqueries) {
+    if (predicate.kind == sql::PredicateKind::Comparison) {
+        collect_scalar_subquery(predicate.comparison.left, subqueries);
+        collect_scalar_subquery(predicate.comparison.right, subqueries);
+    }
+    if (predicate.subquery != nullptr) {
+        subqueries.push_back({"Subquery[" + predicate.subquery_name + "]", predicate.subquery.get()});
+    }
+    if (predicate.left != nullptr) collect_predicate_subqueries(*predicate.left, subqueries);
+    if (predicate.right != nullptr) collect_predicate_subqueries(*predicate.right, subqueries);
+}
+
+std::string tree_json(const plan::LogicalPlan& node, const execution::Catalog& catalog, int indent);
+
+std::string subquery_tree_json(const OwnedSubquery& subquery,
+                               const execution::Catalog& catalog,
+                               int indent) {
+    const auto estimate = optimizer::estimate_cost(*subquery.plan, catalog);
+    const std::string pad(static_cast<std::size_t>(indent), ' ');
+    std::string out = "{\n" + pad + "  \"op\": \"Subquery\"," +
+                      "\n" + pad + "  \"detail\": " + quoted(subquery.detail) +
+                      ",\n" + pad + "  \"rows\": " + fixed(estimate.rows, 2) +
+                      ",\n" + pad + "  \"cost\": " + fixed(estimate.cost, 2) +
+                      ",\n" + pad + "  \"children\": [\n" + pad + "    " +
+                      tree_json(*subquery.plan, catalog, indent + 4) +
+                      "\n" + pad + "  ]\n" + pad + "}";
+    return out;
+}
+
 std::string tree_json(const plan::LogicalPlan& node, const execution::Catalog& catalog, int indent) {
     const auto estimate = optimizer::estimate_cost(node, catalog);
     const auto line = node_line(node);
@@ -166,10 +209,23 @@ std::string tree_json(const plan::LogicalPlan& node, const execution::Catalog& c
     if (node.input) children.push_back(node.input.get());
     if (node.left) children.push_back(node.left.get());
     if (node.right) children.push_back(node.right.get());
-    for (std::size_t i = 0; i < children.size(); ++i) {
-        out += (i == 0 ? "\n" : ",\n") + pad + "    " + tree_json(*children[i], catalog, indent + 4);
+    std::vector<OwnedSubquery> subqueries;
+    for (const auto& predicate : node.predicates) {
+        collect_predicate_subqueries(predicate, subqueries);
     }
-    out += children.empty() ? "]" : "\n" + pad + "  ]";
+    if (node.null_aware_predicate.has_value()) {
+        collect_predicate_subqueries(*node.null_aware_predicate, subqueries);
+    }
+    std::size_t child_index = 0;
+    for (const auto* child : children) {
+        out += (child_index++ == 0 ? "\n" : ",\n") + pad + "    " +
+               tree_json(*child, catalog, indent + 4);
+    }
+    for (const auto& subquery : subqueries) {
+        out += (child_index++ == 0 ? "\n" : ",\n") + pad + "    " +
+               subquery_tree_json(subquery, catalog, indent + 4);
+    }
+    out += child_index == 0 ? "]" : "\n" + pad + "  ]";
     out += "\n" + pad + "}";
     return out;
 }

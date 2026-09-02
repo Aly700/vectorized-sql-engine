@@ -1,8 +1,8 @@
 {
   "engine": {
     "repo": "github.com/Aly700/vectorized-sql-engine",
-    "commit": "1058974ea747",
-    "exportedAt": "2026-09-01",
+    "commit": "7de892a65834",
+    "exportedAt": "2026-09-02",
     "machine": "MacBook Pro Mac14,7, Apple M2, 8 cores, 16 GB",
     "toolchain": "Apple LLVM 17.0.0 (clang-1700.4.4.1)",
     "flags": "-O2 -DNDEBUG",
@@ -73,7 +73,7 @@
           "totalCost": 200512.00,
           "rowCount": 100000,
           "bagChecksum": "0xe60844c222869ce8",
-          "vectorizedMs": { "min": 15.060, "median": 15.291 }
+          "vectorizedMs": { "min": 14.980, "median": 15.336 }
         },
         {
           "index": 1,
@@ -111,12 +111,12 @@
           "totalCost": 200512.00,
           "rowCount": 100000,
           "bagChecksum": "0xe60844c222869ce8",
-          "vectorizedMs": { "min": 15.361, "median": 15.564 }
+          "vectorizedMs": { "min": 15.259, "median": 15.411 }
         }
       ],
       "chosen": 0,
       "checksum": "0xd6eff9218be6da07",
-      "interpretedMs": { "min": 5707.965, "median": 5737.780 },
+      "interpretedMs": { "min": 5371.034, "median": 5371.453 },
       "hitExpressionBound": false,
       "hitPlanBound": false
     },
@@ -228,7 +228,7 @@
           "totalCost": 241486.08,
           "rowCount": 20,
           "bagChecksum": "0x5ad6701e8dbf32d5",
-          "vectorizedMs": { "min": 27.881, "median": 27.934 }
+          "vectorizedMs": { "min": 27.902, "median": 27.962 }
         },
         {
           "index": 1,
@@ -298,7 +298,7 @@
           "totalCost": 241486.08,
           "rowCount": 20,
           "bagChecksum": "0x5ad6701e8dbf32d5",
-          "vectorizedMs": { "min": 25.992, "median": 26.419 }
+          "vectorizedMs": { "min": 24.255, "median": 24.480 }
         },
         {
           "index": 2,
@@ -368,7 +368,7 @@
           "totalCost": 283072.00,
           "rowCount": 20,
           "bagChecksum": "0x5ad6701e8dbf32d5",
-          "vectorizedMs": { "min": 24.780, "median": 24.812 }
+          "vectorizedMs": { "min": 23.469, "median": 23.535 }
         },
         {
           "index": 3,
@@ -438,12 +438,12 @@
           "totalCost": 283072.00,
           "rowCount": 20,
           "bagChecksum": "0x5ad6701e8dbf32d5",
-          "vectorizedMs": { "min": 23.322, "median": 23.467 }
+          "vectorizedMs": { "min": 22.325, "median": 22.540 }
         }
       ],
       "chosen": 0,
       "checksum": "0xae466c9b0f225c78",
-      "interpretedMs": { "min": 4175.083, "median": 4200.672 },
+      "interpretedMs": { "min": 3980.626, "median": 3984.166 },
       "hitExpressionBound": false,
       "hitPlanBound": false
     },
@@ -600,7 +600,7 @@
           "totalCost": 241224.68,
           "rowCount": 20,
           "bagChecksum": "0x8f1c966523a83a50",
-          "vectorizedMs": { "min": 39.776, "median": 39.897 }
+          "vectorizedMs": { "min": 39.877, "median": 39.906 }
         },
         {
           "index": 1,
@@ -685,7 +685,7 @@
           "totalCost": 241224.68,
           "rowCount": 20,
           "bagChecksum": "0x8f1c966523a83a50",
-          "vectorizedMs": { "min": 34.654, "median": 34.667 }
+          "vectorizedMs": { "min": 34.750, "median": 34.792 }
         },
         {
           "index": 2,
@@ -770,7 +770,7 @@
           "totalCost": 241224.68,
           "rowCount": 20,
           "bagChecksum": "0x8f1c966523a83a50",
-          "vectorizedMs": { "min": 32.942, "median": 32.990 }
+          "vectorizedMs": { "min": 32.989, "median": 33.196 }
         },
         {
           "index": 3,
@@ -855,7 +855,7 @@
           "totalCost": 241224.68,
           "rowCount": 20,
           "bagChecksum": "0x8f1c966523a83a50",
-          "vectorizedMs": { "min": 30.710, "median": 30.725 }
+          "vectorizedMs": { "min": 30.725, "median": 30.800 }
         },
         {
           "index": 4,
@@ -940,7 +940,7 @@
           "totalCost": 241096.68,
           "rowCount": 20,
           "bagChecksum": "0x8f1c966523a83a50",
-          "vectorizedMs": { "min": 36.685, "median": 36.737 }
+          "vectorizedMs": { "min": 36.855, "median": 36.994 }
         },
         {
           "index": 5,
@@ -1025,7 +1025,7 @@
           "totalCost": 241096.68,
           "rowCount": 20,
           "bagChecksum": "0x8f1c966523a83a50",
-          "vectorizedMs": { "min": 32.799, "median": 32.900 }
+          "vectorizedMs": { "min": 32.819, "median": 32.963 }
         },
         {
           "index": 6,
@@ -1110,7 +1110,7 @@
           "totalCost": 241096.68,
           "rowCount": 20,
           "bagChecksum": "0x8f1c966523a83a50",
-          "vectorizedMs": { "min": 39.762, "median": 39.825 }
+          "vectorizedMs": { "min": 39.707, "median": 39.832 }
         },
         {
           "index": 7,
@@ -1195,7 +1195,7 @@
           "totalCost": 241096.68,
           "rowCount": 20,
           "bagChecksum": "0x8f1c966523a83a50",
-          "vectorizedMs": { "min": 29.400, "median": 29.418 }
+          "vectorizedMs": { "min": 29.410, "median": 29.494 }
         },
         {
           "index": 8,
@@ -1280,7 +1280,7 @@
           "totalCost": 241109.48,
           "rowCount": 20,
           "bagChecksum": "0x8f1c966523a83a50",
-          "vectorizedMs": { "min": 27.592, "median": 27.625 }
+          "vectorizedMs": { "min": 27.550, "median": 27.610 }
         },
         {
           "index": 9,
@@ -1365,7 +1365,7 @@
           "totalCost": 241109.48,
           "rowCount": 20,
           "bagChecksum": "0x8f1c966523a83a50",
-          "vectorizedMs": { "min": 24.504, "median": 24.548 }
+          "vectorizedMs": { "min": 24.584, "median": 24.666 }
         },
         {
           "index": 10,
@@ -1450,7 +1450,7 @@
           "totalCost": 241109.48,
           "rowCount": 20,
           "bagChecksum": "0x8f1c966523a83a50",
-          "vectorizedMs": { "min": 25.881, "median": 25.902 }
+          "vectorizedMs": { "min": 26.094, "median": 26.409 }
         },
         {
           "index": 11,
@@ -1535,7 +1535,7 @@
           "totalCost": 241109.48,
           "rowCount": 20,
           "bagChecksum": "0x8f1c966523a83a50",
-          "vectorizedMs": { "min": 23.560, "median": 23.607 }
+          "vectorizedMs": { "min": 23.627, "median": 23.717 }
         },
         {
           "index": 12,
@@ -1620,7 +1620,7 @@
           "totalCost": 240866.28,
           "rowCount": 20,
           "bagChecksum": "0x8f1c966523a83a50",
-          "vectorizedMs": { "min": 16.510, "median": 16.563 }
+          "vectorizedMs": { "min": 16.589, "median": 16.705 }
         },
         {
           "index": 13,
@@ -1705,7 +1705,7 @@
           "totalCost": 240866.28,
           "rowCount": 20,
           "bagChecksum": "0x8f1c966523a83a50",
-          "vectorizedMs": { "min": 15.168, "median": 15.200 }
+          "vectorizedMs": { "min": 15.119, "median": 15.181 }
         },
         {
           "index": 14,
@@ -1790,7 +1790,7 @@
           "totalCost": 240866.28,
           "rowCount": 20,
           "bagChecksum": "0x8f1c966523a83a50",
-          "vectorizedMs": { "min": 17.779, "median": 17.896 }
+          "vectorizedMs": { "min": 17.009, "median": 17.070 }
         },
         {
           "index": 15,
@@ -1875,7 +1875,7 @@
           "totalCost": 240866.28,
           "rowCount": 20,
           "bagChecksum": "0x8f1c966523a83a50",
-          "vectorizedMs": { "min": 14.535, "median": 14.738 }
+          "vectorizedMs": { "min": 14.371, "median": 14.482 }
         },
         {
           "index": 16,
@@ -1960,7 +1960,7 @@
           "totalCost": 240981.48,
           "rowCount": 20,
           "bagChecksum": "0x8f1c966523a83a50",
-          "vectorizedMs": { "min": 26.074, "median": 26.108 }
+          "vectorizedMs": { "min": 26.054, "median": 26.265 }
         },
         {
           "index": 17,
@@ -2045,7 +2045,7 @@
           "totalCost": 240981.48,
           "rowCount": 20,
           "bagChecksum": "0x8f1c966523a83a50",
-          "vectorizedMs": { "min": 21.237, "median": 21.333 }
+          "vectorizedMs": { "min": 21.168, "median": 21.207 }
         },
         {
           "index": 18,
@@ -2130,7 +2130,7 @@
           "totalCost": 240866.28,
           "rowCount": 20,
           "bagChecksum": "0x8f1c966523a83a50",
-          "vectorizedMs": { "min": 16.506, "median": 16.541 }
+          "vectorizedMs": { "min": 16.574, "median": 16.649 }
         },
         {
           "index": 19,
@@ -2215,7 +2215,7 @@
           "totalCost": 240866.28,
           "rowCount": 20,
           "bagChecksum": "0x8f1c966523a83a50",
-          "vectorizedMs": { "min": 15.267, "median": 15.569 }
+          "vectorizedMs": { "min": 15.278, "median": 15.349 }
         },
         {
           "index": 20,
@@ -2300,7 +2300,7 @@
           "totalCost": 240981.48,
           "rowCount": 20,
           "bagChecksum": "0x8f1c966523a83a50",
-          "vectorizedMs": { "min": 26.842, "median": 26.997 }
+          "vectorizedMs": { "min": 26.464, "median": 26.671 }
         },
         {
           "index": 21,
@@ -2385,7 +2385,7 @@
           "totalCost": 240981.48,
           "rowCount": 20,
           "bagChecksum": "0x8f1c966523a83a50",
-          "vectorizedMs": { "min": 20.516, "median": 20.581 }
+          "vectorizedMs": { "min": 20.370, "median": 20.439 }
         },
         {
           "index": 22,
@@ -2470,7 +2470,7 @@
           "totalCost": 240866.28,
           "rowCount": 20,
           "bagChecksum": "0x8f1c966523a83a50",
-          "vectorizedMs": { "min": 17.074, "median": 17.142 }
+          "vectorizedMs": { "min": 17.032, "median": 17.058 }
         },
         {
           "index": 23,
@@ -2555,12 +2555,12 @@
           "totalCost": 240866.28,
           "rowCount": 20,
           "bagChecksum": "0x8f1c966523a83a50",
-          "vectorizedMs": { "min": 14.410, "median": 14.423 }
+          "vectorizedMs": { "min": 14.456, "median": 14.509 }
         }
       ],
       "chosen": 12,
       "checksum": "0x7e53943623dc6b01",
-      "interpretedMs": { "min": 1591.984, "median": 1601.294 },
+      "interpretedMs": { "min": 1540.199, "median": 1541.353 },
       "hitExpressionBound": false,
       "hitPlanBound": false
     },
@@ -2619,6 +2619,37 @@
                     "rows": 100000.00,
                     "cost": 100000.00,
                     "children": []
+                  },
+                  {
+                    "op": "Subquery",
+                    "detail": "Subquery[IN subquery at position 59]",
+                    "rows": 25.60,
+                    "cost": 512.00,
+                    "children": [
+                      {
+                        "op": "Project",
+                        "detail": "r.k1=col(r.k1)",
+                        "rows": 25.60,
+                        "cost": 512.00,
+                        "children": [
+                          {
+                            "op": "Filter",
+                            "detail": "col(r.payload) = lit(10000)",
+                            "rows": 25.60,
+                            "cost": 512.00,
+                            "children": [
+                              {
+                                "op": "Scan",
+                                "detail": "join_right AS r",
+                                "rows": 256.00,
+                                "cost": 256.00,
+                                "children": []
+                              }
+                            ]
+                          }
+                        ]
+                      }
+                    ]
                   }
                 ]
               }
@@ -2627,7 +2658,7 @@
           "totalCost": 200512.00,
           "rowCount": 6250,
           "bagChecksum": "0x5b144f1cb20c62ff",
-          "vectorizedMs": { "min": 3.063, "median": 3.151 }
+          "vectorizedMs": { "min": 3.037, "median": 3.043 }
         },
         {
           "index": 1,
@@ -2681,19 +2712,19 @@
           "totalCost": 200537.60,
           "rowCount": 6250,
           "bagChecksum": "0x5b144f1cb20c62ff",
-          "vectorizedMs": { "min": 5.250, "median": 5.272 }
+          "vectorizedMs": { "min": 5.135, "median": 5.147 }
         }
       ],
       "chosen": 0,
       "checksum": "0x72a0d9bc69515c7e",
-      "interpretedMs": { "min": 8.902, "median": 9.068 },
+      "interpretedMs": { "min": 8.562, "median": 8.602 },
       "hitExpressionBound": false,
       "hitPlanBound": false
     }
   ],
   "hump": [
-    { "id": "scan_filter_1pct", "sql": "SELECT a FROM fact WHERE bucket = 7", "predicate": "bucket = 7", "kept": 2000, "of": 200000, "checksum": "0x95ba2cbd0a720591", "interpretedMs": { "min": 17.409, "median": 17.525 }, "vectorizedMs": { "min": 7.904, "median": 7.949 } },
-    { "id": "scan_filter_10pct", "sql": "SELECT a FROM fact WHERE decile = 3", "predicate": "decile = 3", "kept": 20000, "of": 200000, "checksum": "0x8031b34dc1b05c00", "interpretedMs": { "min": 18.751, "median": 18.816 }, "vectorizedMs": { "min": 9.067, "median": 9.089 } },
-    { "id": "scan_filter_50pct", "sql": "SELECT a FROM fact WHERE half = 1", "predicate": "half = 1", "kept": 100000, "of": 200000, "checksum": "0xd4bb87b7e1354cb7", "interpretedMs": { "min": 25.338, "median": 25.427 }, "vectorizedMs": { "min": 14.235, "median": 14.249 } }
+    { "id": "scan_filter_1pct", "sql": "SELECT a FROM fact WHERE bucket = 7", "predicate": "bucket = 7", "kept": 2000, "of": 200000, "checksum": "0x95ba2cbd0a720591", "interpretedMs": { "min": 16.640, "median": 16.784 }, "vectorizedMs": { "min": 7.687, "median": 7.773 } },
+    { "id": "scan_filter_10pct", "sql": "SELECT a FROM fact WHERE decile = 3", "predicate": "decile = 3", "kept": 20000, "of": 200000, "checksum": "0x8031b34dc1b05c00", "interpretedMs": { "min": 18.231, "median": 18.320 }, "vectorizedMs": { "min": 8.815, "median": 8.859 } },
+    { "id": "scan_filter_50pct", "sql": "SELECT a FROM fact WHERE half = 1", "predicate": "half = 1", "kept": 100000, "of": 200000, "checksum": "0xd4bb87b7e1354cb7", "interpretedMs": { "min": 24.571, "median": 24.761 }, "vectorizedMs": { "min": 13.900, "median": 13.927 } }
   ]
 }
