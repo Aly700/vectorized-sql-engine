@@ -1,0 +1,119 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1232" height="820" viewBox="0 0 1232 820" font-family="Helvetica Neue, Helvetica, Arial, Liberation Sans, sans-serif" font-size="12" fill="#1d2430">
+<title>Vectorized SQL engine architecture</title>
+<defs><marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#1d2430"/></marker></defs>
+<rect width="1232" height="820" fill="#ffffff"/>
+<rect data-kind="region" data-id="lib" x="224" y="40" width="988" height="730" rx="2" fill="none" stroke="#1d2430" stroke-width="1.4"/>
+<rect data-kind="region-icon" data-of="lib" x="232" y="48" width="22" height="22" fill="#1d2430"/><g data-kind="region-icon-art" data-of="lib" transform="translate(235.0,51.0) scale(0.667)" fill="none" stroke="#ffffff" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="6" width="12" height="12" rx="1.5"/><rect x="9.5" y="9.5" width="5" height="5"/><path d="M9 2.5v3.5M15 2.5v3.5M9 18v3.5M15 18v3.5M2.5 9h3.5M2.5 15h3.5M18 9h3.5M18 15h3.5"/></g>
+<text data-kind="region-label" data-of="lib" x="260" y="64" font-size="13" font-weight="600" fill="#1d2430">sql_engine static library · C++20, standard library only · single process, single thread</text>
+<rect data-kind="region" data-id="front" x="240" y="100" width="212" height="526" rx="2" fill="none" stroke="#2a9d8f" stroke-width="1.4" stroke-dasharray="6 4"/>
+<rect data-kind="region-icon" data-of="front" x="248" y="108" width="22" height="22" fill="#2a9d8f"/><g data-kind="region-icon-art" data-of="front" transform="translate(251.0,111.0) scale(0.667)" fill="none" stroke="#ffffff" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M8 7l-5 5 5 5M16 7l5 5-5 5M13.5 4l-3 16"/></g>
+<text data-kind="region-label" data-of="front" x="276" y="124" font-size="13" font-weight="600" fill="#1d2430">Front end</text>
+<rect data-kind="region" data-id="opt" x="480" y="100" width="212" height="526" rx="2" fill="none" stroke="#5b4bb7" stroke-width="1.4" stroke-dasharray="6 4"/>
+<rect data-kind="region-icon" data-of="opt" x="488" y="108" width="22" height="22" fill="#5b4bb7"/><g data-kind="region-icon-art" data-of="opt" transform="translate(491.0,111.0) scale(0.667)" fill="none" stroke="#ffffff" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v18M5 21h14M12 6l-6 6h12zM6 12a3 3 0 0 0 6 0M12 12a3 3 0 0 0 6 0"/></g>
+<text data-kind="region-label" data-of="opt" x="516" y="124" font-size="13" font-weight="600" fill="#1d2430">Optimizer (memo)</text>
+<rect data-kind="region" data-id="exec" x="720" y="100" width="212" height="526" rx="2" fill="none" stroke="#e07a1f" stroke-width="1.4" stroke-dasharray="6 4"/>
+<rect data-kind="region-icon" data-of="exec" x="728" y="108" width="22" height="22" fill="#e07a1f"/><g data-kind="region-icon-art" data-of="exec" transform="translate(731.0,111.0) scale(0.667)" fill="none" stroke="#ffffff" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3.2"/><path d="M12 2.5v3M12 18.5v3M2.5 12h3M18.5 12h3M5.3 5.3l2.1 2.1M16.6 16.6l2.1 2.1M5.3 18.7l2.1-2.1M16.6 7.4l2.1-2.1"/></g>
+<text data-kind="region-label" data-of="exec" x="756" y="124" font-size="13" font-weight="600" fill="#1d2430">Execution</text>
+<rect data-kind="region" data-id="store" x="960" y="100" width="212" height="526" rx="2" fill="none" stroke="#3b5bdb" stroke-width="1.4" stroke-dasharray="6 4"/>
+<rect data-kind="region-icon" data-of="store" x="968" y="108" width="22" height="22" fill="#3b5bdb"/><g data-kind="region-icon-art" data-of="store" transform="translate(971.0,111.0) scale(0.667)" fill="none" stroke="#ffffff" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="6" rx="7" ry="3"/><path d="M5 6v12c0 1.7 3.1 3 7 3s7-1.3 7-3V6M5 12c0 1.7 3.1 3 7 3s7-1.3 7-3"/></g>
+<text data-kind="region-label" data-of="store" x="996" y="124" font-size="13" font-weight="600" fill="#1d2430">Catalog and storage</text>
+<path data-kind="edge" data-edge="0" data-from="sql" data-to="lexer" data-n="1" d="M187.0 201.0 L252.0 201.0" fill="none" stroke="#1d2430" stroke-width="1.4" marker-end="url(#arr)"/>
+<circle data-kind="badge" data-n="1" data-edge="0" cx="209.0" cy="201.0" r="10" fill="#232f3e" stroke="#ffffff" stroke-width="1.5"/><text data-kind="badge-text" data-n="1" data-edge="0" x="209.0" y="205.0" text-anchor="middle" font-size="11" font-weight="700" fill="#ffffff">1</text>
+<path data-kind="edge" data-edge="1" data-from="lexer" data-to="parser" data-n="2" d="M346.0 252.0 L346.0 322.0" fill="none" stroke="#1d2430" stroke-width="1.4" marker-end="url(#arr)"/>
+<circle data-kind="badge" data-n="2" data-edge="1" cx="346.0" cy="287.0" r="10" fill="#232f3e" stroke="#ffffff" stroke-width="1.5"/><text data-kind="badge-text" data-n="2" data-edge="1" x="346.0" y="291.0" text-anchor="middle" font-size="11" font-weight="700" fill="#ffffff">2</text>
+<path data-kind="edge" data-edge="2" data-from="parser" data-to="binder" data-n="3" d="M346.0 424.0 L346.0 494.0" fill="none" stroke="#1d2430" stroke-width="1.4" marker-end="url(#arr)"/>
+<circle data-kind="badge" data-n="3" data-edge="2" cx="346.0" cy="459.0" r="10" fill="#232f3e" stroke="#ffffff" stroke-width="1.5"/><text data-kind="badge-text" data-n="3" data-edge="2" x="346.0" y="463.0" text-anchor="middle" font-size="11" font-weight="700" fill="#ffffff">3</text>
+<path data-kind="edge" data-edge="3" data-from="binder" data-to="memo" data-n="4" d="M440.0 545.0 L492.0 545.0" fill="none" stroke="#1d2430" stroke-width="1.4" marker-end="url(#arr)"/>
+<circle data-kind="badge" data-n="4" data-edge="3" cx="466.0" cy="545.0" r="10" fill="#232f3e" stroke="#ffffff" stroke-width="1.5"/><text data-kind="badge-text" data-n="4" data-edge="3" x="466.0" y="549.0" text-anchor="middle" font-size="11" font-weight="700" fill="#ffffff">4</text>
+<path data-kind="edge" data-edge="4" data-from="memo" data-to="rules" data-n="5" d="M586.0 494.0 L586.0 424.0" fill="none" stroke="#1d2430" stroke-width="1.4" marker-start="url(#arr)" marker-end="url(#arr)"/>
+<circle data-kind="badge" data-n="5" data-edge="4" cx="586.0" cy="459.0" r="10" fill="#232f3e" stroke="#ffffff" stroke-width="1.5"/><text data-kind="badge-text" data-n="5" data-edge="4" x="586.0" y="463.0" text-anchor="middle" font-size="11" font-weight="700" fill="#ffffff">5</text>
+<path data-kind="edge" data-edge="5" data-from="rules" data-to="cost" data-n="6" d="M586.0 322.0 L586.0 252.0" fill="none" stroke="#1d2430" stroke-width="1.4" marker-end="url(#arr)"/>
+<circle data-kind="badge" data-n="6" data-edge="5" cx="586.0" cy="287.0" r="10" fill="#232f3e" stroke="#ffffff" stroke-width="1.5"/><text data-kind="badge-text" data-n="6" data-edge="5" x="586.0" y="291.0" text-anchor="middle" font-size="11" font-weight="700" fill="#ffffff">6</text>
+<path data-kind="edge" data-edge="6" data-from="cost" data-to="physical" data-n="7" d="M680.0 201.0 L732.0 201.0" fill="none" stroke="#1d2430" stroke-width="1.4" marker-end="url(#arr)"/>
+<circle data-kind="badge" data-n="7" data-edge="6" cx="706.0" cy="201.0" r="10" fill="#232f3e" stroke="#ffffff" stroke-width="1.5"/><text data-kind="badge-text" data-n="7" data-edge="6" x="706.0" y="205.0" text-anchor="middle" font-size="11" font-weight="700" fill="#ffffff">7</text>
+<path data-kind="edge" data-edge="7" data-from="physical" data-to="vector" data-n="8" d="M826.0 252.0 L826.0 322.0" fill="none" stroke="#1d2430" stroke-width="1.4" marker-end="url(#arr)"/>
+<circle data-kind="badge" data-n="8" data-edge="7" cx="826.0" cy="287.0" r="10" fill="#232f3e" stroke="#ffffff" stroke-width="1.5"/><text data-kind="badge-text" data-n="8" data-edge="7" x="826.0" y="291.0" text-anchor="middle" font-size="11" font-weight="700" fill="#ffffff">8</text>
+<path data-kind="edge" data-edge="8" data-from="vector" data-to="result" data-n="9" d="M920.0 403.6 L946.0 403.6 L946.0 545.0 L972.0 545.0" fill="none" stroke="#1d2430" stroke-width="1.4" marker-end="url(#arr)"/>
+<circle data-kind="badge" data-n="9" data-edge="8" cx="946.0" cy="459.0" r="10" fill="#232f3e" stroke="#ffffff" stroke-width="1.5"/><text data-kind="badge-text" data-n="9" data-edge="8" x="946.0" y="463.0" text-anchor="middle" font-size="11" font-weight="700" fill="#ffffff">9</text>
+<path data-kind="edge" data-edge="9" data-from="catalog" data-to="binder" data-n="" d="M1160.0 201.0 L1192.0 201.0 L1192.0 730.0 L299.0 730.0 L299.0 596.0" fill="none" stroke="#1d2430" stroke-width="1.4" stroke-dasharray="5 4" marker-end="url(#arr)"/>
+<text data-kind="edge-label" data-edge="9" x="333.0" y="648.0" font-size="10.5" fill="#6b7280" text-anchor="middle">schemas</text>
+<path data-kind="edge" data-edge="10" data-from="batch" data-to="vector" data-n="" d="M1066.0 322.0 L1066.0 284.0 L889.9 284.0 L889.9 322.0" fill="none" stroke="#1d2430" stroke-width="1.4" stroke-dasharray="5 4" marker-end="url(#arr)"/>
+<text data-kind="edge-label" data-edge="10" x="1026.0" y="274.0" font-size="10.5" fill="#6b7280" text-anchor="middle">tables</text>
+<path data-kind="edge" data-edge="11" data-from="binder" data-to="oracle" data-n="10" d="M364.8 596.0 L364.8 674.0 L826.0 674.0 L826.0 596.0" fill="none" stroke="#1d2430" stroke-width="1.4" stroke-dasharray="5 4" marker-end="url(#arr)"/>
+<circle data-kind="badge" data-n="10" data-edge="11" cx="586.0" cy="674.0" r="10" fill="#232f3e" stroke="#ffffff" stroke-width="1.5"/><text data-kind="badge-text" data-n="10" data-edge="11" x="586.0" y="678.0" text-anchor="middle" font-size="11" font-weight="700" fill="#ffffff">10</text>
+<text data-kind="edge-label" data-edge="11" x="586.0" y="704.0" font-size="10.5" fill="#6b7280" text-anchor="middle">differential check: same plan through both engines, equal results</text>
+<path data-kind="edge" data-edge="12" data-from="oracle" data-to="vector" data-n="" d="M826.0 494.0 L826.0 424.0" fill="none" stroke="#1d2430" stroke-width="1.4" stroke-dasharray="5 4" marker-end="url(#arr)"/>
+<text data-kind="edge-label" data-edge="12" x="859.0" y="463.0" font-size="10.5" fill="#6b7280" text-anchor="middle">compare</text>
+<path data-kind="edge" data-edge="13" data-from="caller" data-to="sql" data-n="" d="M107.0 322.0 L107.0 229.0" fill="none" stroke="#1d2430" stroke-width="1.4" stroke-dasharray="5 4"/>
+<rect data-kind="node" data-id="sql" x="27" y="173" width="160" height="56" rx="2" fill="#ffffff" stroke="#1d2430" stroke-width="1.2"/>
+<g data-kind="node-icon" data-of="sql" transform="translate(37.0,189.0) scale(1.000)" fill="none" stroke="#1d2430" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M6 3h8l5 5v13H6z"/><path d="M14 3v5h5M9 12h7M9 16h7"/></g>
+<text data-kind="node-text" data-of="sql" x="69.0" y="198.0" font-size="12" font-weight="600">SQL text</text>
+<text data-kind="node-text" data-of="sql" x="69.0" y="212.0" font-size="12" font-weight="400">SELECT · EXPLAIN</text>
+<rect data-kind="node" data-id="caller" x="20" y="322" width="174" height="102" rx="2" fill="#ffffff" stroke="#1d2430" stroke-width="1.2"/>
+<g data-kind="node-icon" data-of="caller" transform="translate(92.0,330.0) scale(1.250)" fill="none" stroke="#1d2430" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 9l3 3-3 3M12 15h5"/></g>
+<text data-kind="node-text" data-of="caller" x="107.0" y="375.0" text-anchor="middle" font-size="12" font-weight="600">Caller</text>
+<text data-kind="node-text" data-of="caller" x="107.0" y="389.0" text-anchor="middle" font-size="12" font-weight="400">tests · benchmarks · fuzzer</text>
+<text data-kind="node-text" data-of="caller" x="107.0" y="404.0" text-anchor="middle" font-size="10.5" fill="#6b7280">no CLI, server or file I/O</text>
+<rect data-kind="node" data-id="lexer" x="252" y="150" width="188" height="102" rx="2" fill="#ffffff" stroke="#1d2430" stroke-width="1.2"/>
+<g data-kind="node-icon" data-of="lexer" transform="translate(331.0,158.0) scale(1.250)" fill="none" stroke="#2a9d8f" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="4" height="16"/><rect x="10" y="4" width="4" height="16"/><rect x="17" y="4" width="4" height="16"/></g>
+<text data-kind="node-text" data-of="lexer" x="346.0" y="203.0" text-anchor="middle" font-size="12" font-weight="600">Lexer</text>
+<text data-kind="node-text" data-of="lexer" x="346.0" y="217.0" text-anchor="middle" font-size="12" font-weight="400">Tokens</text>
+<text data-kind="node-text" data-of="lexer" x="346.0" y="232.0" text-anchor="middle" font-size="10.5" fill="#6b7280">nesting and operator bounds</text>
+<rect data-kind="node" data-id="parser" x="252" y="322" width="188" height="102" rx="2" fill="#ffffff" stroke="#1d2430" stroke-width="1.2"/>
+<g data-kind="node-icon" data-of="parser" transform="translate(331.0,330.0) scale(1.250)" fill="none" stroke="#2a9d8f" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="5" r="2.2"/><circle cx="6" cy="13" r="2.2"/><circle cx="18" cy="13" r="2.2"/><circle cx="9" cy="20" r="1.8"/><circle cx="15" cy="20" r="1.8"/><path d="M10.5 6.8 7.4 11M13.5 6.8l3.1 4.2M6.8 15l1.6 3.2M17.2 15l-1.6 3.2"/></g>
+<text data-kind="node-text" data-of="parser" x="346.0" y="375.0" text-anchor="middle" font-size="12" font-weight="600">Parser</text>
+<text data-kind="node-text" data-of="parser" x="346.0" y="389.0" text-anchor="middle" font-size="12" font-weight="400">sql::SelectQuery AST</text>
+<text data-kind="node-text" data-of="parser" x="346.0" y="404.0" text-anchor="middle" font-size="10.5" fill="#6b7280">recursive descent</text>
+<rect data-kind="node" data-id="binder" x="252" y="494" width="188" height="102" rx="2" fill="#ffffff" stroke="#1d2430" stroke-width="1.2"/>
+<g data-kind="node-icon" data-of="binder" transform="translate(331.0,502.0) scale(1.250)" fill="none" stroke="#2a9d8f" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M7.5 12.5l3 3 6-7"/></g>
+<text data-kind="node-text" data-of="binder" x="346.0" y="547.0" text-anchor="middle" font-size="12" font-weight="600">Binder / type checker</text>
+<text data-kind="node-text" data-of="binder" x="346.0" y="561.0" text-anchor="middle" font-size="12" font-weight="400">bind_select → LogicalPlan</text>
+<text data-kind="node-text" data-of="binder" x="346.0" y="576.0" text-anchor="middle" font-size="10.5" fill="#6b7280">catalog types · correlation</text>
+<rect data-kind="node" data-id="cost" x="492" y="150" width="188" height="102" rx="2" fill="#ffffff" stroke="#1d2430" stroke-width="1.2"/>
+<g data-kind="node-icon" data-of="cost" transform="translate(571.0,158.0) scale(1.250)" fill="none" stroke="#5b4bb7" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v18M5 21h14M12 6l-6 6h12zM6 12a3 3 0 0 0 6 0M12 12a3 3 0 0 0 6 0"/></g>
+<text data-kind="node-text" data-of="cost" x="586.0" y="203.0" text-anchor="middle" font-size="12" font-weight="600">Cost model · extract_best</text>
+<text data-kind="node-text" data-of="cost" x="586.0" y="217.0" text-anchor="middle" font-size="12" font-weight="400">estimate_cost</text>
+<text data-kind="node-text" data-of="cost" x="586.0" y="232.0" text-anchor="middle" font-size="10.5" fill="#6b7280">EXPLAIN prints memo + cost</text>
+<rect data-kind="node" data-id="rules" x="492" y="322" width="188" height="102" rx="2" fill="#ffffff" stroke="#1d2430" stroke-width="1.2"/>
+<g data-kind="node-icon" data-of="rules" transform="translate(571.0,330.0) scale(1.250)" fill="none" stroke="#5b4bb7" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M19.5 12a7.5 7.5 0 0 1-13 5.1M4.5 12a7.5 7.5 0 0 1 13-5.1"/><path d="M17.5 3v4h-4M6.5 21v-4h4"/></g>
+<text data-kind="node-text" data-of="rules" x="586.0" y="375.0" text-anchor="middle" font-size="12" font-weight="600">Rewrite rules</text>
+<text data-kind="node-text" data-of="rules" x="586.0" y="389.0" text-anchor="middle" font-size="12" font-weight="400">4 standalone · 13 memo rules</text>
+<text data-kind="node-text" data-of="rules" x="586.0" y="404.0" text-anchor="middle" font-size="10.5" fill="#6b7280">explore_memo_to_fixpoint</text>
+<rect data-kind="node" data-id="memo" x="492" y="494" width="188" height="102" rx="2" fill="#ffffff" stroke="#1d2430" stroke-width="1.2"/>
+<g data-kind="node-icon" data-of="memo" transform="translate(571.0,502.0) scale(1.250)" fill="none" stroke="#5b4bb7" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l9 5-9 5-9-5z"/><path d="M3 13l9 5 9-5M3 17l9 5 9-5"/></g>
+<text data-kind="node-text" data-of="memo" x="586.0" y="547.0" text-anchor="middle" font-size="12" font-weight="600">Memo</text>
+<text data-kind="node-text" data-of="memo" x="586.0" y="561.0" text-anchor="middle" font-size="12" font-weight="400">equivalence groups</text>
+<text data-kind="node-text" data-of="memo" x="586.0" y="576.0" text-anchor="middle" font-size="10.5" fill="#6b7280">Memo::insert · deterministic ids</text>
+<rect data-kind="node" data-id="physical" x="732" y="150" width="188" height="102" rx="2" fill="#ffffff" stroke="#1d2430" stroke-width="1.2"/>
+<g data-kind="node-icon" data-of="physical" transform="translate(811.0,158.0) scale(1.250)" fill="none" stroke="#e07a1f" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 4h18l-7 8v7l-4 2v-9z"/></g>
+<text data-kind="node-text" data-of="physical" x="826.0" y="203.0" text-anchor="middle" font-size="12" font-weight="600">lower_to_physical</text>
+<text data-kind="node-text" data-of="physical" x="826.0" y="217.0" text-anchor="middle" font-size="12" font-weight="400">PhysicalPlan</text>
+<text data-kind="node-text" data-of="physical" x="826.0" y="232.0" text-anchor="middle" font-size="10.5" fill="#6b7280">structure preserving, no costing</text>
+<rect data-kind="node" data-id="vector" x="732" y="322" width="188" height="102" rx="2" fill="#ffffff" stroke="#1d2430" stroke-width="1.2"/>
+<g data-kind="node-icon" data-of="vector" transform="translate(811.0,330.0) scale(1.250)" fill="none" stroke="#e07a1f" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="4" height="16"/><rect x="10" y="4" width="4" height="16"/><rect x="17" y="4" width="4" height="16"/></g>
+<text data-kind="node-text" data-of="vector" x="826.0" y="375.0" text-anchor="middle" font-size="12" font-weight="600">Vectorized engine</text>
+<text data-kind="node-text" data-of="vector" x="826.0" y="389.0" text-anchor="middle" font-size="12" font-weight="400">execute_vectorized</text>
+<text data-kind="node-text" data-of="vector" x="826.0" y="404.0" text-anchor="middle" font-size="10.5" fill="#6b7280">BatchView · SelectionVector</text>
+<rect data-kind="node" data-id="oracle" x="732" y="494" width="188" height="102" rx="2" fill="#ffffff" stroke="#6b7280" stroke-width="1.2"/>
+<g data-kind="node-icon" data-of="oracle" transform="translate(811.0,502.0) scale(1.250)" fill="none" stroke="#6b7280" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="1"/><path d="M3 9h18M3 14h18M9 4v16M15 4v16"/></g>
+<text data-kind="node-text" data-of="oracle" x="826.0" y="547.0" text-anchor="middle" font-size="12" font-weight="600">Interpreted oracle</text>
+<text data-kind="node-text" data-of="oracle" x="826.0" y="561.0" text-anchor="middle" font-size="12" font-weight="400">execute_interpreted</text>
+<text data-kind="node-text" data-of="oracle" x="826.0" y="576.0" text-anchor="middle" font-size="10.5" fill="#6b7280">row at a time, logical plan</text>
+<rect data-kind="node" data-id="catalog" x="972" y="158" width="188" height="86" rx="2" fill="#ffffff" stroke="#1d2430" stroke-width="1.2"/>
+<g data-kind="node-icon" data-of="catalog" transform="translate(1051.0,166.0) scale(1.250)" fill="none" stroke="#3b5bdb" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="6" rx="7" ry="3"/><path d="M5 6v12c0 1.7 3.1 3 7 3s7-1.3 7-3V6M5 12c0 1.7 3.1 3 7 3s7-1.3 7-3"/></g>
+<text data-kind="node-text" data-of="catalog" x="1066.0" y="211.0" text-anchor="middle" font-size="12" font-weight="600">catalog::Catalog</text>
+<text data-kind="node-text" data-of="catalog" x="1066.0" y="225.0" text-anchor="middle" font-size="12" font-weight="400">table + column schemas</text>
+<rect data-kind="node" data-id="batch" x="972" y="322" width="188" height="102" rx="2" fill="#ffffff" stroke="#1d2430" stroke-width="1.2"/>
+<g data-kind="node-icon" data-of="batch" transform="translate(1051.0,330.0) scale(1.250)" fill="none" stroke="#3b5bdb" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="4" height="16"/><rect x="10" y="4" width="4" height="16"/><rect x="17" y="4" width="4" height="16"/></g>
+<text data-kind="node-text" data-of="batch" x="1066.0" y="375.0" text-anchor="middle" font-size="12" font-weight="600">storage::ColumnarBatch</text>
+<text data-kind="node-text" data-of="batch" x="1066.0" y="389.0" text-anchor="middle" font-size="12" font-weight="400">Int64Column · StringColumn</text>
+<text data-kind="node-text" data-of="batch" x="1066.0" y="404.0" text-anchor="middle" font-size="10.5" fill="#6b7280">copy-on-write · validity mask</text>
+<rect data-kind="node" data-id="result" x="972" y="517" width="188" height="56" rx="2" fill="#ffffff" stroke="#1d2430" stroke-width="1.2"/>
+<g data-kind="node-icon" data-of="result" transform="translate(982.0,533.0) scale(1.000)" fill="none" stroke="#3b5bdb" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M7.5 12.5l3 3 6-7"/></g>
+<text data-kind="node-text" data-of="result" x="1014.0" y="542.0" font-size="12" font-weight="600">Result batch</text>
+<text data-kind="node-text" data-of="result" x="1014.0" y="556.0" font-size="12" font-weight="400">materialize_view</text>
+<text data-kind="note" data-note="0" x="20" y="450" font-size="10.5" fill="#6b7280" font-style="italic">callers compose the steps;</text>
+<text data-kind="note" data-note="0" x="20" y="463" font-size="10.5" fill="#6b7280" font-style="italic">execute_vectorized runs</text>
+<text data-kind="note" data-note="0" x="20" y="476" font-size="10.5" fill="#6b7280" font-style="italic">7 to 9 itself</text>
+<text data-kind="note" data-note="1" x="240" y="796" font-size="10.5" fill="#6b7280" font-style="italic">all data lives in process memory; a batch is a whole table or intermediate result plus a selection vector</text>
+</svg>
