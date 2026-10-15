@@ -10,6 +10,12 @@ A columnar analytical engine whose hardest boundary is the optimizer: SQL is par
 
 C++20, CMake, Arrow-like in-memory column batches, SIMD-friendly operator interfaces without external dependencies yet.
 
+## Architecture
+
+![SQL engine architecture: front end, memo optimizer, execution and storage inside one static library](docs/architecture.svg)
+
+The numbered arrows are walked one by one in [docs/architecture.md](docs/architecture.md), with the component table, the trust and data boundaries, and where each guarantee is proven.
+
 ## Build and smoke test
 
 ```bash
